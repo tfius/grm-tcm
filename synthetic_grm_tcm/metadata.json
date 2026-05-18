@@ -1,0 +1,60 @@
+{
+  "config": {
+    "n_subjects": 80,
+    "n_days": 60,
+    "latent_dim": 4,
+    "random_seed": 42,
+    "output_dir": "synthetic_grm_tcm",
+    "latent_noise_std": 0.18,
+    "obs_noise_std": 0.45,
+    "missing_rate": 0.03,
+    "stress_event_rate": 0.1,
+    "recovery_event_rate": 0.07,
+    "treatment_event_rate": 0.12,
+    "flare_threshold": 0.65,
+    "crash_threshold": 0.85,
+    "hidden_subtype_strength": 0.45,
+    "split_spleen_like_label": true,
+    "merge_liver_damp_like_labels": true
+  },
+  "latent_names": [
+    "vitality_depletion",
+    "stress_activation",
+    "inflammatory_load",
+    "digestive_instability"
+  ],
+  "observation_names": [
+    "sleep_quality",
+    "hrv",
+    "resting_hr",
+    "body_temp",
+    "fatigue",
+    "pain",
+    "appetite",
+    "bowel_quality",
+    "mood_calm",
+    "energy",
+    "heaviness",
+    "cold_hot"
+  ],
+  "event_types": [
+    "stress_event",
+    "recovery_event",
+    "treatment_event"
+  ],
+  "notes": {
+    "purpose": "Synthetic benchmark for GRM-style latent-state modeling of integrative physiology.",
+    "not_biology": "This is not a biological simulator or proof of TCM. It is a controlled benchmark.",
+    "contrarian_examples": [
+      "One syndrome-like label is split into hidden subtypes.",
+      "Some labels merge into a bridge state.",
+      "Treatment response depends partly on hidden subtype, not label."
+    ],
+    "recommended_tasks": [
+      "Predict next_day_score.",
+      "Predict flare_next_day.",
+      "Recover latent state from observations only.",
+      "Detect mismatch between latent clusters and semantic labels."
+    ]
+  }
+}
