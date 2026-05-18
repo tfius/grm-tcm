@@ -63,6 +63,7 @@ from sklearn.neighbors import NearestNeighbors
 from sklearn.preprocessing import StandardScaler
 
 from grm_tcm_load import DynamicGRMModel, StaticGRMModel, load_dynamic_model, load_static_model
+from grm_tcm_plot_captions import save_with_caption
 
 
 OBSERVATION_NAMES: List[str] = [
@@ -1142,9 +1143,7 @@ def eval_ablations(setup: EvalSetup, aliased_result: Optional[Dict[str, Any]] = 
 
 
 def _save(fig: plt.Figure, path: Path) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(path, dpi=140, bbox_inches="tight")
-    plt.close(fig)
+    save_with_caption(fig, path, dpi=140)
 
 
 def generate_plots(setup: EvalSetup, results: Dict[str, Any]) -> None:

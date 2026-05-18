@@ -61,6 +61,7 @@ from grm_tcm_persistence import (
     save_joblib,
     write_manifest,
 )
+from grm_tcm_plot_captions import save_with_caption
 
 
 DYNAMIC_SCHEMA_VERSION = "dynamic-v1"
@@ -1365,8 +1366,7 @@ def run_state_source_comparison(cfg: DynamicGRMConfig) -> pd.DataFrame:
         ax.set_ylabel("Metric value")
         ax.legend(loc="best", fontsize=8)
         fig.tight_layout()
-        fig.savefig(plot_dir / "state_source_metric_comparison.png", dpi=160)
-        plt.close(fig)
+        save_with_caption(fig, plot_dir / "state_source_metric_comparison.png", dpi=160)
 
     print("\nState-source comparison complete.")
     print(f"Outputs written to: {output_dir.resolve()}")
@@ -1400,8 +1400,7 @@ def save_plots(
         ax.set_xlabel("Day")
         ax.set_ylabel("Frobenius change")
         fig.tight_layout()
-        fig.savefig(plot_dir / "rolling_regime_change_score.png", dpi=160)
-        plt.close(fig)
+        save_with_caption(fig, plot_dir / "rolling_regime_change_score.png", dpi=160)
 
         fig, ax = plt.subplots(figsize=(8, 4))
         ax.plot(regime_df["window_end_day"], regime_df["selected_modes"])
@@ -1409,8 +1408,7 @@ def save_plots(
         ax.set_xlabel("Day")
         ax.set_ylabel("Selected modes")
         fig.tight_layout()
-        fig.savefig(plot_dir / "selected_modes_over_time.png", dpi=160)
-        plt.close(fig)
+        save_with_caption(fig, plot_dir / "selected_modes_over_time.png", dpi=160)
 
         if "modes_needed_for_threshold_uncapped" in regime_df.columns:
             fig, ax = plt.subplots(figsize=(8, 4))
@@ -1422,8 +1420,7 @@ def save_plots(
             ax.set_ylabel("Modes")
             ax.legend(loc="best")
             fig.tight_layout()
-            fig.savefig(plot_dir / "selected_modes_saturation.png", dpi=160)
-            plt.close(fig)
+            save_with_caption(fig, plot_dir / "selected_modes_saturation.png", dpi=160)
 
     if not energy_df.empty:
         pivot = energy_df.pivot(index="window_end_day", columns="mode_rank", values="cumulative_energy")
@@ -1438,8 +1435,7 @@ def save_plots(
         ax.set_xlabel("Mode rank")
         ax.set_ylabel("Cumulative energy")
         fig.tight_layout()
-        fig.savefig(plot_dir / "cumulative_spectral_energy.png", dpi=160)
-        plt.close(fig)
+        save_with_caption(fig, plot_dir / "cumulative_spectral_energy.png", dpi=160)
 
         mean_energy = energy_df.groupby("mode_rank", as_index=False)["cumulative_energy"].mean()
         fig, ax = plt.subplots(figsize=(8, 4))
@@ -1450,8 +1446,7 @@ def save_plots(
         ax.set_xlabel("Mode rank")
         ax.set_ylabel("Mean cumulative energy")
         fig.tight_layout()
-        fig.savefig(plot_dir / "mean_cumulative_spectral_energy.png", dpi=160)
-        plt.close(fig)
+        save_with_caption(fig, plot_dir / "mean_cumulative_spectral_energy.png", dpi=160)
 
     if {"self_resonance", "global_dysregulation_score"}.issubset(visits.columns):
         pair = visits[["self_resonance", "global_dysregulation_score"]].dropna()
@@ -1462,8 +1457,7 @@ def save_plots(
             ax.set_xlabel("Self-resonance")
             ax.set_ylabel("Global dysregulation score")
             fig.tight_layout()
-            fig.savefig(plot_dir / "self_resonance_vs_dysregulation.png", dpi=160)
-            plt.close(fig)
+            save_with_caption(fig, plot_dir / "self_resonance_vs_dysregulation.png", dpi=160)
 
     if {"subject_regime_change_score", "day"}.issubset(visits.columns):
         grouped = (
@@ -1481,8 +1475,7 @@ def save_plots(
             ax.set_ylabel("Frobenius change")
             ax.legend(loc="best")
             fig.tight_layout()
-            fig.savefig(plot_dir / "subject_regime_change_score.png", dpi=160)
-            plt.close(fig)
+            save_with_caption(fig, plot_dir / "subject_regime_change_score.png", dpi=160)
 
     if {"subject_self_resonance", "global_dysregulation_score"}.issubset(visits.columns):
         pair = visits[["subject_self_resonance", "global_dysregulation_score"]].dropna()
@@ -1493,8 +1486,7 @@ def save_plots(
             ax.set_xlabel("Subject self-resonance")
             ax.set_ylabel("Global dysregulation score")
             fig.tight_layout()
-            fig.savefig(plot_dir / "subject_self_resonance_vs_dysregulation.png", dpi=160)
-            plt.close(fig)
+            save_with_caption(fig, plot_dir / "subject_self_resonance_vs_dysregulation.png", dpi=160)
 
     if {"soft_self_resonance", "global_dysregulation_score"}.issubset(visits.columns):
         pair = visits[["soft_self_resonance", "global_dysregulation_score"]].dropna()
@@ -1505,8 +1497,7 @@ def save_plots(
             ax.set_xlabel("Soft self-resonance")
             ax.set_ylabel("Global dysregulation score")
             fig.tight_layout()
-            fig.savefig(plot_dir / "soft_self_resonance_vs_dysregulation.png", dpi=160)
-            plt.close(fig)
+            save_with_caption(fig, plot_dir / "soft_self_resonance_vs_dysregulation.png", dpi=160)
 
     if not reliability_df.empty:
         for scope, scoped in reliability_df.groupby("scope"):
@@ -1519,8 +1510,7 @@ def save_plots(
             ax.set_ylabel("Empirical accuracy")
             ax.legend(loc="best")
             fig.tight_layout()
-            fig.savefig(plot_dir / f"{scope}_transition_reliability.png", dpi=160)
-            plt.close(fig)
+            save_with_caption(fig, plot_dir / f"{scope}_transition_reliability.png", dpi=160)
 
     if not state_regime_confusion.empty:
         fig, ax = plt.subplots(figsize=(9, 5))
@@ -1532,8 +1522,7 @@ def save_plots(
         ax.set_ylabel("Inferred state")
         fig.colorbar(im, ax=ax)
         fig.tight_layout()
-        fig.savefig(plot_dir / "inferred_state_true_regime_confusion.png", dpi=160)
-        plt.close(fig)
+        save_with_caption(fig, plot_dir / "inferred_state_true_regime_confusion.png", dpi=160)
 
     if {"hidden_subtype", "frac_in_stuck_depleted", "frac_in_stuck_agitated"}.issubset(subject_summary_df.columns):
         means = subject_summary_df.groupby("hidden_subtype")[["frac_in_stuck_depleted", "frac_in_stuck_agitated"]].mean()
@@ -1543,8 +1532,7 @@ def save_plots(
         ax.set_xlabel("hidden_subtype")
         ax.set_ylabel("Mean fraction of days")
         fig.tight_layout()
-        fig.savefig(plot_dir / "true_stuck_occupancy_by_hidden_subtype.png", dpi=160)
-        plt.close(fig)
+        save_with_caption(fig, plot_dir / "true_stuck_occupancy_by_hidden_subtype.png", dpi=160)
 
     if {"mean_subject_soft_self_resonance", "frac_in_any_stuck"}.issubset(subject_summary_df.columns):
         pair = subject_summary_df[["mean_subject_soft_self_resonance", "frac_in_any_stuck"]].dropna()
@@ -1555,8 +1543,7 @@ def save_plots(
             ax.set_xlabel("Mean subject soft self-resonance")
             ax.set_ylabel("Fraction in any stuck regime")
             fig.tight_layout()
-            fig.savefig(plot_dir / "subject_resonance_vs_true_stuck_occupancy.png", dpi=160)
-            plt.close(fig)
+            save_with_caption(fig, plot_dir / "subject_resonance_vs_true_stuck_occupancy.png", dpi=160)
 
 
 def print_readme(output_dir: Path, metrics: Dict[str, Any]) -> None:

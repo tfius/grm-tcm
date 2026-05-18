@@ -57,6 +57,8 @@ from sklearn.metrics import (
     roc_auc_score,
 )
 
+from grm_tcm_plot_captions import save_with_caption
+
 
 LATENT_NAMES = [
     "vitality_depletion",
@@ -499,8 +501,7 @@ def save_heatmap(matrix: pd.DataFrame, path: Path, title: str, xlabel: str, ylab
     ax.set_ylabel(ylabel)
     fig.colorbar(im, ax=ax)
     fig.tight_layout()
-    fig.savefig(path, dpi=160)
-    plt.close(fig)
+    save_with_caption(fig, path, dpi=160)
     print(f"[plot] {path}")
 
 
@@ -523,8 +524,7 @@ def save_prediction_plots(df: pd.DataFrame, plot_dir: Path) -> None:
     ax.set_ylabel("Predicted next_day_score")
     fig.tight_layout()
     path = plot_dir / "predicted_vs_actual_next_day_score.png"
-    fig.savefig(path, dpi=160)
-    plt.close(fig)
+    save_with_caption(fig, path, dpi=160)
     print(f"[plot] {path}")
 
     residual = pair["pred_grm_next_score"] - pair["next_day_score"]
@@ -535,8 +535,7 @@ def save_prediction_plots(df: pd.DataFrame, plot_dir: Path) -> None:
     ax.set_ylabel("Count")
     fig.tight_layout()
     path = plot_dir / "residual_histogram.png"
-    fig.savefig(path, dpi=160)
-    plt.close(fig)
+    save_with_caption(fig, path, dpi=160)
     print(f"[plot] {path}")
 
 
@@ -560,8 +559,7 @@ def save_mode_scatter(df: pd.DataFrame, label_col: str, path: Path) -> None:
     ax.set_xlabel("grm_mode_1")
     ax.set_ylabel("grm_mode_2")
     fig.tight_layout()
-    fig.savefig(path, dpi=160)
-    plt.close(fig)
+    save_with_caption(fig, path, dpi=160)
     print(f"[plot] {path}")
 
 

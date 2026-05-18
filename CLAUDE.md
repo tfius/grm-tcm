@@ -72,7 +72,7 @@ Do **not** claim this validates TCM, Qi, or any clinical ontology. The labels in
 
 ## Conventions
 
-- Plots: matplotlib only, no seaborn, no custom colors.
+- Plots: matplotlib only, no seaborn, no custom colors. All `fig.savefig` calls funnel through `grm_tcm_plot_captions.save_with_caption(fig, path)`, which embeds a wording-from-registry caption strip below the axes. Captions live in `grm_tcm_plot_captions.CAPTIONS` keyed by `path.stem`. To add a plot: write the figure, call `save_with_caption`, add a 1–3 sentence entry to `CAPTIONS`. A missing entry triggers a runtime warning and falls back to a guardrail string. The `tests/test_plot_captions.py` registry-coverage test enforces every produced stem is registered.
 - Random seed 42 throughout for reproducibility.
 - Group splits use `subject_id` to avoid leakage.
 - Type hints + short docstrings on public methods.
