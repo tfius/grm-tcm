@@ -20,9 +20,9 @@ import argparse
 import json
 import os
 import sys
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 os.environ.setdefault("MPLCONFIGDIR", "/private/tmp/grm_tcm_matplotlib_cache")
 os.environ.setdefault("XDG_CACHE_HOME", "/private/tmp/grm_tcm_cache")
@@ -54,6 +54,16 @@ from sklearn.impute import SimpleImputer
 from sklearn.metrics import accuracy_score, brier_score_loss, roc_auc_score
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
+
+from grm_tcm_persistence import (
+    manifest_sha,
+    save_int_keyed_npz,
+    save_joblib,
+    write_manifest,
+)
+
+
+DYNAMIC_SCHEMA_VERSION = "dynamic-v1"
 
 
 OBSERVATION_NAMES = [
@@ -92,6 +102,8 @@ class DynamicGRMConfig:
     state_similarity_k: int = 3
     similarity_quantile: float = 0.70
     state_fit_end_day: Optional[int] = None
+    state_source: str = "kmeans_observation"
+    compare_state_sources: bool = False
     random_seed: int = 42
 
 
@@ -112,6 +124,8 @@ def parse_args() -> DynamicGRMConfig:
     parser.add_argument("--state-similarity-k", type=int, default=3)
     parser.add_argument("--similarity-quantile", type=float, default=0.70)
     parser.add_argument("--state-fit-end-day", type=int, default=None)
+    parser.add_argument("--state-source", choices=["kmeans_observation", "kmeans_dynamic", "true_regime"], default="kmeans_observation")
+    parser.add_argument("--compare-state-sources", action="store_true")
     args = parser.parse_args()
     return DynamicGRMConfig(
         data_dir=args.data_dir,
@@ -127,6 +141,8 @@ def parse_args() -> DynamicGRMConfig:
         state_similarity_k=args.state_similarity_k,
         similarity_quantile=args.similarity_quantile,
         state_fit_end_day=args.state_fit_end_day,
+        state_source=args.state_source,
+        compare_state_sources=args.compare_state_sources,
     )
 
 
@@ -169,8 +185,51 @@ def load_inputs(cfg: DynamicGRMConfig) -> Tuple[pd.DataFrame, Optional[pd.DataFr
     return visits, events, embeddings
 
 
+def scale_features(frame: pd.DataFrame, columns: Iterable[str]) -> Tuple[np.ndarray, Pipeline, List[str]]:
+    """Median-impute and standardize a numeric feature matrix; return matrix, fitted pipe, used columns."""
+
+    cols = [c for c in columns if c in frame.columns]
+    if not cols:
+        raise ValueError("No requested columns are available for state discretization.")
+    pipe = Pipeline([("imputer", SimpleImputer(strategy="median")), ("scaler", StandardScaler())])
+    X = pipe.fit_transform(frame[cols].to_numpy(float))
+    return X, pipe, cols
+
+
+def observation_state_features(visits: pd.DataFrame) -> Tuple[np.ndarray, Pipeline, List[str]]:
+    """Build observation-only state features. Returns matrix, fitted preprocessor, columns used."""
+
+    cols = [c for c in OBSERVATION_NAMES if c in visits.columns]
+    if not cols:
+        raise ValueError("No observation features available for state discretization.")
+    X, pipe, used = scale_features(visits, cols)
+    return X, pipe, used
+
+
+def dynamic_state_features(visits: pd.DataFrame) -> Tuple[np.ndarray, Pipeline, List[str]]:
+    """Build observation trajectory features for dynamic state discretization."""
+
+    cols = [c for c in OBSERVATION_NAMES if c in visits.columns]
+    if not cols:
+        raise ValueError("No observation features available for dynamic state discretization.")
+    work = visits.sort_values(["subject_id", "day"]).copy()
+    feature_cols = list(cols)
+    for col in cols:
+        delta_col = f"{col}_delta1"
+        mean_col = f"{col}_roll3_mean"
+        std_col = f"{col}_roll3_std"
+        grouped = work.groupby("subject_id", sort=False)[col]
+        work[delta_col] = grouped.diff().fillna(0.0)
+        work[mean_col] = grouped.transform(lambda s: s.rolling(3, min_periods=1).mean())
+        work[std_col] = grouped.transform(lambda s: s.rolling(3, min_periods=2).std()).fillna(0.0)
+        feature_cols.extend([delta_col, mean_col, std_col])
+    work = work.sort_index()
+    X, pipe, used = scale_features(work, feature_cols)
+    return X, pipe, used
+
+
 def make_state_features(visits: pd.DataFrame, embeddings: Optional[pd.DataFrame]) -> Tuple[np.ndarray, List[int], List[str]]:
-    """Build feature matrix used for fixed state-space discretization."""
+    """Build legacy feature matrix used for fixed state-space discretization."""
 
     if embeddings is not None:
         modes = mode_columns(embeddings)
@@ -180,15 +239,22 @@ def make_state_features(visits: pd.DataFrame, embeddings: Optional[pd.DataFrame]
             )
             complete = merged[modes].notna().all(axis=1)
             if complete.mean() >= 0.5:
-                rows = merged.index.to_list()
                 pipe = Pipeline([("imputer", SimpleImputer(strategy="median")), ("scaler", StandardScaler())])
-                return pipe.fit_transform(merged[modes].to_numpy(float)), rows, modes
+                return pipe.fit_transform(merged[modes].to_numpy(float)), merged.index.to_list(), modes
 
-    cols = [c for c in OBSERVATION_NAMES if c in visits.columns]
-    if not cols:
-        raise ValueError("No observation or embedding features available for state discretization.")
-    pipe = Pipeline([("imputer", SimpleImputer(strategy="median")), ("scaler", StandardScaler())])
-    return pipe.fit_transform(visits[cols].to_numpy(float)), visits.index.to_list(), cols
+    X, _pipe, cols = observation_state_features(visits)
+    return X, visits.index.to_list(), cols
+
+
+def hard_assignment_centroids(X: np.ndarray, labels: np.ndarray, n_states: int) -> np.ndarray:
+    """Compute centroids from assigned rows with global-mean fallback for empty states."""
+
+    global_mean = X.mean(axis=0)
+    centroids = []
+    for state in range(n_states):
+        mask = labels == state
+        centroids.append(X[mask].mean(axis=0) if mask.any() else global_mean)
+    return np.vstack(centroids)
 
 
 def assign_states(visits: pd.DataFrame, embeddings: Optional[pd.DataFrame], cfg: DynamicGRMConfig) -> Tuple[pd.DataFrame, np.ndarray]:
@@ -211,26 +277,77 @@ def assign_states(visits: pd.DataFrame, embeddings: Optional[pd.DataFrame], cfg:
     return out, centroids
 
 
-def soft_state_weights(X: np.ndarray, centroids: np.ndarray) -> np.ndarray:
-    """Compute soft RBF state assignments for each visit."""
+def soft_state_weights(X: np.ndarray, centroids: np.ndarray, sigma: Optional[float] = None) -> Tuple[np.ndarray, float]:
+    """Compute soft RBF state assignments for each visit. Returns weights and the sigma used."""
 
     diff = X[:, None, :] - centroids[None, :, :]
     dist = np.sqrt(np.sum(diff * diff, axis=2))
-    nonzero = dist[dist > 0]
-    sigma = float(np.median(nonzero)) if len(nonzero) else 1.0
-    weights = np.exp(-(dist**2) / (2.0 * max(sigma, 1e-9) ** 2))
+    if sigma is None:
+        nonzero = dist[dist > 0]
+        sigma = float(np.median(nonzero)) if len(nonzero) else 1.0
+    sigma_safe = max(float(sigma), 1e-9)
+    weights = np.exp(-(dist**2) / (2.0 * sigma_safe**2))
     row_sums = np.maximum(weights.sum(axis=1, keepdims=True), 1e-12)
-    return weights / row_sums
+    return weights / row_sums, sigma_safe
+
+
+@dataclass
+class StateModel:
+    """Captures everything needed to re-assign new visits to the state vocabulary."""
+
+    source: str
+    feature_columns: List[str]
+    preprocessor: Optional[Pipeline]
+    kmeans: Optional[KMeans]
+    centroids: np.ndarray
+    soft_sigma: float
 
 
 def assign_states_and_weights(
     visits: pd.DataFrame, embeddings: Optional[pd.DataFrame], cfg: DynamicGRMConfig
-) -> Tuple[pd.DataFrame, np.ndarray, np.ndarray]:
-    """Assign hard states and soft state weights in one shared state vocabulary."""
+) -> Tuple[pd.DataFrame, StateModel, np.ndarray]:
+    """Assign hard states and soft state weights in one shared state vocabulary.
 
-    X, _, feature_names = make_state_features(visits, embeddings)
+    Returns the visits frame with state_id, a StateModel (capturing preprocessor /
+    kmeans / centroids / sigma for out-of-sample reuse), and the soft weights matrix.
+    """
+
+    out = visits.copy()
+    if cfg.state_source == "kmeans_observation":
+        X, preprocessor, feature_names = observation_state_features(visits)
+    elif cfg.state_source == "kmeans_dynamic":
+        X, preprocessor, feature_names = dynamic_state_features(visits)
+    elif cfg.state_source == "true_regime":
+        if "true_regime_id" not in visits.columns:
+            raise ValueError("--state-source true_regime requires true_regime_id in visits.csv")
+        X, preprocessor, feature_names = observation_state_features(visits)
+        labels = visits["true_regime_id"].astype(int).to_numpy()
+        n_states = int(labels.max()) + 1
+        out["state_id"] = labels
+        weights = np.zeros((len(out), n_states), dtype=float)
+        weights[np.arange(len(out)), labels] = 1.0
+        centroids = hard_assignment_centroids(X, labels, n_states)
+        # No KMeans was fit; sigma is meaningless for one-hot weights but we still report it.
+        _, soft_sigma = soft_state_weights(X, centroids)
+        print(f"[step] Using true_regime_id as oracle state vocabulary with {n_states} states")
+        out["state_source"] = cfg.state_source
+        state_model = StateModel(
+            source=cfg.state_source,
+            feature_columns=feature_names,
+            preprocessor=preprocessor,
+            kmeans=None,
+            centroids=centroids,
+            soft_sigma=soft_sigma,
+        )
+        return out, state_model, weights
+    else:
+        raise ValueError(f"Unknown state_source: {cfg.state_source}")
+
     n_states = min(cfg.n_states, max(2, len(visits) // 5))
-    print(f"[step] Discretizing visits into {n_states} states using {len(feature_names)} features")
+    print(
+        f"[step] Discretizing visits into {n_states} states using {len(feature_names)} "
+        f"{cfg.state_source} features"
+    )
     fit_mask = np.ones(len(visits), dtype=bool)
     if cfg.state_fit_end_day is not None:
         fit_mask = visits["day"].to_numpy(int) <= cfg.state_fit_end_day
@@ -238,10 +355,18 @@ def assign_states_and_weights(
             raise ValueError(f"state_fit_end_day leaves fewer rows than n_states: {fit_mask.sum()} < {n_states}")
         print(f"[step] Fitting states on visits through day {cfg.state_fit_end_day}; assigning all visits")
     kmeans = KMeans(n_clusters=n_states, random_state=cfg.random_seed, n_init=20).fit(X[fit_mask])
-    out = visits.copy()
     out["state_id"] = kmeans.predict(X)
-    weights = soft_state_weights(X, kmeans.cluster_centers_)
-    return out, kmeans.cluster_centers_, weights
+    out["state_source"] = cfg.state_source
+    weights, soft_sigma = soft_state_weights(X, kmeans.cluster_centers_)
+    state_model = StateModel(
+        source=cfg.state_source,
+        feature_columns=feature_names,
+        preprocessor=preprocessor,
+        kmeans=kmeans,
+        centroids=kmeans.cluster_centers_,
+        soft_sigma=soft_sigma,
+    )
+    return out, state_model, weights
 
 
 def add_event_flags(visits: pd.DataFrame, events: Optional[pd.DataFrame]) -> pd.DataFrame:
@@ -718,6 +843,85 @@ def hidden_subtype_eta_squared(subject_summary: pd.DataFrame) -> float:
     return float(ss_between / ss_total)
 
 
+def eta_squared_by_group(df: pd.DataFrame, value_col: str, group_col: str) -> float:
+    """Generic eta-squared for a numeric feature grouped by a categorical variable."""
+
+    if df.empty or not {value_col, group_col}.issubset(df.columns):
+        return float("nan")
+    work = df[[value_col, group_col]].dropna()
+    if work.empty or work[group_col].nunique() < 2:
+        return float("nan")
+    values = work[value_col].to_numpy(float)
+    grand_mean = float(values.mean())
+    ss_total = float(((values - grand_mean) ** 2).sum())
+    if ss_total <= 0:
+        return float("nan")
+    ss_between = 0.0
+    for _, group in work.groupby(group_col):
+        group_values = group[value_col].to_numpy(float)
+        ss_between += len(group_values) * (float(group_values.mean()) - grand_mean) ** 2
+    return float(ss_between / ss_total)
+
+
+def safe_corr(df: pd.DataFrame, a: str, b: str) -> float:
+    """Guarded Pearson correlation for two numeric columns."""
+
+    if df.empty or not {a, b}.issubset(df.columns):
+        return float("nan")
+    pair = df[[a, b]].dropna()
+    if len(pair) < 3 or pair[a].nunique() < 2 or pair[b].nunique() < 2:
+        return float("nan")
+    return float(pair[a].corr(pair[b]))
+
+
+def state_regime_mapping(visits: pd.DataFrame) -> Dict[int, int]:
+    """Map inferred state ids to their modal true regime id."""
+
+    if not {"state_id", "true_regime_id"}.issubset(visits.columns):
+        return {}
+    mapping: Dict[int, int] = {}
+    for state, group in visits.dropna(subset=["state_id", "true_regime_id"]).groupby("state_id"):
+        mapping[int(state)] = int(group["true_regime_id"].mode().iloc[0])
+    return mapping
+
+
+def add_true_regime_transition_eval(transition_df: pd.DataFrame, visits: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, float]]:
+    """Evaluate inferred-state transition predictions after mapping states to true regimes."""
+
+    if transition_df.empty or "next_true_regime_id" not in visits.columns:
+        return transition_df, {
+            "grm_true_regime_transition_accuracy": float("nan"),
+            "markov_true_regime_transition_accuracy": float("nan"),
+            "true_regime_transition_accuracy_lift": float("nan"),
+        }
+    mapping = state_regime_mapping(visits)
+    if not mapping:
+        return transition_df, {
+            "grm_true_regime_transition_accuracy": float("nan"),
+            "markov_true_regime_transition_accuracy": float("nan"),
+            "true_regime_transition_accuracy_lift": float("nan"),
+        }
+    out = transition_df.merge(visits[["visit_id", "next_true_regime_id"]], on="visit_id", how="left")
+    out["pred_true_regime_grm"] = out["pred_state_grm"].map(mapping)
+    out["pred_true_regime_markov"] = out["pred_state_markov"].map(mapping)
+    pair = out.dropna(subset=["next_true_regime_id", "pred_true_regime_grm", "pred_true_regime_markov"])
+    if pair.empty:
+        metrics = {
+            "grm_true_regime_transition_accuracy": float("nan"),
+            "markov_true_regime_transition_accuracy": float("nan"),
+            "true_regime_transition_accuracy_lift": float("nan"),
+        }
+    else:
+        grm_acc = float(accuracy_score(pair["next_true_regime_id"].astype(int), pair["pred_true_regime_grm"].astype(int)))
+        markov_acc = float(accuracy_score(pair["next_true_regime_id"].astype(int), pair["pred_true_regime_markov"].astype(int)))
+        metrics = {
+            "grm_true_regime_transition_accuracy": grm_acc,
+            "markov_true_regime_transition_accuracy": markov_acc,
+            "true_regime_transition_accuracy_lift": grm_acc - markov_acc,
+        }
+    return out, metrics
+
+
 def run_dynamic(cfg: DynamicGRMConfig) -> Dict[str, Any]:
     """Run dynamic GRM analysis and write outputs."""
 
@@ -729,7 +933,9 @@ def run_dynamic(cfg: DynamicGRMConfig) -> Dict[str, Any]:
     print("[start] Loading dynamic GRM inputs")
     visits, events, embeddings = load_inputs(cfg)
     subjects = read_csv_optional(Path(cfg.data_dir) / "subjects.csv")
-    visits, centroids, state_weights = assign_states_and_weights(visits, embeddings, cfg)
+    attractors = read_csv_optional(Path(cfg.data_dir) / "true_attractor_states.csv")
+    visits, state_model, state_weights = assign_states_and_weights(visits, embeddings, cfg)
+    centroids = state_model.centroids
     visits = add_event_flags(visits, events)
 
     print("[step] Computing rolling resonance matrices")
@@ -740,17 +946,24 @@ def run_dynamic(cfg: DynamicGRMConfig) -> Dict[str, Any]:
     transition_matrices: Dict[int, np.ndarray] = {}
     markov_matrices: Dict[int, np.ndarray] = {}
     global_g_matrices: Dict[int, np.ndarray] = {}
+    spectral_basis_per_window: Dict[int, Dict[str, np.ndarray]] = {}
     previous_G: Optional[np.ndarray] = None
 
     for end_day, window in windows:
         W, T_counts = build_weight_matrix(window, centroids, cfg)
         r_s = data_scale(window)
-        G, eigenvalues, _, selected_modes, cumulative_energy = spectral_grm(W, r_s, cfg)
+        G, eigenvalues, psi, selected_modes, cumulative_energy = spectral_grm(W, r_s, cfg)
         P = grm_transition_matrix(G, T_counts, cfg.alpha)
         P_markov = row_normalize(T_counts)
         transition_matrices[end_day] = P
         markov_matrices[end_day] = P_markov
         global_g_matrices[end_day] = G
+        spectral_basis_per_window[end_day] = {
+            "lambdas": np.asarray(eigenvalues, dtype=float),
+            "psi": np.asarray(psi, dtype=float),
+            "r_s": float(r_s),
+            "selected_modes": int(selected_modes),
+        }
         regime_score = float(np.linalg.norm(G - previous_G, ord="fro")) if previous_G is not None else float("nan")
         previous_G = G
         regime_rows.append(
@@ -818,12 +1031,14 @@ def run_dynamic(cfg: DynamicGRMConfig) -> Dict[str, Any]:
         how="left",
     )
     transition_df = evaluate_transition_predictions(visits, transition_matrices, markov_matrices)
+    transition_df, true_regime_transition_metrics = add_true_regime_transition_eval(transition_df, visits)
     pooled_transition_metrics = transition_metrics(transition_df)
 
     print("[step] Computing subject-conditioned dynamic GRM")
     subject_scores_df, subject_transition_df, subject_summary_df = compute_subject_dynamic_scores(
         visits, state_weights, global_g_matrices, transition_matrices, markov_matrices, cfg
     )
+    subject_transition_df, subject_true_regime_transition_metrics = add_true_regime_transition_eval(subject_transition_df, visits)
     subject_transition_metrics = transition_metrics(subject_transition_df)
     if not subject_scores_df.empty:
         visits = visits.merge(
@@ -847,13 +1062,21 @@ def run_dynamic(cfg: DynamicGRMConfig) -> Dict[str, Any]:
 
     if subjects is not None and not subject_summary_df.empty:
         subject_summary_df = subject_summary_df.merge(subjects[["subject_id", "hidden_subtype"]], on="subject_id", how="left")
+    if attractors is not None and not subject_summary_df.empty:
+        subject_summary_df = subject_summary_df.merge(attractors, on="subject_id", how="left")
     hidden_eta = hidden_subtype_eta_squared(subject_summary_df)
     reliability_df = make_reliability_outputs(transition_df, subject_transition_df)
+    state_regime_confusion = (
+        pd.crosstab(visits["state_id"], visits["true_regime"], normalize="index")
+        if {"state_id", "true_regime"}.issubset(visits.columns)
+        else pd.DataFrame()
+    )
 
     metrics = {
         "config": asdict(cfg),
         "n_windows": int(len(regime_df)),
-        "n_states": int(cfg.n_states),
+        "n_states": int(len(centroids)),
+        "state_source": cfg.state_source,
         "regime_flare_auc": safe_auc(visits["flare_next_day"], visits["regime_change_score"]) if "flare_next_day" in visits.columns else float("nan"),
         "regime_crash_auc": safe_auc(visits["crash_next_day"], visits["regime_change_score"]) if "crash_next_day" in visits.columns else float("nan"),
         "self_resonance_flare_auc": safe_auc(visits["flare_next_day"], visits["self_resonance"]) if "flare_next_day" in visits.columns else float("nan"),
@@ -864,7 +1087,11 @@ def run_dynamic(cfg: DynamicGRMConfig) -> Dict[str, Any]:
         "soft_self_resonance_crash_auc": safe_auc(visits["crash_next_day"], visits["soft_self_resonance"])
         if "crash_next_day" in visits.columns
         else float("nan"),
+        "soft_self_resonance_stuck_auc": safe_auc(visits["attractor_state"], visits["soft_self_resonance"])
+        if "attractor_state" in visits.columns
+        else float("nan"),
         **pooled_transition_metrics,
+        **true_regime_transition_metrics,
         "subject_n_windows": int(len(subject_scores_df)),
         "subject_regime_flare_auc": safe_auc(visits["flare_next_day"], visits["subject_regime_change_score"])
         if "flare_next_day" in visits.columns
@@ -885,6 +1112,26 @@ def run_dynamic(cfg: DynamicGRMConfig) -> Dict[str, Any]:
         if "crash_next_day" in visits.columns
         else float("nan"),
         "subject_soft_self_resonance_hidden_subtype_eta_squared": hidden_eta,
+        "subject_mean_soft_resonance_stuck_depleted_correlation": safe_corr(
+            subject_summary_df, "mean_subject_soft_self_resonance", "frac_in_stuck_depleted"
+        )
+        if "frac_in_stuck_depleted" in subject_summary_df.columns
+        else float("nan"),
+        "subject_mean_soft_resonance_stuck_agitated_correlation": safe_corr(
+            subject_summary_df, "mean_subject_soft_self_resonance", "frac_in_stuck_agitated"
+        )
+        if "frac_in_stuck_agitated" in subject_summary_df.columns
+        else float("nan"),
+        "frac_in_stuck_depleted_hidden_subtype_eta_squared": eta_squared_by_group(
+            subject_summary_df, "frac_in_stuck_depleted", "hidden_subtype"
+        )
+        if "frac_in_stuck_depleted" in subject_summary_df.columns
+        else float("nan"),
+        "frac_in_stuck_agitated_hidden_subtype_eta_squared": eta_squared_by_group(
+            subject_summary_df, "frac_in_stuck_agitated", "hidden_subtype"
+        )
+        if "frac_in_stuck_agitated" in subject_summary_df.columns
+        else float("nan"),
         "subject_grm_transition_accuracy": subject_transition_metrics["grm_transition_accuracy"],
         "subject_markov_transition_accuracy": subject_transition_metrics["markov_transition_accuracy"],
         "subject_transition_accuracy_lift": subject_transition_metrics["transition_accuracy_lift"],
@@ -897,6 +1144,9 @@ def run_dynamic(cfg: DynamicGRMConfig) -> Dict[str, Any]:
         "subject_grm_transition_ece": subject_transition_metrics["grm_transition_ece"],
         "subject_markov_transition_ece": subject_transition_metrics["markov_transition_ece"],
         "subject_transition_ece_lift": subject_transition_metrics["transition_ece_lift"],
+        "subject_grm_true_regime_transition_accuracy": subject_true_regime_transition_metrics["grm_true_regime_transition_accuracy"],
+        "subject_markov_true_regime_transition_accuracy": subject_true_regime_transition_metrics["markov_true_regime_transition_accuracy"],
+        "subject_true_regime_transition_accuracy_lift": subject_true_regime_transition_metrics["true_regime_transition_accuracy_lift"],
         "interpretation_guardrail": (
             "Dynamic GRM metrics test rolling resonance, state persistence, and transition propagation in a "
             "synthetic benchmark. They do not prove TCM, Qi, or a biological mechanism."
@@ -925,17 +1175,210 @@ def run_dynamic(cfg: DynamicGRMConfig) -> Dict[str, Any]:
     )
     subject_scores_df.to_csv(output_dir / "subject_dynamic_scores.csv", index=False)
     subject_summary_df.to_csv(output_dir / "subject_resonance_summary.csv", index=False)
+    state_regime_confusion.to_csv(output_dir / "inferred_state_true_regime_confusion.csv")
     transition_df.to_csv(output_dir / "grm_transition_predictions.csv", index=False)
     subject_transition_df.to_csv(output_dir / "subject_transition_predictions.csv", index=False)
     reliability_df.to_csv(output_dir / "transition_reliability.csv", index=False)
-    state_assignments = visits[["visit_id", "subject_id", "day", "state_id"]].copy()
+    state_assignments = visits[["visit_id", "subject_id", "day", "state_id", "state_source"]].copy()
     state_assignments.to_csv(output_dir / "state_assignments.csv", index=False)
     with open(output_dir / "dynamic_grm_metrics.json", "w", encoding="utf-8") as f:
         json.dump(metrics, f, indent=2)
 
-    save_plots(regime_df, energy_df, visits, reliability_df, plot_dir, cfg)
+    save_dynamic_model(
+        output_dir / "model",
+        cfg=cfg,
+        state_model=state_model,
+        state_weights=state_weights,
+        global_g_matrices=global_g_matrices,
+        transition_matrices=transition_matrices,
+        markov_matrices=markov_matrices,
+        spectral_basis_per_window=spectral_basis_per_window,
+        regime_df=regime_df,
+    )
+
+    save_plots(regime_df, energy_df, visits, reliability_df, state_regime_confusion, subject_summary_df, plot_dir, cfg)
     print_readme(output_dir, metrics)
     return metrics
+
+
+def save_dynamic_model(
+    model_dir: Path,
+    *,
+    cfg: DynamicGRMConfig,
+    state_model: StateModel,
+    state_weights: np.ndarray,
+    global_g_matrices: Dict[int, np.ndarray],
+    transition_matrices: Dict[int, np.ndarray],
+    markov_matrices: Dict[int, np.ndarray],
+    spectral_basis_per_window: Dict[int, Dict[str, Any]],
+    regime_df: pd.DataFrame,
+) -> None:
+    """Persist the fitted dynamic GRM pipeline alongside its derived CSVs.
+
+    Layout under model_dir:
+      - state_preprocessor.joblib (Optional)
+      - state_kmeans.joblib (Optional; absent when state_source='true_regime')
+      - state_centroids.npy
+      - state_metadata.json (source, soft_sigma, feature_columns)
+      - state_weights_visit.npy
+      - G_matrices.npz / grm_transition_matrices.npz / markov_transition_matrices.npz
+      - spectral_basis_per_window.npz  (concatenated lambdas/psi per end_day) + sidecar
+      - window_index.parquet
+      - manifest.json (with optional static_manifest_sha cross-link)
+    """
+
+    model_dir = Path(model_dir)
+    model_dir.mkdir(parents=True, exist_ok=True)
+
+    if state_model.preprocessor is not None:
+        save_joblib(state_model.preprocessor, model_dir / "state_preprocessor.joblib")
+    if state_model.kmeans is not None:
+        save_joblib(state_model.kmeans, model_dir / "state_kmeans.joblib")
+    np.save(model_dir / "state_centroids.npy", state_model.centroids)
+    with open(model_dir / "state_metadata.json", "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "source": state_model.source,
+                "soft_sigma": float(state_model.soft_sigma),
+                "feature_columns": list(state_model.feature_columns),
+                "n_states": int(state_model.centroids.shape[0]),
+            },
+            f,
+            indent=2,
+        )
+
+    np.save(model_dir / "state_weights_visit.npy", np.asarray(state_weights, dtype=float))
+
+    save_int_keyed_npz(global_g_matrices, model_dir / "G_matrices.npz", prefix="d")
+    save_int_keyed_npz(transition_matrices, model_dir / "grm_transition_matrices.npz", prefix="d")
+    save_int_keyed_npz(markov_matrices, model_dir / "markov_transition_matrices.npz", prefix="d")
+
+    basis_arrays: Dict[str, np.ndarray] = {}
+    basis_sidecar: Dict[str, Dict[str, float]] = {}
+    for end_day, entry in spectral_basis_per_window.items():
+        basis_arrays[f"lambdas_d{int(end_day)}"] = entry["lambdas"]
+        basis_arrays[f"psi_d{int(end_day)}"] = entry["psi"]
+        basis_sidecar[str(int(end_day))] = {
+            "r_s": float(entry["r_s"]),
+            "selected_modes": int(entry["selected_modes"]),
+        }
+    if basis_arrays:
+        np.savez_compressed(model_dir / "spectral_basis_per_window.npz", **basis_arrays)
+    with open(model_dir / "spectral_basis_sidecar.json", "w", encoding="utf-8") as f:
+        json.dump(basis_sidecar, f, indent=2)
+
+    if not regime_df.empty:
+        window_cols = [
+            "window_end_day",
+            "window_start_day",
+            "regime_change_score",
+            "r_s",
+            "selected_modes",
+            "hit_mode_cap",
+            "energy_at_selected_modes",
+        ]
+        regime_df[[c for c in window_cols if c in regime_df.columns]].to_parquet(
+            model_dir / "window_index.parquet", index=False
+        )
+
+    static_manifest_sha: Optional[str] = None
+    static_manifest_path = Path(cfg.results_dir) / "model" / "manifest.json"
+    if static_manifest_path.exists():
+        static_manifest_sha = manifest_sha(static_manifest_path.parent)
+
+    write_manifest(
+        model_dir,
+        config=cfg,
+        inputs=[
+            Path(cfg.data_dir) / "visits.csv",
+            Path(cfg.data_dir) / "events.csv",
+            Path(cfg.data_dir) / "subjects.csv",
+            Path(cfg.data_dir) / "true_attractor_states.csv",
+            Path(cfg.results_dir) / "grm_visit_embeddings.csv",
+        ],
+        schema_version=DYNAMIC_SCHEMA_VERSION,
+        random_seed=cfg.random_seed,
+        extra={"static_manifest_sha": static_manifest_sha},
+    )
+
+
+def run_state_source_comparison(cfg: DynamicGRMConfig) -> pd.DataFrame:
+    """Run dynamic GRM under each state vocabulary and compare key metrics."""
+
+    output_dir = Path(cfg.output_dir)
+    plot_dir = output_dir / "plots"
+    ensure_dir(output_dir)
+    ensure_dir(plot_dir)
+
+    sources = ["kmeans_observation", "kmeans_dynamic", "true_regime"]
+    rows: List[Dict[str, Any]] = []
+    metric_cols = [
+        "regime_flare_auc",
+        "soft_self_resonance_flare_auc",
+        "subject_regime_flare_auc",
+        "subject_soft_self_resonance_flare_auc",
+        "transition_accuracy_lift",
+        "transition_log_loss_lift",
+        "transition_brier_lift",
+        "transition_ece_lift",
+        "true_regime_transition_accuracy_lift",
+        "subject_true_regime_transition_accuracy_lift",
+        "soft_self_resonance_stuck_auc",
+        "subject_soft_self_resonance_hidden_subtype_eta_squared",
+    ]
+
+    for source in sources:
+        print(f"\n[compare] Running state_source={source}")
+        sub_cfg = replace(
+            cfg,
+            state_source=source,
+            compare_state_sources=False,
+            output_dir=str(output_dir / source),
+        )
+        metrics = run_dynamic(sub_cfg)
+        row = {"state_source": source, "n_states": metrics.get("n_states", np.nan)}
+        for col in metric_cols:
+            row[col] = metrics.get(col, np.nan)
+        rows.append(row)
+
+    comparison = pd.DataFrame(rows)
+    comparison_path = output_dir / "state_source_comparison.csv"
+    comparison.to_csv(comparison_path, index=False)
+    print(f"[write] {comparison_path}")
+
+    plot_cols = [
+        "soft_self_resonance_flare_auc",
+        "subject_regime_flare_auc",
+        "transition_log_loss_lift",
+        "true_regime_transition_accuracy_lift",
+        "subject_soft_self_resonance_hidden_subtype_eta_squared",
+    ]
+    available = [c for c in plot_cols if c in comparison.columns and comparison[c].notna().any()]
+    if available:
+        fig, ax = plt.subplots(figsize=(10, 5))
+        x = np.arange(len(comparison))
+        width = 0.8 / max(len(available), 1)
+        for idx, col in enumerate(available):
+            ax.bar(x + idx * width - (len(available) - 1) * width / 2.0, comparison[col], width=width, label=col)
+        ax.set_xticks(x, labels=comparison["state_source"], rotation=20, ha="right")
+        ax.set_title("Dynamic GRM by State Source")
+        ax.set_ylabel("Metric value")
+        ax.legend(loc="best", fontsize=8)
+        fig.tight_layout()
+        fig.savefig(plot_dir / "state_source_metric_comparison.png", dpi=160)
+        plt.close(fig)
+
+    print("\nState-source comparison complete.")
+    print(f"Outputs written to: {output_dir.resolve()}")
+    print("Inspect first:")
+    print("  1. state_source_comparison.csv")
+    print("  2. plots/state_source_metric_comparison.png")
+    print("  3. <state_source>/dynamic_grm_metrics.json")
+    print("Interpretation:")
+    print("  - kmeans_observation tests whether visible observations define useful states.")
+    print("  - kmeans_dynamic tests whether short trajectory features reduce observation aliasing.")
+    print("  - true_regime is an oracle ceiling for state vocabulary quality, not a deployable model.")
+    return comparison
 
 
 def save_plots(
@@ -943,6 +1386,8 @@ def save_plots(
     energy_df: pd.DataFrame,
     visits: pd.DataFrame,
     reliability_df: pd.DataFrame,
+    state_regime_confusion: pd.DataFrame,
+    subject_summary_df: pd.DataFrame,
     plot_dir: Path,
     cfg: DynamicGRMConfig,
 ) -> None:
@@ -1077,6 +1522,42 @@ def save_plots(
             fig.savefig(plot_dir / f"{scope}_transition_reliability.png", dpi=160)
             plt.close(fig)
 
+    if not state_regime_confusion.empty:
+        fig, ax = plt.subplots(figsize=(9, 5))
+        im = ax.imshow(state_regime_confusion.to_numpy(float), aspect="auto")
+        ax.set_xticks(np.arange(state_regime_confusion.shape[1]), labels=state_regime_confusion.columns, rotation=45, ha="right")
+        ax.set_yticks(np.arange(state_regime_confusion.shape[0]), labels=state_regime_confusion.index)
+        ax.set_title("Inferred State vs True Regime")
+        ax.set_xlabel("True regime")
+        ax.set_ylabel("Inferred state")
+        fig.colorbar(im, ax=ax)
+        fig.tight_layout()
+        fig.savefig(plot_dir / "inferred_state_true_regime_confusion.png", dpi=160)
+        plt.close(fig)
+
+    if {"hidden_subtype", "frac_in_stuck_depleted", "frac_in_stuck_agitated"}.issubset(subject_summary_df.columns):
+        means = subject_summary_df.groupby("hidden_subtype")[["frac_in_stuck_depleted", "frac_in_stuck_agitated"]].mean()
+        fig, ax = plt.subplots(figsize=(7, 4))
+        means.plot(kind="bar", ax=ax)
+        ax.set_title("True Stuck Occupancy by Hidden Subtype")
+        ax.set_xlabel("hidden_subtype")
+        ax.set_ylabel("Mean fraction of days")
+        fig.tight_layout()
+        fig.savefig(plot_dir / "true_stuck_occupancy_by_hidden_subtype.png", dpi=160)
+        plt.close(fig)
+
+    if {"mean_subject_soft_self_resonance", "frac_in_any_stuck"}.issubset(subject_summary_df.columns):
+        pair = subject_summary_df[["mean_subject_soft_self_resonance", "frac_in_any_stuck"]].dropna()
+        if not pair.empty:
+            fig, ax = plt.subplots(figsize=(6, 5))
+            ax.scatter(pair["mean_subject_soft_self_resonance"], pair["frac_in_any_stuck"], s=18, alpha=0.75)
+            ax.set_title("Subject Resonance vs True Stuck Occupancy")
+            ax.set_xlabel("Mean subject soft self-resonance")
+            ax.set_ylabel("Fraction in any stuck regime")
+            fig.tight_layout()
+            fig.savefig(plot_dir / "subject_resonance_vs_true_stuck_occupancy.png", dpi=160)
+            plt.close(fig)
+
 
 def print_readme(output_dir: Path, metrics: Dict[str, Any]) -> None:
     """Print concise output guidance."""
@@ -1090,9 +1571,10 @@ def print_readme(output_dir: Path, metrics: Dict[str, Any]) -> None:
     print("  4. self_resonance_scores.csv")
     print("  5. subject_dynamic_scores.csv")
     print("  6. subject_resonance_summary.csv")
-    print("  7. grm_transition_predictions.csv")
-    print("  8. subject_transition_predictions.csv")
-    print("  9. transition_reliability.csv")
+    print("  7. inferred_state_true_regime_confusion.csv")
+    print("  8. grm_transition_predictions.csv")
+    print("  9. subject_transition_predictions.csv")
+    print("  10. transition_reliability.csv")
     print("Interpretation:")
     print("  - High regime-change AUC means rolling G changes before flares/crashes.")
     print("  - High self-resonance AUC means attractor/stuck-state strength is predictive.")
@@ -1112,4 +1594,8 @@ def print_readme(output_dir: Path, metrics: Dict[str, Any]) -> None:
 
 
 if __name__ == "__main__":
-    run_dynamic(parse_args())
+    parsed = parse_args()
+    if parsed.compare_state_sources:
+        run_state_source_comparison(parsed)
+    else:
+        run_dynamic(parsed)

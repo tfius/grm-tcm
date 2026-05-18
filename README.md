@@ -39,24 +39,53 @@ grm_tcm_diagnostics/
   diagnostics_summary.json
   cluster_scores.csv
   contrarian_findings.csv
+  regime_label_mismatch.csv
   plots/*.png
 
 grm_tcm_dynamic/
   dynamic_grm_metrics.json
+  state_source_comparison.csv
+  state_assignments.csv
   rolling_regime_scores.csv
   spectral_energy.csv
   self_resonance_scores.csv
   subject_dynamic_scores.csv
   subject_resonance_summary.csv
+  inferred_state_true_regime_confusion.csv
   grm_transition_predictions.csv
   subject_transition_predictions.csv
   transition_reliability.csv
+```
+
+Both the trainer and the dynamic pipeline also write a `model/` subdirectory containing the fitted preprocessor, eigenbasis, KMeans, regressors, G-matrices, and a `manifest.json` (config + git sha + input hashes + schema version). The dynamic manifest cross-references the static manifest sha, so a stale static model is rejected at load time.
+
+## Predicting on new visits
+
+After training, run `predict.py` to score new visits without retraining:
+
+```bash
+uv run python predict.py --visits NEW_VISITS.csv \
+    --static-model grm_tcm_results/model \
+    --dynamic-model grm_tcm_dynamic/model \
+    --out predictions.csv
+```
+
+Inputs must include the 12 observation columns plus `subject_id` and `day`. Outputs include `grm_mode_*` coordinates (via Nyström extension), `pred_next_day_score`, `pred_flare_prob`, and optionally `state_id`, `self_resonance`, `soft_self_resonance`, `top1_next_state`, `top1_next_state_prob`.
+
+Nyström uses feature-only KNN edges, so it is a defensible approximation for visits feature-close to training data and increasingly noisy for far-out points. Temporal and treatment edges from the training graph are not reconstructed.
+
+## Tests
+
+```bash
+uv sync --group dev
+uv run pytest
 ```
 
 To run the multi-seed difficulty/ablation sweep:
 
 ```bash
 uv run python grm_tcm_experiments.py
+uv run python grm_tcm_experiments.py --state-sources kmeans_observation,kmeans_dynamic,true_regime
 ```
 
 Inspect `grm_tcm_diagnostics/diagnostics_summary.json` first for a single run, or `grm_tcm_experiments/experiment_summary.json` after a sweep.
@@ -71,7 +100,10 @@ Most useful static GRM plots:
 - `grm_tcm_diagnostics/plots/predicted_vs_actual_next_day_score.png` — whether outcome predictions are calibrated or just biased.
 - `grm_tcm_diagnostics/plots/residual_histogram.png` — whether prediction errors are centered or systematically skewed.
 - `grm_tcm_diagnostics/plots/grm_modes_scatter_hidden_subtype.png` — whether embeddings separate true hidden subtypes.
+- `grm_tcm_diagnostics/plots/grm_modes_scatter_true_regime.png` — whether embeddings separate the simulator's true regimes.
 - `grm_tcm_diagnostics/plots/grm_modes_scatter_tcm_like_label.png` — whether embeddings separate semantic TCM-like labels.
+- `grm_tcm_diagnostics/plots/true_regime_occupancy_by_hidden_subtype.png` — whether the generator's hidden subtype changes regime occupancy.
+- `grm_tcm_diagnostics/plots/true_regime_distribution_by_tcm_label.png` — how noisy TCM-like labels merge or split true regimes.
 - `grm_tcm_diagnostics/plots/mean_grm_modes_by_hidden_subtype.png` and `mean_grm_modes_by_tcm_like_label.png` — which modes are associated with each grouping.
 
 Most useful dynamic GRM plots:
@@ -82,10 +114,14 @@ Most useful dynamic GRM plots:
 - `grm_tcm_dynamic/plots/subject_regime_change_score.png` — whether individual subject-level `G_s^(t)` changes before subject-level events.
 - `grm_tcm_dynamic/plots/subject_self_resonance_vs_dysregulation.png` — whether subject-conditioned self-resonance improves stuck-state interpretation.
 - `grm_tcm_dynamic/plots/pooled_transition_reliability.png` and `subject_transition_reliability.png` — whether GRM transition probabilities are better calibrated than Markov-only probabilities.
+- `grm_tcm_dynamic/plots/inferred_state_true_regime_confusion.png` — whether inferred state IDs separate the simulator's true regimes.
+- `grm_tcm_dynamic/plots/true_stuck_occupancy_by_hidden_subtype.png` — whether hidden subtype drives attractor occupancy as intended.
+- `grm_tcm_dynamic/plots/subject_resonance_vs_true_stuck_occupancy.png` — whether subject-level resonance tracks true stuck-regime occupancy.
 - `grm_tcm_dynamic/plots/selected_modes_over_time.png` — whether the energy-selected number of modes is stable or changes across regimes.
 - `grm_tcm_dynamic/plots/selected_modes_saturation.png` — whether selected modes are hitting the `max_modes` cap.
 - `grm_tcm_dynamic/plots/cumulative_spectral_energy.png` — whether the spectrum changes across rolling windows even when selected mode count is flat.
 - `grm_tcm_dynamic/plots/mean_cumulative_spectral_energy.png` — average energy captured by each mode rank.
+- `grm_tcm_dynamic/plots/state_source_metric_comparison.png` — whether observation states, dynamic-feature states, or oracle true-regime states explain the gap.
 
 The most meaningful visual comparison is:
 
@@ -101,9 +137,14 @@ Useful dynamic GRM options:
 uv run python grm_tcm_dynamic_grm.py --similarity-mode knn --state-similarity-k 3
 uv run python grm_tcm_dynamic_grm.py --similarity-mode threshold --similarity-quantile 0.8
 uv run python grm_tcm_dynamic_grm.py --state-fit-end-day 40
+uv run python grm_tcm_dynamic_grm.py --state-source kmeans_dynamic
+uv run python grm_tcm_dynamic_grm.py --state-source true_regime
+uv run python grm_tcm_dynamic_grm.py --compare-state-sources
 ```
 
 The first two sharpen the state graph when the Laplacian spectrum is too flat. `--state-fit-end-day` fits state centroids only on early visits and assigns later visits into that fixed state space, which is closer to an out-of-sample diagnostic.
+
+State sources control the discrete vocabulary used by dynamic GRM. `kmeans_observation` tests visible observation clusters, `kmeans_dynamic` adds short trajectory features to reduce aliasing, and `true_regime` is an oracle ceiling for the synthetic benchmark. `--compare-state-sources` writes `state_source_comparison.csv` and a comparison plot.
 
 Dynamic GRM now reports hard and soft self-resonance. Soft self-resonance weights each visit by RBF similarity to all state centroids, which removes the discrete stripe artifact from hard `G_ii` lookup. `subject_resonance_summary.csv` aggregates soft self-resonance per subject so it can be compared with subject-level metadata such as `hidden_subtype`.
 

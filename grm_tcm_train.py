@@ -29,6 +29,7 @@ import pandas as pd
 from scipy import sparse
 from scipy.linalg import orthogonal_procrustes
 from scipy.sparse.linalg import eigsh
+from sklearn.base import BaseEstimator
 from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
 from sklearn.impute import SimpleImputer
 from sklearn.linear_model import LogisticRegression, Ridge
@@ -37,6 +38,15 @@ from sklearn.model_selection import GroupShuffleSplit
 from sklearn.neighbors import NearestNeighbors
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
+
+from grm_tcm_persistence import (
+    canonicalize_eigvec_signs,
+    save_joblib,
+    write_manifest,
+)
+
+
+STATIC_SCHEMA_VERSION = "static-v1"
 
 
 OBSERVATION_NAMES = [
@@ -77,19 +87,36 @@ class GRMTCMTrainer:
         self.input_dir = Path(config.input_dir)
         self.output_dir = Path(config.output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.obs_preprocessor: Optional[Pipeline] = None
+        self.nn_index: Optional[NearestNeighbors] = None
+        self.knn_sigma: Optional[float] = None
+        self.eigenvalues: Optional[np.ndarray] = None
+        self.eigenvectors: Optional[np.ndarray] = None
+        self.train_degrees: Optional[np.ndarray] = None
+        self.ridge_reg: Optional[BaseEstimator] = None
+        self.logistic_clf: Optional[BaseEstimator] = None
+        self.train_idx: Optional[np.ndarray] = None
+        self.test_idx: Optional[np.ndarray] = None
+        self.procrustes_R: Optional[np.ndarray] = None
+        self._visit_index: Optional[pd.DataFrame] = None
 
     def run(self) -> Dict:
         visits, latent, events = self._load_data()
         visits = self._prepare_visits(visits)
+        self._visit_index = visits[["visit_id", "subject_id", "day"]].copy()
         X_obs, feature_names = self._make_observation_matrix(visits)
         W = self._build_visit_graph(visits, X_obs, events)
         eigenvalues, eigenvectors = self._spectral_decomposition(W)
+        eigenvectors = canonicalize_eigvec_signs(eigenvectors)
+        self.eigenvalues = eigenvalues
+        self.eigenvectors = eigenvectors
         embeddings = self._make_grm_embeddings(eigenvalues, eigenvectors)
 
-        embeddings_df = self._make_embeddings_df(visits, embeddings, eigenvalues)
+        embeddings_df = self._make_embeddings_df(visits, embeddings)
         metrics, predictions_df = self._evaluate(visits, embeddings, latent)
         feature_modes_df = self._feature_mode_correlations(visits, embeddings, feature_names)
         self._write_outputs(embeddings_df, feature_modes_df, metrics, predictions_df)
+        self._save_model()
         return metrics
 
     def _load_data(self) -> Tuple[pd.DataFrame, Optional[pd.DataFrame], Optional[pd.DataFrame]]:
@@ -115,7 +142,9 @@ class GRMTCMTrainer:
         if missing:
             raise ValueError(f"Missing observation columns: {missing}")
         pipe = Pipeline([("imputer", SimpleImputer(strategy="median")), ("scaler", StandardScaler())])
-        return pipe.fit_transform(visits[OBSERVATION_NAMES].to_numpy(dtype=float)), OBSERVATION_NAMES
+        X = pipe.fit_transform(visits[OBSERVATION_NAMES].to_numpy(dtype=float))
+        self.obs_preprocessor = pipe
+        return X, OBSERVATION_NAMES
 
     def _build_visit_graph(self, visits: pd.DataFrame, X: np.ndarray, events: Optional[pd.DataFrame]) -> sparse.csr_matrix:
         valid_modes = {
@@ -145,6 +174,8 @@ class GRMTCMTrainer:
             nonzero = nonzero[nonzero > 0]
             sigma = float(self.cfg.similarity_sigma or (np.median(nonzero) if len(nonzero) else 1.0))
             sigma = max(sigma, 1e-9)
+            self.nn_index = nn
+            self.knn_sigma = sigma
 
             for i in range(n):
                 for dist, j in zip(distances[i, 1:], indices[i, 1:]):
@@ -225,6 +256,7 @@ class GRMTCMTrainer:
         n = W.shape[0]
         degrees = np.asarray(W.sum(axis=1)).ravel()
         degrees = np.maximum(degrees, 1e-12)
+        self.train_degrees = degrees.copy()
         if self.cfg.use_normalized_laplacian:
             D_inv_sqrt = sparse.diags(1.0 / np.sqrt(degrees))
             L = sparse.eye(n, format="csr") - D_inv_sqrt @ W @ D_inv_sqrt
@@ -241,11 +273,10 @@ class GRMTCMTrainer:
         weights = 1.0 / (1.0 + (self.cfg.rho ** 2) * eigenvalues)
         return eigenvectors * weights.reshape(1, -1)
 
-    def _make_embeddings_df(self, visits: pd.DataFrame, embeddings: np.ndarray, eigenvalues: np.ndarray) -> pd.DataFrame:
+    def _make_embeddings_df(self, visits: pd.DataFrame, embeddings: np.ndarray) -> pd.DataFrame:
         df = visits[["visit_id", "subject_id", "day"]].copy()
         for i in range(embeddings.shape[1]):
             df[f"grm_mode_{i + 1}"] = embeddings[:, i]
-        df["_eigenvalues_json"] = json.dumps([float(x) for x in eigenvalues])
         return df
 
     def _evaluate(self, visits: pd.DataFrame, embeddings: np.ndarray, latent: Optional[pd.DataFrame]) -> Tuple[Dict, pd.DataFrame]:
@@ -253,16 +284,18 @@ class GRMTCMTrainer:
         y_cls = visits[self.cfg.target_classification].astype(int).to_numpy()
         groups = visits["subject_id"].to_numpy()
         train_idx, test_idx = next(GroupShuffleSplit(n_splits=1, test_size=self.cfg.test_size, random_state=self.cfg.random_seed).split(embeddings, y_reg, groups))
+        self.train_idx = train_idx
+        self.test_idx = test_idx
 
         X_grm = embeddings
         X_raw = self._raw_baseline_matrix(visits)
-        pred_grm_reg = self._fit_reg(X_grm, y_reg, train_idx, test_idx, "ridge")
-        pred_raw_reg = self._fit_reg(X_raw, y_reg, train_idx, test_idx, "random_forest")
+        pred_grm_reg, self.ridge_reg = self._fit_reg(X_grm, y_reg, train_idx, test_idx, "ridge")
+        pred_raw_reg, _ = self._fit_reg(X_raw, y_reg, train_idx, test_idx, "random_forest")
         pred_naive_reg = visits.iloc[test_idx]["global_dysregulation_score"].to_numpy(float)
         pred_naive_reg = np.nan_to_num(pred_naive_reg, nan=float(np.nanmedian(y_reg[train_idx])))
 
-        pred_grm_cls, prob_grm_cls = self._fit_cls(X_grm, y_cls, train_idx, test_idx, "logistic")
-        pred_raw_cls, prob_raw_cls = self._fit_cls(X_raw, y_cls, train_idx, test_idx, "random_forest")
+        pred_grm_cls, prob_grm_cls, self.logistic_clf = self._fit_cls(X_grm, y_cls, train_idx, test_idx, "logistic")
+        pred_raw_cls, prob_raw_cls, _ = self._fit_cls(X_raw, y_cls, train_idx, test_idx, "random_forest")
         naive_threshold = float(np.nanmedian(y_reg[train_idx]))
         pred_naive_cls = (pred_naive_reg >= naive_threshold).astype(int)
         prob_naive_cls = np.clip(pred_naive_reg / max(float(np.nanmax(y_reg[train_idx])), 1e-9), 0, 1)
@@ -279,7 +312,7 @@ class GRMTCMTrainer:
                 "raw_random_forest": self._cls_metrics(y_cls[test_idx], pred_raw_cls, prob_raw_cls),
                 "naive_current_score": self._cls_metrics(y_cls[test_idx], pred_naive_cls, prob_naive_cls),
             },
-            "latent_recovery": self._latent_recovery(visits, embeddings, latent) if latent is not None else {},
+            "latent_recovery": self._latent_recovery_capture(visits, embeddings, latent) if latent is not None else {},
         }
 
         pred_df = visits[["visit_id", "subject_id", "day", self.cfg.target_regression, self.cfg.target_classification]].copy()
@@ -302,7 +335,7 @@ class GRMTCMTrainer:
         return pipe.fit_transform(visits[cols].to_numpy(float))
 
     @staticmethod
-    def _fit_reg(X: np.ndarray, y: np.ndarray, train_idx: np.ndarray, test_idx: np.ndarray, model: str) -> np.ndarray:
+    def _fit_reg(X: np.ndarray, y: np.ndarray, train_idx: np.ndarray, test_idx: np.ndarray, model: str) -> Tuple[np.ndarray, BaseEstimator]:
         if model == "ridge":
             reg = Ridge(alpha=1.0)
         elif model == "random_forest":
@@ -310,15 +343,15 @@ class GRMTCMTrainer:
         else:
             raise ValueError(model)
         reg.fit(X[train_idx], y[train_idx])
-        return reg.predict(X[test_idx])
+        return reg.predict(X[test_idx]), reg
 
     @staticmethod
-    def _fit_cls(X: np.ndarray, y: np.ndarray, train_idx: np.ndarray, test_idx: np.ndarray, model: str) -> Tuple[np.ndarray, np.ndarray]:
+    def _fit_cls(X: np.ndarray, y: np.ndarray, train_idx: np.ndarray, test_idx: np.ndarray, model: str) -> Tuple[np.ndarray, np.ndarray, Optional[BaseEstimator]]:
         if len(np.unique(y[train_idx])) < 2:
             constant = int(y[train_idx][0]) if len(train_idx) else 0
             pred = np.full(len(test_idx), constant, dtype=int)
             prob = np.full(len(test_idx), float(constant), dtype=float)
-            return pred, prob
+            return pred, prob, None
         if model == "logistic":
             clf = LogisticRegression(max_iter=2000, class_weight="balanced")
         elif model == "random_forest":
@@ -328,7 +361,7 @@ class GRMTCMTrainer:
         clf.fit(X[train_idx], y[train_idx])
         pred = clf.predict(X[test_idx])
         prob = clf.predict_proba(X[test_idx])[:, 1]
-        return pred, prob
+        return pred, prob, clf
 
     @staticmethod
     def _reg_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> Dict[str, float]:
@@ -345,8 +378,7 @@ class GRMTCMTrainer:
         out["roc_auc"] = float(roc_auc_score(y_true, y_prob)) if len(np.unique(y_true)) > 1 else float("nan")
         return out
 
-    @staticmethod
-    def _latent_recovery(visits: pd.DataFrame, embeddings: np.ndarray, latent: pd.DataFrame) -> Dict[str, object]:
+    def _latent_recovery_capture(self, visits: pd.DataFrame, embeddings: np.ndarray, latent: pd.DataFrame) -> Dict[str, object]:
         merged = visits[["visit_id", "subject_id", "day"]].merge(
             latent[["subject_id", "day"] + LATENT_NAMES], on=["subject_id", "day"], how="left"
         )
@@ -356,6 +388,7 @@ class GRMTCMTrainer:
         E = StandardScaler().fit_transform(embeddings)
         q = min(E.shape[1], Z.shape[1])
         R, _ = orthogonal_procrustes(E[:, :q], Z[:, :q])
+        self.procrustes_R = R
         E_aligned = E[:, :q] @ R
         corrs = [float(np.corrcoef(E_aligned[:, j], Z[:, j])[0, 1]) for j in range(q)]
         return {
@@ -383,6 +416,69 @@ class GRMTCMTrainer:
         predictions.to_csv(self.output_dir / "grm_predictions.csv", index=False)
         with open(self.output_dir / "grm_metrics.json", "w", encoding="utf-8") as f:
             json.dump(metrics, f, indent=2)
+
+    def _save_model(self) -> None:
+        """Persist the fitted static GRM-TCM pipeline."""
+
+        if self.eigenvalues is None or self.eigenvectors is None:
+            raise RuntimeError("Model state missing; run() must populate eigenpairs before _save_model().")
+        model_dir = self.output_dir / "model"
+        model_dir.mkdir(parents=True, exist_ok=True)
+
+        if self.obs_preprocessor is not None:
+            save_joblib(self.obs_preprocessor, model_dir / "obs_preprocessor.joblib")
+
+        basis_arrays = dict(
+            eigenvalues=self.eigenvalues,
+            eigenvectors=self.eigenvectors,
+            rho=np.asarray(self.cfg.rho, dtype=float),
+            normalized=np.asarray(self.cfg.use_normalized_laplacian, dtype=bool),
+            n_modes=np.asarray(self.cfg.n_modes, dtype=int),
+            graph_mode=np.asarray(self.cfg.graph_mode),
+        )
+        if self.train_degrees is not None:
+            basis_arrays["train_degrees"] = self.train_degrees
+        np.savez_compressed(model_dir / "grm_basis.npz", **basis_arrays)
+
+        if self.nn_index is not None:
+            save_joblib(self.nn_index, model_dir / "nn_index.joblib")
+            with open(model_dir / "knn_sigma.json", "w", encoding="utf-8") as f:
+                json.dump({"knn_sigma": float(self.knn_sigma) if self.knn_sigma is not None else None}, f)
+
+        if self.ridge_reg is not None:
+            save_joblib(self.ridge_reg, model_dir / "ridge_next_day.joblib")
+        if self.logistic_clf is not None:
+            save_joblib(self.logistic_clf, model_dir / "logistic_flare.joblib")
+
+        if self.train_idx is not None and self.test_idx is not None:
+            with open(model_dir / "split_indices.json", "w", encoding="utf-8") as f:
+                json.dump(
+                    {
+                        "seed": int(self.cfg.random_seed),
+                        "test_size": float(self.cfg.test_size),
+                        "train": [int(i) for i in self.train_idx],
+                        "test": [int(i) for i in self.test_idx],
+                    },
+                    f,
+                )
+
+        if self.procrustes_R is not None:
+            np.save(model_dir / "procrustes_R.npy", self.procrustes_R)
+
+        if self._visit_index is not None:
+            self._visit_index.to_parquet(model_dir / "visit_index.parquet", index=False)
+
+        write_manifest(
+            model_dir,
+            config=self.cfg,
+            inputs=[
+                self.input_dir / "visits.csv",
+                self.input_dir / "latent_states.csv",
+                self.input_dir / "events.csv",
+            ],
+            schema_version=STATIC_SCHEMA_VERSION,
+            random_seed=self.cfg.random_seed,
+        )
 
 
 if __name__ == "__main__":

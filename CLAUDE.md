@@ -22,7 +22,36 @@ Each stage reads only the outputs of the previous stages, so they are independen
 | `synthetic_grm_tcm/` | Generator outputs (`subjects.csv`, `visits.csv`, `latent_states.csv`, `events.csv`, `metadata.json`) |
 | `grm_tcm_results/` | Trainer outputs (`grm_visit_embeddings.csv`, `grm_feature_modes.csv`, `grm_predictions.csv`, `grm_metrics.json`) |
 | `grm_tcm_diagnostics/` | Diagnostics outputs (CSV tables, `diagnostics_summary.json`, `plots/*.png`) |
-| `pyproject.toml` | Deps: numpy, pandas, scipy, scikit-learn, matplotlib (managed by uv) |
+| `grm_tcm_dynamic_grm.py` | Rolling-window GRM diagnostics: G^(t), regime-change, self-resonance, transition reliability |
+| `grm_tcm_persistence.py` | Manifest + npz/joblib helpers shared by train and dynamic pipelines |
+| `grm_tcm_load.py` | `load_static_model` / `load_dynamic_model` — typed dataclass loaders |
+| `predict.py` | Out-of-sample inference via Nyström extension; no retraining |
+| `tests/` | pytest suite (`uv run pytest`) |
+| `pyproject.toml` | Deps: numpy, pandas, scipy, scikit-learn, matplotlib, joblib, pyarrow (managed by uv) |
+
+## Persisted model artifacts
+
+Each output dir gets a `model/` subdirectory written next to the existing CSVs.
+
+`grm_tcm_results/model/`:
+- `manifest.json` — config, git sha, input hashes, package versions, schema `static-v1`
+- `obs_preprocessor.joblib` — median-impute + standardize over the 12 observations
+- `grm_basis.npz` — eigenvalues, eigenvectors, `rho`, `normalized` flag, `train_degrees`
+- `nn_index.joblib` + `knn_sigma.json` — KNN attach for Nyström extension
+- `ridge_next_day.joblib`, `logistic_flare.joblib` — prediction heads
+- `split_indices.json` — train/test indices used in evaluation
+- `procrustes_R.npy` — synthetic-only latent-recovery rotation
+- `visit_index.parquet` — `(visit_id, subject_id, day)` aligned with eigenvector rows
+
+`grm_tcm_dynamic/model/`:
+- `manifest.json` — schema `dynamic-v1`; `extra.static_manifest_sha` cross-links the static manifest. Loaders refuse mismatches.
+- `state_preprocessor.joblib`, `state_kmeans.joblib`, `state_centroids.npy`, `state_metadata.json` — state vocabulary; KMeans is absent when `state_source="true_regime"`.
+- `state_weights_visit.npy` — V × K soft RBF assignment matrix.
+- `G_matrices.npz`, `grm_transition_matrices.npz`, `markov_transition_matrices.npz` — keyed by window end-day.
+- `spectral_basis_per_window.npz` + `spectral_basis_sidecar.json` — Λ^(t), Ψ^(t), r_s, selected_modes per window.
+- `window_index.parquet` — per-window audit log.
+
+`predict.py` consumes both manifests, applies Nyström extension to new visits, and emits ridge/logistic predictions plus optional dynamic scores (state, self-resonance, top-1 next-state). Nyström uses feature-only edges, so it is an approximation of the multi-relational training graph.
 
 ## Key data schemas
 
