@@ -1,0 +1,93 @@
+{
+  "config": {
+    "data_dir": "synthetic_grm_tcm",
+    "static_model_dir": "grm_tcm_results/model",
+    "dynamic_model_dir": "grm_tcm_dynamic/model",
+    "output_dir": "grm_tcm_dynamic_eval",
+    "scope": [
+      "all"
+    ],
+    "seed": 42,
+    "bootstrap_n": 200,
+    "cv_splits": 5,
+    "aliased_k_nn": 10,
+    "aliased_min_each": 3,
+    "dirichlet_kappa": 10.0,
+    "grm_blend_alpha": 0.65
+  },
+  "verdicts": {
+    "grm_beats_markov_log_loss": {
+      "magnitude": -0.020077412306888753,
+      "ci_low": -0.10058921828796619,
+      "ci_high": 0.06323157733758,
+      "passes": null,
+      "description": "GRM-blended transition log-loss vs empirical Markov (positive = GRM helps)."
+    },
+    "grm_beats_strong_baseline_log_loss": {
+      "magnitude": -0.11934330866529441,
+      "ci_low": -0.16394401254577273,
+      "ci_high": -0.06873091923618091,
+      "passes": false,
+      "description": "GRM-blended vs strong baseline (current_regime + dwell + delayed_loads)."
+    },
+    "grm_beats_markov_brier": {
+      "magnitude": -0.005383003648329221,
+      "ci_low": -0.012796914005046789,
+      "ci_high": 0.0016422362812834601,
+      "passes": null,
+      "description": "Brier score: GRM-blended vs empirical Markov."
+    },
+    "grm_separates_aliased_states": {
+      "magnitude": 0.1818437324339517,
+      "ci_low": 0.16277472858674757,
+      "ci_high": 0.20085105858713026,
+      "passes": true,
+      "description": "Fraction of aliased visits where GRM neighborhood entropy < observation entropy (positive = GRM separates)."
+    },
+    "grm_attractor_auc_lift_aliased": {
+      "magnitude": 0.05218314684305969,
+      "ci_low": 0.030071054299661122,
+      "ci_high": 0.07529761464400885,
+      "passes": true,
+      "description": "AUC lift for attractor_state via k-NN on aliased visits: GRM minus obs (subject cluster bootstrap)."
+    },
+    "grm_next_regime_top1_lift_aliased": {
+      "magnitude": 0.013651877133105783,
+      "ci_low": -0.007504485049833853,
+      "ci_high": 0.033063779330413906,
+      "passes": null,
+      "description": "Top-1 next_regime accuracy lift on aliased visits: GRM minus obs (subject cluster bootstrap)."
+    },
+    "grm_silhouette_lift_aliased": {
+      "magnitude": -0.026214812160087492,
+      "ci_low": -0.06818550906860371,
+      "ci_high": 0.014790650628785047,
+      "passes": null,
+      "description": "Silhouette lift by true_regime on aliased visits: GRM minus obs (subject cluster bootstrap)."
+    },
+    "grm_helps_hidden_subtype_recovery": {
+      "magnitude": 0.09114681614681619,
+      "ci_low": -0.041466468716468634,
+      "ci_high": 0.16313629888629888,
+      "passes": null,
+      "description": "Hidden_subtype macro-F1 lift: (strong_baseline + GRM) minus strong_baseline (subject bootstrap).",
+      "strong_baseline_f1": 0.3466213416213416,
+      "strong_plus_grm_f1": 0.4377681577681578
+    }
+  },
+  "framing": "Diagnostic on a known synthetic generator. Not a biological simulator. Not evidence for TCM or Qi. Verdicts describe latent-state recovery, attractor fingerprinting, and ontology-mismatch detection on synthetic data.",
+  "ablations": {
+    "shuffled_time_grm": {
+      "t2_attractor_auc_aliased": 0.5204585497032641,
+      "vs_full_grm": 0.10104926537256842
+    },
+    "random_embedding": {
+      "t2_attractor_auc_aliased": 0.5248722387075503,
+      "vs_full_grm": 0.09663557636828224
+    },
+    "raw_observations": {
+      "t2_attractor_auc_aliased": 0.5693246682327728,
+      "vs_full_grm": 0.05218314684305969
+    }
+  }
+}
