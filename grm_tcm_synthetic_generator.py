@@ -22,6 +22,7 @@ Outputs:
   synthetic_grm_tcm/metadata.json
 """
 
+import argparse
 import json
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -63,6 +64,7 @@ class GeneratorConfig:
     latent_dim: int = 4
     random_seed: int = 42
     output_dir: str = "synthetic_grm_tcm"
+    difficulty: str = "medium"
 
     latent_noise_std: float = 0.18
     obs_noise_std: float = 0.45
@@ -76,8 +78,65 @@ class GeneratorConfig:
     crash_threshold: float = 0.85
 
     hidden_subtype_strength: float = 0.45
+    delayed_treatment_effect: float = 0.20
+    label_noise_rate: float = 0.03
+    practitioner_bias: float = 0.20
     split_spleen_like_label: bool = True
     merge_liver_damp_like_labels: bool = True
+
+    def __post_init__(self) -> None:
+        if self.difficulty not in DIFFICULTY_PRESETS:
+            raise ValueError(f"Unknown difficulty: {self.difficulty}. Choose one of {sorted(DIFFICULTY_PRESETS)}")
+        for key, value in DIFFICULTY_PRESETS[self.difficulty].items():
+            setattr(self, key, value)
+
+
+DIFFICULTY_PRESETS = {
+    "easy": {
+        "latent_noise_std": 0.10,
+        "obs_noise_std": 0.28,
+        "missing_rate": 0.01,
+        "stress_event_rate": 0.07,
+        "treatment_event_rate": 0.10,
+        "hidden_subtype_strength": 0.70,
+        "delayed_treatment_effect": 0.05,
+        "label_noise_rate": 0.00,
+        "practitioner_bias": 0.05,
+    },
+    "medium": {
+        "latent_noise_std": 0.18,
+        "obs_noise_std": 0.45,
+        "missing_rate": 0.03,
+        "stress_event_rate": 0.10,
+        "treatment_event_rate": 0.12,
+        "hidden_subtype_strength": 0.45,
+        "delayed_treatment_effect": 0.20,
+        "label_noise_rate": 0.03,
+        "practitioner_bias": 0.20,
+    },
+    "hard": {
+        "latent_noise_std": 0.28,
+        "obs_noise_std": 0.70,
+        "missing_rate": 0.08,
+        "stress_event_rate": 0.14,
+        "treatment_event_rate": 0.15,
+        "hidden_subtype_strength": 0.28,
+        "delayed_treatment_effect": 0.45,
+        "label_noise_rate": 0.10,
+        "practitioner_bias": 0.45,
+    },
+    "chaotic": {
+        "latent_noise_std": 0.40,
+        "obs_noise_std": 0.95,
+        "missing_rate": 0.15,
+        "stress_event_rate": 0.20,
+        "treatment_event_rate": 0.19,
+        "hidden_subtype_strength": 0.15,
+        "delayed_treatment_effect": 0.65,
+        "label_noise_rate": 0.20,
+        "practitioner_bias": 0.75,
+    },
+}
 
 
 class SyntheticGRMTCMGenerator:
@@ -189,10 +248,12 @@ class SyntheticGRMTCMGenerator:
                 subj.baseline_digestive_instability,
             ], dtype=float)
             treatment_proto = self.treatment_prototypes[subtype]
+            pending_treatment = np.zeros(self.cfg.latent_dim)
 
             for day in range(self.cfg.n_days):
-                u = np.zeros(self.cfg.latent_dim)
-                for event in self._sample_events():
+                u = pending_treatment.copy()
+                pending_treatment = np.zeros(self.cfg.latent_dim)
+                for event in self._sample_events(z):
                     effect = self.B_events[event].copy()
                     if event == "stress_event":
                         effect *= subj.sensitivity_stress
@@ -200,6 +261,9 @@ class SyntheticGRMTCMGenerator:
                         effect *= subj.sensitivity_recovery
                     elif event == "treatment_event":
                         effect = effect * subj.sensitivity_treatment + treatment_proto
+                        delayed = float(np.clip(self.cfg.delayed_treatment_effect, 0.0, 0.95))
+                        pending_treatment += delayed * effect
+                        effect = (1.0 - delayed) * effect
                     u += effect
                     event_rows.append({"subject_id": sid, "day": day, "event_type": event})
 
@@ -230,13 +294,15 @@ class SyntheticGRMTCMGenerator:
 
         return pd.DataFrame(visit_rows), pd.DataFrame(latent_rows), pd.DataFrame(event_rows)
 
-    def _sample_events(self) -> List[str]:
+    def _sample_events(self, z: np.ndarray) -> List[str]:
         events = []
         if self.rng.random() < self.cfg.stress_event_rate:
             events.append("stress_event")
         if self.rng.random() < self.cfg.recovery_event_rate:
             events.append("recovery_event")
-        if self.rng.random() < self.cfg.treatment_event_rate:
+        dysregulation = float(np.clip(np.mean(np.maximum(z, 0.0)), 0.0, 3.0) / 3.0)
+        treatment_rate = self.cfg.treatment_event_rate * (1.0 + self.cfg.practitioner_bias * dysregulation)
+        if self.rng.random() < min(treatment_rate, 0.95):
             events.append("treatment_event")
         return events
 
@@ -331,7 +397,23 @@ class SyntheticGRMTCMGenerator:
         df["qi_like_label"] = qi_labels
         df["tcm_like_label"] = tcm_labels
         df["contrarian_signature"] = signatures
+        df = self._inject_label_noise(df)
         return df
+
+    def _inject_label_noise(self, df: pd.DataFrame) -> pd.DataFrame:
+        out = df.copy()
+        rate = float(np.clip(self.cfg.label_noise_rate, 0.0, 1.0))
+        if rate <= 0.0 or out.empty:
+            return out
+        qi_choices = np.array(sorted(out["qi_like_label"].dropna().unique()))
+        tcm_choices = np.array(sorted(out["tcm_like_label"].dropna().unique()))
+        mask = self.rng.random(len(out)) < rate
+        if len(qi_choices):
+            out.loc[mask, "qi_like_label"] = self.rng.choice(qi_choices, size=int(mask.sum()))
+        if len(tcm_choices):
+            out.loc[mask, "tcm_like_label"] = self.rng.choice(tcm_choices, size=int(mask.sum()))
+        out.loc[mask, "contrarian_signature"] = "label_noise_injected"
+        return out
 
     def _inject_missingness(self, df: pd.DataFrame) -> pd.DataFrame:
         out = df.copy()
@@ -376,8 +458,25 @@ def summarize_dataset(visits: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame({"non_null": visits.notna().sum(), "mean": numeric.mean(), "std": numeric.std()})
 
 
+def parse_args() -> GeneratorConfig:
+    parser = argparse.ArgumentParser(description="Generate a synthetic GRM-TCM benchmark dataset.")
+    parser.add_argument("--output-dir", default="synthetic_grm_tcm")
+    parser.add_argument("--difficulty", default="medium", choices=sorted(DIFFICULTY_PRESETS))
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--n-subjects", type=int, default=80)
+    parser.add_argument("--n-days", type=int, default=60)
+    args = parser.parse_args()
+    return GeneratorConfig(
+        n_subjects=args.n_subjects,
+        n_days=args.n_days,
+        random_seed=args.seed,
+        output_dir=args.output_dir,
+        difficulty=args.difficulty,
+    )
+
+
 if __name__ == "__main__":
-    cfg = GeneratorConfig()
+    cfg = parse_args()
     gen = SyntheticGRMTCMGenerator(cfg)
     outputs = gen.run()
     print(f"Wrote synthetic dataset to: {gen.output_dir.resolve()}")

@@ -60,6 +60,7 @@ class GRMTrainConfig:
     temporal_edge_weight: float = 0.75
     same_subject_edge_weight: float = 0.15
     treatment_edge_weight: float = 0.20
+    graph_mode: str = "feature_temporal_treatment"
 
     n_modes: int = 8
     rho: float = 1.0
@@ -117,52 +118,73 @@ class GRMTCMTrainer:
         return pipe.fit_transform(visits[OBSERVATION_NAMES].to_numpy(dtype=float)), OBSERVATION_NAMES
 
     def _build_visit_graph(self, visits: pd.DataFrame, X: np.ndarray, events: Optional[pd.DataFrame]) -> sparse.csr_matrix:
+        valid_modes = {
+            "feature_only",
+            "temporal_only",
+            "feature_temporal",
+            "feature_temporal_treatment",
+            "random_graph",
+        }
+        if self.cfg.graph_mode not in valid_modes:
+            raise ValueError(f"Unknown graph_mode: {self.cfg.graph_mode}. Choose one of {sorted(valid_modes)}")
+        if self.cfg.graph_mode == "random_graph":
+            return self._build_random_graph(len(visits))
+
         n = len(visits)
         rows: List[int] = []
         cols: List[int] = []
         vals: List[float] = []
+        indices: Optional[np.ndarray] = None
 
         # KNN graph on observation similarity.
-        nn = NearestNeighbors(n_neighbors=min(self.cfg.n_neighbors + 1, n), metric="euclidean")
-        nn.fit(X)
-        distances, indices = nn.kneighbors(X)
-        nonzero = distances[:, 1:].ravel()
-        nonzero = nonzero[nonzero > 0]
-        sigma = float(self.cfg.similarity_sigma or (np.median(nonzero) if len(nonzero) else 1.0))
-        sigma = max(sigma, 1e-9)
+        if self.cfg.graph_mode in {"feature_only", "feature_temporal", "feature_temporal_treatment"}:
+            nn = NearestNeighbors(n_neighbors=min(self.cfg.n_neighbors + 1, n), metric="euclidean")
+            nn.fit(X)
+            distances, indices = nn.kneighbors(X)
+            nonzero = distances[:, 1:].ravel()
+            nonzero = nonzero[nonzero > 0]
+            sigma = float(self.cfg.similarity_sigma or (np.median(nonzero) if len(nonzero) else 1.0))
+            sigma = max(sigma, 1e-9)
 
-        for i in range(n):
-            for dist, j in zip(distances[i, 1:], indices[i, 1:]):
-                weight = float(np.exp(-(dist ** 2) / (2.0 * sigma ** 2)))
-                rows += [i, int(j)]
-                cols += [int(j), i]
-                vals += [weight, weight]
+            for i in range(n):
+                for dist, j in zip(distances[i, 1:], indices[i, 1:]):
+                    weight = float(np.exp(-(dist ** 2) / (2.0 * sigma ** 2)))
+                    rows += [i, int(j)]
+                    cols += [int(j), i]
+                    vals += [weight, weight]
 
         # Temporal same-subject edges.
         visit_index = {(int(r.subject_id), int(r.day)): int(r.visit_id) for r in visits.itertuples(index=False)}
-        for r in visits.itertuples(index=False):
-            i = int(r.visit_id)
-            nxt = (int(r.subject_id), int(r.day) + 1)
-            if nxt in visit_index:
-                j = visit_index[nxt]
-                rows += [i, j]
-                cols += [j, i]
-                vals += [self.cfg.temporal_edge_weight, self.cfg.temporal_edge_weight]
+        if self.cfg.graph_mode in {"temporal_only", "feature_temporal", "feature_temporal_treatment"}:
+            for r in visits.itertuples(index=False):
+                i = int(r.visit_id)
+                nxt = (int(r.subject_id), int(r.day) + 1)
+                if nxt in visit_index:
+                    j = visit_index[nxt]
+                    rows += [i, j]
+                    cols += [j, i]
+                    vals += [self.cfg.temporal_edge_weight, self.cfg.temporal_edge_weight]
 
-        # Weak same-subject smoothness edges up to 3 days away.
-        for _, group in visits.groupby("subject_id"):
-            ids = group["visit_id"].to_numpy(int)
-            days = group["day"].to_numpy(int)
-            for a in range(len(ids)):
-                for b in range(a + 2, min(a + 4, len(ids))):
-                    dt = abs(int(days[b]) - int(days[a]))
-                    weight = float(self.cfg.same_subject_edge_weight * np.exp(-dt / 3.0))
-                    rows += [ids[a], ids[b]]
-                    cols += [ids[b], ids[a]]
-                    vals += [weight, weight]
+            # Weak same-subject smoothness edges up to 3 days away.
+            for _, group in visits.groupby("subject_id"):
+                ids = group["visit_id"].to_numpy(int)
+                days = group["day"].to_numpy(int)
+                for a in range(len(ids)):
+                    for b in range(a + 2, min(a + 4, len(ids))):
+                        dt = abs(int(days[b]) - int(days[a]))
+                        weight = float(self.cfg.same_subject_edge_weight * np.exp(-dt / 3.0))
+                        rows += [ids[a], ids[b]]
+                        cols += [ids[b], ids[a]]
+                        vals += [weight, weight]
 
         # Optional treatment-similarity edges among feature-near treatment visits.
-        if events is not None and not events.empty and "event_type" in events.columns:
+        if (
+            self.cfg.graph_mode == "feature_temporal_treatment"
+            and indices is not None
+            and events is not None
+            and not events.empty
+            and "event_type" in events.columns
+        ):
             treatment_keys = {
                 (int(r.subject_id), int(r.day))
                 for r in events[events["event_type"] == "treatment_event"][["subject_id", "day"]].itertuples(index=False)
@@ -177,6 +199,23 @@ class GRMTCMTrainer:
                             cols += [j, i]
                             vals += [self.cfg.treatment_edge_weight, self.cfg.treatment_edge_weight]
 
+        W = sparse.coo_matrix((vals, (rows, cols)), shape=(n, n)).tocsr()
+        W.setdiag(0.0)
+        W.eliminate_zeros()
+        return W.maximum(W.T)
+
+    def _build_random_graph(self, n: int) -> sparse.csr_matrix:
+        rng = np.random.default_rng(self.cfg.random_seed)
+        rows: List[int] = []
+        cols: List[int] = []
+        vals: List[float] = []
+        degree = min(max(self.cfg.n_neighbors, 2), max(n - 1, 1))
+        for i in range(n):
+            choices = rng.choice(np.delete(np.arange(n), i), size=degree, replace=False)
+            for j in choices:
+                rows += [i, int(j)]
+                cols += [int(j), i]
+                vals += [1.0, 1.0]
         W = sparse.coo_matrix((vals, (rows, cols)), shape=(n, n)).tocsr()
         W.setdiag(0.0)
         W.eliminate_zeros()
@@ -275,6 +314,11 @@ class GRMTCMTrainer:
 
     @staticmethod
     def _fit_cls(X: np.ndarray, y: np.ndarray, train_idx: np.ndarray, test_idx: np.ndarray, model: str) -> Tuple[np.ndarray, np.ndarray]:
+        if len(np.unique(y[train_idx])) < 2:
+            constant = int(y[train_idx][0]) if len(train_idx) else 0
+            pred = np.full(len(test_idx), constant, dtype=int)
+            prob = np.full(len(test_idx), float(constant), dtype=float)
+            return pred, prob
         if model == "logistic":
             clf = LogisticRegression(max_iter=2000, class_weight="balanced")
         elif model == "random_forest":

@@ -5,3 +5,5 @@ __pycache__/
 
 /synthetic_grm_tcm/
 /grm_tcm_results/
+/grm_tcm_experiments/
+/grm_tcm_dynamic/

@@ -357,12 +357,108 @@ Start with:
 
 That is enough to tell whether this is worth pursuing.
 
-Next step should be:
+Initial implementation:
 
-1. define the latent variables
-2. define observation equations
-3. define interventions and flare logic
-4. generate CSVs
-5. run GRM vs baselines
+1. define the latent variables — done
+2. define observation equations — done
+3. define interventions and flare logic — done
+4. generate CSVs — done
+5. run GRM vs baselines — done
 
-I can generate the full **synthetic data spec + Python generator** next.
+The current prototype includes:
+
+- `grm_tcm_synthetic_generator.py`
+- `grm_tcm_train.py`
+- `grm_tcm_diagnostics.py`
+- `grm_tcm_dynamic_grm.py`
+- `grm_tcm_experiments.py`
+
+## Strategic Path
+
+1. Diagnostics — done
+2. Difficulty modes — done
+3. Ablations — done
+4. Multi-seed experiments — implemented
+5. Dynamic / inductive GRM — first pass implemented
+6. Intervention-response analysis
+7. Real-world pilot schema
+8. Optional molecular/proteomics extension
+
+`grm_tcm_experiments.py` now runs the full pipeline across random seeds, difficulty settings, and ablations.
+
+Difficulty settings:
+
+- easy
+- medium
+- hard
+- chaotic
+
+They adjust latent noise, observation noise, missingness, stress and treatment event rates, hidden subtype strength, delayed treatment effect, label noise, and practitioner bias.
+
+Implemented ablations:
+
+- feature similarity only
+- temporal only
+- feature + temporal
+- feature + temporal + treatment
+- random graph control
+- permuted label control
+
+## Current Diagnostic Answers
+
+Current single-run diagnostics answer the four core questions this way:
+
+1. **Did GRM recover the hidden latent state?**
+
+   Partially. The trainer reports mean absolute aligned latent correlation around `0.406`, and diagnostics find a best absolute GRM-mode/latent correlation around `0.682`. That is real synthetic latent recovery, but not strong enough to claim the current spectral embedding fully recovers the hidden state.
+
+2. **Did GRM predict outcome better than naive baselines?**
+
+   No for next-day score regression. Current R2 values are roughly:
+
+   - GRM ridge: `0.170`
+   - raw random forest: `0.974`
+   - naive current score: `0.973`
+
+   GRM flare prediction is high in this synthetic run, with ROC-AUC around `1.000`, but the raw and naive baselines are also near-ceiling. This means the outcome is currently too easy for short-horizon baselines.
+
+3. **Did GRM discover label mismatch / hidden subtypes?**
+
+   Yes, as a diagnostics target. The current diagnostics produce `8` contrarian findings and ontology-mismatch tables showing TCM-like labels mixing hidden subtypes and hidden subtypes splitting across labels. This is synthetic mismatch detection, not validation of TCM categories.
+
+4. **Did GRM clusters align more with true latent structure than with naive TCM-like labels?**
+
+   No in the current single run. Cluster alignment with `hidden_subtype` is near zero (`ARI` about `0.00`, `NMI` about `0.006` at best), while alignment with `tcm_like_label` is higher (`NMI` about `0.281` at best). That suggests the current embedding clusters track observed semantic/label structure more than the generator's hidden subtype IDs.
+
+## Dynamic GRM Port
+
+`grm_tcm_dynamic_grm.py` implements the next piece from the markets GRM formulation:
+
+- rolling-window `G^(t)`
+- regime-change score `||G^(t) - G^(t-1)||_F`
+- self-resonance / stuck-state score `G_ii`
+- GRM-blended transition probabilities against Markov-only transitions
+- data-derived `r_s`
+- energy-based mode selection
+
+Current single-run dynamic metrics are mixed:
+
+- rolling regime-change flare AUC: about `0.48`
+- self-resonance flare AUC: about `0.74`
+- soft self-resonance flare AUC: about `0.83`
+- GRM transition accuracy: about `0.79`
+- transition accuracy lift over Markov-only: about `0.002`
+- subject-level rolling regime-change flare AUC: about `0.66`
+- subject-level soft self-resonance flare AUC: about `0.84`
+- subject-level transition accuracy lift over Markov-only: about `0.055`
+- subject-level soft self-resonance vs hidden subtype eta-squared: about `0.009`
+
+Interpretation: the first dynamic port makes `G` meaningful as a propagator object, not only an embedding source. The useful signal is currently self-resonance / stuck-state detection. Rolling regime change and transition blending need more work before they can be considered strong flare predictors.
+
+The subject-conditioned extension is the important correction. Pooled `R_t` measures population graph deformation and does not align with subject-level flares. Subject-level `R_{s,t}` is more meaningful for physiology and improves flare signal in the current default run. Soft self-resonance is better than hard state lookup because it removes the discrete stripe artifact and treats each visit as a weighted mixture over attractor states.
+
+The subject-level mean soft self-resonance does **not** recover `hidden_subtype` yet; the current eta-squared is near zero. That is a useful negative result: self-resonance is currently a flare-risk / stuck-state marker, not a hidden-subtype marker.
+
+Sharpening the state graph with KNN similarity can further improve dynamic scores; for example, `--similarity-mode knn --state-similarity-k 3 --max-modes 16` increased soft self-resonance AUC in the current smoke test. Early-fit state assignment with `--state-fit-end-day 40` is more honest as a predictive diagnostic, but weaker, so future reported predictive claims should distinguish transductive diagnostics from early-fit validation.
+
+Interpretation guardrail: these are synthetic benchmark results only. They test latent-state recovery, ontology mismatch detection, and ablation behavior; they do not prove TCM, Qi, or a biological mechanism.

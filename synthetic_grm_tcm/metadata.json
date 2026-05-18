@@ -5,6 +5,7 @@
     "latent_dim": 4,
     "random_seed": 42,
     "output_dir": "synthetic_grm_tcm",
+    "difficulty": "medium",
     "latent_noise_std": 0.18,
     "obs_noise_std": 0.45,
     "missing_rate": 0.03,
@@ -14,6 +15,9 @@
     "flare_threshold": 0.65,
     "crash_threshold": 0.85,
     "hidden_subtype_strength": 0.45,
+    "delayed_treatment_effect": 0.2,
+    "label_noise_rate": 0.03,
+    "practitioner_bias": 0.2,
     "split_spleen_like_label": true,
     "merge_liver_damp_like_labels": true
   },

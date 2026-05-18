@@ -16,25 +16,25 @@
     "grm_mode_7",
     "grm_mode_8"
   ],
-  "best_abs_grm_latent_correlation": 0.6803643558723368,
+  "best_abs_grm_latent_correlation": 0.6815567245323063,
   "next_day_prediction": {
     "n": 1180,
-    "mae": 0.1614503092058102,
-    "rmse": 0.18155108789026236,
-    "bias": 0.12852392174946908,
-    "mean_error": 0.12852392174946908,
-    "median_abs_error": 0.18278647301876705,
-    "error_std": 0.12822791838080397
+    "mae": 0.16244651246415645,
+    "rmse": 0.18260932648576203,
+    "bias": 0.12833658742127002,
+    "mean_error": 0.12833658742127002,
+    "median_abs_error": 0.1826146767056238,
+    "error_std": 0.12990722246529
   },
   "flare_prediction": {
     "n": 1180,
     "positive_rate": 0.03728813559322034,
-    "accuracy": 0.9940677966101695,
-    "roc_auc": 0.999419814340589
+    "accuracy": 0.9966101694915255,
+    "roc_auc": 0.9997399167733675
   },
-  "best_cluster_normalized_mutual_info": 0.3113835042734942,
-  "best_cluster_adjusted_rand_index": 0.111210193936245,
-  "n_grouped_performance_rows": 17,
+  "best_cluster_normalized_mutual_info": 0.2965250657580466,
+  "best_cluster_adjusted_rand_index": 0.15919928489895138,
+  "n_grouped_performance_rows": 18,
   "n_contrarian_findings": 8,
   "trainer_metrics": {
     "config": {
@@ -46,6 +46,7 @@
       "temporal_edge_weight": 0.75,
       "same_subject_edge_weight": 0.15,
       "treatment_edge_weight": 0.2,
+      "graph_mode": "feature_temporal_treatment",
       "n_modes": 8,
       "rho": 1.0,
       "use_normalized_laplacian": true,
@@ -55,42 +56,42 @@
     },
     "regression": {
       "grm_ridge": {
-        "mae": 0.16145030920581022,
-        "rmse": 0.1815510878902624,
-        "r2": 0.17455975864122097
+        "mae": 0.16244651246415645,
+        "rmse": 0.18260932648576203,
+        "r2": 0.169772746276859
       },
       "raw_random_forest": {
-        "mae": 0.016809043560168484,
-        "rmse": 0.03280779373804598,
-        "r2": 0.9730448360296371
+        "mae": 0.01715760988495894,
+        "rmse": 0.03239253056506875,
+        "r2": 0.9738759304748479
       },
       "naive_current_score": {
-        "mae": 0.01729294681994789,
-        "rmse": 0.03341970623478051,
-        "r2": 0.972029953889168
+        "mae": 0.017279699472311286,
+        "rmse": 0.033017545532832364,
+        "r2": 0.9728580749256085
       }
     },
     "classification": {
       "grm_logistic": {
-        "accuracy": 0.9940677966101695,
-        "roc_auc": 0.999419814340589
+        "accuracy": 0.9966101694915255,
+        "roc_auc": 0.9997399167733675
       },
       "raw_random_forest": {
-        "accuracy": 0.9957627118644068,
-        "roc_auc": 0.9997199103713188
+        "accuracy": 0.9949152542372881,
+        "roc_auc": 0.9997399167733675
       },
       "naive_current_score": {
         "accuracy": 0.9,
-        "roc_auc": 0.9997199103713188
+        "roc_auc": 0.9997399167733675
       }
     },
     "latent_recovery": {
-      "mean_abs_aligned_correlation": 0.40403300568721234,
+      "mean_abs_aligned_correlation": 0.4055165467130669,
       "aligned_correlations": [
-        0.40335611834076773,
-        0.40512418518148047,
-        0.40487750730489075,
-        0.4027742119217104
+        0.4052249453062964,
+        0.40660505167837774,
+        0.4063716053897025,
+        0.40386458447789086
       ],
       "note": "Synthetic-only metric: GRM embedding aligned to true latent states by orthogonal Procrustes."
     }
