@@ -27,13 +27,21 @@ Scientific framing:
   Diagnostic on a known synthetic generator. Not a biological simulator. Not
   evidence for TCM or Qi. Verdicts here describe latent-state recovery,
   attractor fingerprinting, and ontology-mismatch detection on synthetic data.
+
+Methodological caveats (recorded in dynamic_eval_certificates.json["caveats"]):
+  - Persisted GRM transition matrices G^(t) were fit on all training subjects,
+    not refit per CV fold. Evaluation is subject-CV honest at the prediction
+    layer but the GRM model itself has seen all subjects. This is leakage in
+    GRM's favor: any FAIL verdict against GRM is therefore conservative.
+  - The strong-baseline transition model uses state_id (cluster vocabulary),
+    matching what GRM has access to. It does NOT use true_regime_id.
 """
 
 import argparse
 import json
 import os
 import warnings
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
@@ -46,19 +54,17 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-from sklearn.cluster import KMeans
 from sklearn.exceptions import ConvergenceWarning
 from sklearn.impute import SimpleImputer
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import (
     accuracy_score,
-    brier_score_loss,
     f1_score,
     log_loss,
     roc_auc_score,
     silhouette_score,
 )
-from sklearn.model_selection import GroupKFold
+from sklearn.model_selection import GroupKFold, StratifiedGroupKFold, StratifiedKFold
 from sklearn.neighbors import NearestNeighbors
 from sklearn.preprocessing import StandardScaler
 
@@ -293,17 +299,21 @@ def cluster_bootstrap_paired(
     *,
     n_boot: int,
     seed: int,
+    label: str = "",
 ) -> List[Tuple[float, float, float]]:
     """Cluster bootstrap by subject. `metric_fn(idx)` returns a tuple of scalars.
 
     Returns one (point, ci_low, ci_high) per scalar in the tuple. The point estimate
     uses all rows; CI bounds are 2.5% / 97.5% quantiles across B subject-resamples.
+    Skipped iterations (non-finite or exception) are counted and printed when
+    `label` is non-empty.
     """
     rng = np.random.default_rng(seed)
     unique = np.unique(subject_ids)
     by_subject = {int(s): np.where(subject_ids == s)[0] for s in unique}
     point = metric_fn(np.arange(len(subject_ids)))
     samples: List[Tuple[float, ...]] = []
+    n_skipped = 0
     for _ in range(int(n_boot)):
         chosen = rng.choice(unique, size=len(unique), replace=True)
         idx = np.concatenate([by_subject[int(s)] for s in chosen])
@@ -311,8 +321,13 @@ def cluster_bootstrap_paired(
             vals = metric_fn(idx)
             if all(np.isfinite(v) for v in vals):
                 samples.append(vals)
+            else:
+                n_skipped += 1
         except Exception:
+            n_skipped += 1
             continue
+    if label and n_skipped:
+        print(f"[bootstrap:{label}] skipped {n_skipped}/{int(n_boot)} iterations (non-finite or raised)")
     if not samples:
         return [(float(p), float("nan"), float("nan")) for p in point]
     arr = np.array(samples)
@@ -393,12 +408,15 @@ def _empirical_markov(
 
 
 def _grm_blended_from_persisted(
-    dynamic: DynamicGRMModel, alpha: float, current_states: np.ndarray, end_days: np.ndarray
+    dynamic: DynamicGRMModel, current_states: np.ndarray, end_days: np.ndarray
 ) -> np.ndarray:
     """Per-visit probability rows using persisted GRM-blended transition matrices.
 
     For each visit (current_state s, end_day d): return GRM_T[d][s, :].
     Falls back to a uniform distribution where end_day == -1.
+
+    The persisted matrices already encode the Markov+G blend applied during the
+    dynamic pipeline run; there is no `alpha` to apply here.
     """
     n_visits = len(current_states)
     n_states = next(iter(dynamic.grm_transition_matrices.values())).shape[0]
@@ -503,13 +521,16 @@ def _transition_eval_rows(name: str, y_true: np.ndarray, probs: np.ndarray, n_st
     }
 
 
-def _baseline_feature_matrix(visits: pd.DataFrame) -> np.ndarray:
-    """Strong baseline F: current_regime + dwell + delayed loads."""
+def _baseline_feature_matrix(visits: pd.DataFrame, n_states: int) -> np.ndarray:
+    """Strong baseline F: current state (cluster) one-hot + dwell + delayed loads.
+
+    Uses `state_id` (not `true_regime_id`) so the baseline operates in the same
+    vocabulary as GRM. Including `true_regime_id` would give the baseline oracle
+    access GRM does not have, making the comparison unfair.
+    """
     n = len(visits)
-    n_regimes = int(visits["true_regime_id"].max() + 1) if "true_regime_id" in visits.columns else int(visits["state_id"].max() + 1)
-    one_hot = np.zeros((n, n_regimes), dtype=float)
-    src = visits["true_regime_id"] if "true_regime_id" in visits.columns else visits["state_id"]
-    one_hot[np.arange(n), src.to_numpy(int)] = 1.0
+    one_hot = np.zeros((n, n_states), dtype=float)
+    one_hot[np.arange(n), visits["state_id"].to_numpy(int)] = 1.0
     extras = []
     for col, default in [
         ("dwell_time", 0.0),
@@ -537,14 +558,14 @@ def eval_transitions(setup: EvalSetup) -> Dict[str, Any]:
     end_days = eval_df["g_end_day"].to_numpy(int)
     print(f"[transitions] eligible visits: {len(eval_df)} / {len(visits)}")
 
-    baseline_X = _baseline_feature_matrix(eval_df)
+    baseline_X = _baseline_feature_matrix(eval_df, n_states)
 
     gkf = GroupKFold(n_splits=cfg.cv_splits)
     fold_rows: List[Dict[str, Any]] = []
     reliability_rows: List[Dict[str, Any]] = []
     per_visit_logloss: Dict[str, List[Tuple[int, float]]] = {}
 
-    grm_persisted_full = _grm_blended_from_persisted(setup.dynamic, cfg.grm_blend_alpha, current, end_days)
+    grm_persisted_full = _grm_blended_from_persisted(setup.dynamic, current, end_days)
     markov_persisted_full = _markov_from_persisted(setup.dynamic, current, end_days)
 
     for fold_idx, (train_idx, test_idx) in enumerate(gkf.split(current, nxt, groups=subj)):
@@ -578,10 +599,10 @@ def eval_transitions(setup: EvalSetup) -> Dict[str, Any]:
             fold_rows.append(row)
             for j, ll in enumerate(_per_row_log_loss(y_test, probs)):
                 per_visit_logloss.setdefault(name, []).append((int(test_idx[j]), float(ll)))
-            if fold_idx == 0:
-                rel = reliability_table(y_test, probs)
-                rel["model"] = name
-                reliability_rows.append(rel)
+            rel = reliability_table(y_test, probs)
+            rel["model"] = name
+            rel["fold"] = fold_idx
+            reliability_rows.append(rel)
 
     fold_df = pd.DataFrame(fold_rows)
     summary_rows = []
@@ -592,7 +613,31 @@ def eval_transitions(setup: EvalSetup) -> Dict[str, Any]:
             summary_rows.append({"model": model, "metric": metric, "mean": point, "ci_low": lo, "ci_high": hi})
     summary_df = pd.DataFrame(summary_rows)
 
-    reliability_df = pd.concat(reliability_rows, ignore_index=True) if reliability_rows else pd.DataFrame()
+    reliability_full = pd.concat(reliability_rows, ignore_index=True) if reliability_rows else pd.DataFrame()
+    # Aggregate per (model, bin): mean confidence + frequency-weighted mean accuracy
+    # across folds. Folds with zero rows in a bin contribute nothing.
+    if not reliability_full.empty:
+        agg_rows = []
+        for (model, bin_lo, bin_hi), grp in reliability_full.groupby(["model", "bin_low", "bin_high"]):
+            grp_valid = grp[grp["n"] > 0]
+            total_n = int(grp_valid["n"].sum())
+            if total_n == 0:
+                agg_rows.append({
+                    "model": model, "bin_low": float(bin_lo), "bin_high": float(bin_hi),
+                    "n": 0, "mean_confidence": float("nan"), "empirical_accuracy": float("nan"),
+                })
+                continue
+            weights = grp_valid["n"].to_numpy(float)
+            agg_rows.append({
+                "model": model,
+                "bin_low": float(bin_lo), "bin_high": float(bin_hi),
+                "n": total_n,
+                "mean_confidence": float(np.average(grp_valid["mean_confidence"], weights=weights)),
+                "empirical_accuracy": float(np.average(grp_valid["empirical_accuracy"], weights=weights)),
+            })
+        reliability_df = pd.DataFrame(agg_rows).sort_values(["model", "bin_low"]).reset_index(drop=True)
+    else:
+        reliability_df = pd.DataFrame()
 
     setup.cfg.output_dir.mkdir(parents=True, exist_ok=True)
     fold_df.to_csv(setup.cfg.output_dir / "transition_metrics_per_fold.csv", index=False)
@@ -766,19 +811,38 @@ def _subject_feature_sets(setup: EvalSetup) -> Tuple[pd.DataFrame, Dict[str, Lis
     return fp_df, feature_sets
 
 
-def _cv_macro_f1(X: np.ndarray, y: np.ndarray, n_splits: int, seed: int) -> Tuple[float, float, np.ndarray]:
-    """Stratified k-fold logistic regression returning macro-F1 mean, std, per-fold."""
+def _cv_macro_f1(
+    X: np.ndarray,
+    y: np.ndarray,
+    n_splits: int,
+    seed: int,
+    groups: Optional[np.ndarray] = None,
+) -> Tuple[float, float, np.ndarray]:
+    """Stratified k-fold logistic regression returning macro-F1 mean, std, per-fold.
+
+    When `groups` is supplied, uses StratifiedGroupKFold so that all rows for a
+    given group land in the same fold. This is essential inside a cluster
+    bootstrap where the same subject may appear multiple times — without it,
+    duplicated rows can leak across folds.
+    """
+    if groups is not None:
+        n_unique = int(len(np.unique(groups)))
+        n_splits = min(n_splits, n_unique)
     n_splits = min(n_splits, int(np.min(np.bincount(y))))
     n_splits = max(2, n_splits)
-    from sklearn.model_selection import StratifiedKFold
 
-    skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=seed)
+    splitter = (
+        StratifiedGroupKFold(n_splits=n_splits, shuffle=True, random_state=seed)
+        if groups is not None
+        else StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=seed)
+    )
     scores: List[float] = []
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", category=ConvergenceWarning)
         warnings.filterwarnings("ignore", category=UserWarning)
         scaler = StandardScaler()
-        for tr, te in skf.split(X, y):
+        split_iter = splitter.split(X, y, groups) if groups is not None else splitter.split(X, y)
+        for tr, te in split_iter:
             X_tr = scaler.fit_transform(X[tr])
             X_te = scaler.transform(X[te])
             clf = LogisticRegression(max_iter=2000, C=1.0, random_state=seed)
@@ -828,18 +892,24 @@ def eval_fingerprints(setup: EvalSetup) -> Dict[str, Any]:
     X_strong = SimpleImputer(strategy="median").fit_transform(merged[strong_cols].to_numpy(float))
     X_combo = SimpleImputer(strategy="median").fit_transform(merged[combo_cols].to_numpy(float))
 
+    subj_ids = merged["subject_id"].to_numpy(int)
+
     def _fp_paired(idx: np.ndarray) -> Tuple[float, float, float]:
         if idx.size < 6 or len(np.unique(y[idx])) < 2:
             return (float("nan"), float("nan"), float("nan"))
+        g = subj_ids[idx]
+        if len(np.unique(g)) < cfg.cv_splits:
+            return (float("nan"), float("nan"), float("nan"))
         try:
-            f_strong, _, _ = _cv_macro_f1(X_strong[idx], y[idx], cfg.cv_splits, cfg.seed)
-            f_combo, _, _ = _cv_macro_f1(X_combo[idx], y[idx], cfg.cv_splits, cfg.seed)
+            f_strong, _, _ = _cv_macro_f1(X_strong[idx], y[idx], cfg.cv_splits, cfg.seed, groups=g)
+            f_combo, _, _ = _cv_macro_f1(X_combo[idx], y[idx], cfg.cv_splits, cfg.seed, groups=g)
             return (f_strong, f_combo, f_combo - f_strong)
         except Exception:
             return (float("nan"), float("nan"), float("nan"))
 
-    subj_ids = merged["subject_id"].to_numpy(int)
-    fp_results = cluster_bootstrap_paired(subj_ids, _fp_paired, n_boot=cfg.bootstrap_n, seed=cfg.seed)
+    fp_results = cluster_bootstrap_paired(
+        subj_ids, _fp_paired, n_boot=cfg.bootstrap_n, seed=cfg.seed, label="fingerprint",
+    )
     (strong_pt, strong_lo, strong_hi) = fp_results[0]
     (combo_pt, combo_lo, combo_hi) = fp_results[1]
     (lift_pt, lift_lo, lift_hi) = fp_results[2]
@@ -945,8 +1015,12 @@ def eval_aliased(setup: EvalSetup) -> Dict[str, Any]:
     score_grm = _knn_score_attr(setup, grm_features, cfg.aliased_k_nn)
     aliased_idx_full = np.where(aliased_mask)[0]
 
+    aliased_set = set(aliased_idx_full.tolist())
+
     def _t2(idx: np.ndarray) -> Tuple[float, float, float]:
-        keep = np.intersect1d(idx, aliased_idx_full)
+        # np.isin preserves duplicates — a visit whose subject is sampled twice
+        # appears twice in `keep`, which is the correct cluster-bootstrap weight.
+        keep = idx[np.isin(idx, aliased_idx_full)]
         if keep.size < 5:
             return (float("nan"), float("nan"), float("nan"))
         y = attractor[keep]
@@ -956,7 +1030,9 @@ def eval_aliased(setup: EvalSetup) -> Dict[str, Any]:
         a_grm = float(roc_auc_score(y, score_grm[keep]))
         return (a_obs, a_grm, a_grm - a_obs)
 
-    t2_results = cluster_bootstrap_paired(subj_full, _t2, n_boot=cfg.bootstrap_n, seed=cfg.seed)
+    t2_results = cluster_bootstrap_paired(
+        subj_full, _t2, n_boot=cfg.bootstrap_n, seed=cfg.seed, label="T2_attractor_auc",
+    )
     (t2_obs_auc, t2_obs_lo, t2_obs_hi) = t2_results[0]
     (t2_grm_auc, t2_grm_lo, t2_grm_hi) = t2_results[1]
     (t2_lift, t2_lift_lo, t2_lift_hi) = t2_results[2]
@@ -968,17 +1044,27 @@ def eval_aliased(setup: EvalSetup) -> Dict[str, Any]:
     pred_obs3, pred_grm3 = _aliased_next_regime_predictions(
         obs_features[mask3], grm_features[mask3], y3, groups3, cfg,
     )
+    # Rows that GroupKFold didn't assign to any test fold (degenerate fold-count
+    # or single-group fold) remain at -1; exclude them from accuracy.
+    valid3 = (pred_obs3 >= 0) & (pred_grm3 >= 0)
+    if valid3.sum() < len(valid3):
+        print(f"[T3] dropping {int((~valid3).sum())}/{len(valid3)} aliased rows with no CV prediction")
     correct_obs3 = (pred_obs3 == y3).astype(float)
     correct_grm3 = (pred_grm3 == y3).astype(float)
 
     def _t3(local_idx: np.ndarray) -> Tuple[float, float, float]:
         if local_idx.size == 0:
             return (float("nan"), float("nan"), float("nan"))
-        a_obs = float(correct_obs3[local_idx].mean())
-        a_grm = float(correct_grm3[local_idx].mean())
+        keep = local_idx[valid3[local_idx]]
+        if keep.size == 0:
+            return (float("nan"), float("nan"), float("nan"))
+        a_obs = float(correct_obs3[keep].mean())
+        a_grm = float(correct_grm3[keep].mean())
         return (a_obs, a_grm, a_grm - a_obs)
 
-    t3_results = cluster_bootstrap_paired(groups3, _t3, n_boot=cfg.bootstrap_n, seed=cfg.seed)
+    t3_results = cluster_bootstrap_paired(
+        groups3, _t3, n_boot=cfg.bootstrap_n, seed=cfg.seed, label="T3_next_regime_top1",
+    )
     (t3_obs_acc, t3_obs_lo, t3_obs_hi) = t3_results[0]
     (t3_grm_acc, t3_grm_lo, t3_grm_hi) = t3_results[1]
     (t3_lift, t3_lift_lo, t3_lift_hi) = t3_results[2]
@@ -987,7 +1073,8 @@ def eval_aliased(setup: EvalSetup) -> Dict[str, Any]:
     t4_boot = min(cfg.bootstrap_n, 80)
 
     def _t4(idx: np.ndarray) -> Tuple[float, float, float]:
-        keep = np.intersect1d(idx, aliased_idx_full)
+        # Preserve duplicates: see _t2.
+        keep = idx[np.isin(idx, aliased_idx_full)]
         if keep.size < 10:
             return (float("nan"), float("nan"), float("nan"))
         regs = regimes[keep]
@@ -997,7 +1084,9 @@ def eval_aliased(setup: EvalSetup) -> Dict[str, Any]:
         s_grm = _safe_silhouette(grm_features[keep], regs)
         return (s_obs, s_grm, s_grm - s_obs)
 
-    t4_results = cluster_bootstrap_paired(subj_full, _t4, n_boot=t4_boot, seed=cfg.seed)
+    t4_results = cluster_bootstrap_paired(
+        subj_full, _t4, n_boot=t4_boot, seed=cfg.seed, label="T4_silhouette",
+    )
     (sil_obs, sil_obs_lo, sil_obs_hi) = t4_results[0]
     (sil_grm, sil_grm_lo, sil_grm_hi) = t4_results[1]
     (sil_lift, sil_lift_lo, sil_lift_hi) = t4_results[2]
@@ -1099,11 +1188,6 @@ def eval_ablations(setup: EvalSetup, aliased_result: Optional[Dict[str, Any]] = 
         perm = rng.permutation(idx)
         grm_shuffled_time[idx] = grm_full[perm]
 
-    # Shuffled subject IDs: keep visits in place but pretend subjects are swapped.
-    sid_perm = rng.permutation(np.unique(subj))
-    sid_map = {int(old): int(new) for old, new in zip(np.unique(subj), sid_perm)}
-    shuffled_subjects = np.array([sid_map[int(s)] for s in subj])
-
     # Random embedding control: same shape, drawn from standard normal.
     grm_random = rng.normal(size=grm_full.shape)
 
@@ -1175,7 +1259,7 @@ def generate_plots(setup: EvalSetup, results: Dict[str, Any]) -> None:
                 ax.plot(sub["mean_confidence"], sub["empirical_accuracy"], marker="o", label=model)
             ax.set_xlabel("Mean predicted top-1 probability")
             ax.set_ylabel("Empirical top-1 accuracy")
-            ax.set_title("Reliability diagram (fold 0)")
+            ax.set_title("Reliability diagram (subject-CV folds, fold-weighted)")
             ax.legend(fontsize=8, loc="best")
             _save(fig, plot_dir / "transition_reliability.png")
 
@@ -1248,6 +1332,29 @@ def write_certificate(setup: EvalSetup, results: Dict[str, Any]) -> Dict[str, An
             "TCM or Qi. Verdicts describe latent-state recovery, attractor fingerprinting, and "
             "ontology-mismatch detection on synthetic data."
         ),
+        "caveats": {
+            "grm_matrices_not_refit_per_fold": (
+                "The persisted GRM-blended transition matrices G^(t) were fit on all training "
+                "subjects, not refit per CV fold. Evaluation is subject-CV honest at the prediction "
+                "layer but the GRM model itself has seen all subjects. This is leakage in GRM's "
+                "favor; any FAIL verdict against GRM is therefore conservative."
+            ),
+            "strong_baseline_uses_state_id": (
+                "Strong baseline F uses state_id (cluster vocabulary), matching what GRM has access "
+                "to. Earlier versions used true_regime_id, which gave the baseline oracle features "
+                "GRM did not have."
+            ),
+            "fingerprint_bootstrap_uses_grouped_cv": (
+                "Inside the fingerprint cluster bootstrap, _cv_macro_f1 uses StratifiedGroupKFold "
+                "by subject_id so duplicated subjects (a normal cluster-bootstrap outcome) cannot "
+                "leak across train/test folds."
+            ),
+            "aliased_bootstrap_preserves_duplicates": (
+                "T2 and T4 cluster bootstrap use np.isin (not np.intersect1d) so a visit whose "
+                "subject was sampled k times contributes k copies — the correct cluster-bootstrap "
+                "weight for AUC and silhouette."
+            ),
+        },
     }
 
     if "transitions" in results:

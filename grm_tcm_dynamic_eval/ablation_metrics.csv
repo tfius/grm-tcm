@@ -1,5 +1,5 @@
 ablation,t2_attractor_auc_aliased
 full_grm,0.6215078150758325
 shuffled_time_grm,0.5204585497032641
-random_embedding,0.5248722387075503
+random_embedding,0.4814971511292449
 raw_observations,0.5693246682327728

@@ -24,9 +24,9 @@
       "description": "GRM-blended transition log-loss vs empirical Markov (positive = GRM helps)."
     },
     "grm_beats_strong_baseline_log_loss": {
-      "magnitude": -0.11934330866529441,
-      "ci_low": -0.16394401254577273,
-      "ci_high": -0.06873091923618091,
+      "magnitude": -0.051053659869661594,
+      "ci_low": -0.10166470933832983,
+      "ci_high": -6.292854490919098e-05,
       "passes": false,
       "description": "GRM-blended vs strong baseline (current_regime + dwell + delayed_loads)."
     },
@@ -46,8 +46,8 @@
     },
     "grm_attractor_auc_lift_aliased": {
       "magnitude": 0.05218314684305969,
-      "ci_low": 0.030071054299661122,
-      "ci_high": 0.07529761464400885,
+      "ci_low": 0.0222064830898728,
+      "ci_high": 0.07985446925881161,
       "passes": true,
       "description": "AUC lift for attractor_state via k-NN on aliased visits: GRM minus obs (subject cluster bootstrap)."
     },
@@ -60,15 +60,15 @@
     },
     "grm_silhouette_lift_aliased": {
       "magnitude": -0.026214812160087492,
-      "ci_low": -0.06818550906860371,
-      "ci_high": 0.014790650628785047,
+      "ci_low": -0.06496755017968503,
+      "ci_high": 0.01564776402818536,
       "passes": null,
       "description": "Silhouette lift by true_regime on aliased visits: GRM minus obs (subject cluster bootstrap)."
     },
     "grm_helps_hidden_subtype_recovery": {
-      "magnitude": 0.09114681614681619,
-      "ci_low": -0.041466468716468634,
-      "ci_high": 0.16313629888629888,
+      "magnitude": 0.08103896103896108,
+      "ci_low": -0.17069243175125526,
+      "ci_high": 0.16504736881052678,
       "passes": null,
       "description": "Hidden_subtype macro-F1 lift: (strong_baseline + GRM) minus strong_baseline (subject bootstrap).",
       "strong_baseline_f1": 0.3466213416213416,
@@ -76,14 +76,20 @@
     }
   },
   "framing": "Diagnostic on a known synthetic generator. Not a biological simulator. Not evidence for TCM or Qi. Verdicts describe latent-state recovery, attractor fingerprinting, and ontology-mismatch detection on synthetic data.",
+  "caveats": {
+    "grm_matrices_not_refit_per_fold": "The persisted GRM-blended transition matrices G^(t) were fit on all training subjects, not refit per CV fold. Evaluation is subject-CV honest at the prediction layer but the GRM model itself has seen all subjects. This is leakage in GRM's favor; any FAIL verdict against GRM is therefore conservative.",
+    "strong_baseline_uses_state_id": "Strong baseline F uses state_id (cluster vocabulary), matching what GRM has access to. Earlier versions used true_regime_id, which gave the baseline oracle features GRM did not have.",
+    "fingerprint_bootstrap_uses_grouped_cv": "Inside the fingerprint cluster bootstrap, _cv_macro_f1 uses StratifiedGroupKFold by subject_id so duplicated subjects (a normal cluster-bootstrap outcome) cannot leak across train/test folds.",
+    "aliased_bootstrap_preserves_duplicates": "T2 and T4 cluster bootstrap use np.isin (not np.intersect1d) so a visit whose subject was sampled k times contributes k copies \u2014 the correct cluster-bootstrap weight for AUC and silhouette."
+  },
   "ablations": {
     "shuffled_time_grm": {
       "t2_attractor_auc_aliased": 0.5204585497032641,
       "vs_full_grm": 0.10104926537256842
     },
     "random_embedding": {
-      "t2_attractor_auc_aliased": 0.5248722387075503,
-      "vs_full_grm": 0.09663557636828224
+      "t2_attractor_auc_aliased": 0.4814971511292449,
+      "vs_full_grm": 0.14001066394658762
     },
     "raw_observations": {
       "t2_attractor_auc_aliased": 0.5693246682327728,
