@@ -17,7 +17,7 @@ uv run python grm_tcm_synthetic_generator.py
 uv run python grm_tcm_train.py
 ```
 
-I also tested the full run. It generates:
+It generates:
 
 ```text
 synthetic_grm_tcm/
@@ -34,4 +34,4 @@ grm_tcm_results/
   grm_metrics.json
 ```
 
-I adjusted defaults so it runs faster and avoids the earlier edge case where the flare target had only one class. The regenerated files follow the same synthetic generator and GRM trainer/evaluator design we outlined earlier.
+Runs faster and avoids the edge case where the flare target had only one class. The regenerated files follow the same synthetic generator and GRM trainer/evaluator design we outlined earlier.

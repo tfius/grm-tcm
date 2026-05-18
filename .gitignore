@@ -1,2 +1,7 @@
 /.backup
 /.venv
+__pycache__/
+*.py[cod]
+
+/synthetic_grm_tcm/
+/grm_tcm_results/
