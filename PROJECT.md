@@ -415,7 +415,6 @@ Current single-run diagnostics answer the four core questions this way:
 2. **Did GRM predict outcome better than naive baselines?**
 
    No for next-day score regression. Current R2 values are roughly:
-
    - GRM ridge: `0.170`
    - raw random forest: `0.974`
    - naive current score: `0.973`
@@ -486,3 +485,7 @@ Current true-subtype signal is present in the generator ground truth: hidden sub
 The state vocabulary is now an explicit experimental lever via `--state-source`. `kmeans_observation` tests whether visible observations are enough, `kmeans_dynamic` adds short trajectory features to reduce aliasing, and `true_regime` is an oracle ceiling for the redesigned synthetic world. In the current comparison, dynamic-feature states improve soft self-resonance flare signal relative to observation-only states, while true-regime states mainly improve next-state transition accuracy. That split is meaningful: part of the remaining gap is state aliasing, and part is the difference between recovering regime transitions and predicting flare timing.
 
 Interpretation guardrail: these are synthetic benchmark results only. They test latent-state recovery, ontology mismatch detection, and ablation behavior; they do not prove TCM, Qi, or a biological mechanism.
+
+About to do:
+Multi-scale temporal hyper recursion. Cascading cross-time retrieval catching long -cycle historical log resonace.
+Deconstruction techno feudalism and the genetic monopoly of the sole owner logevitiy race via Fractal Republicanism.
