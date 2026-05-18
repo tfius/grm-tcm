@@ -67,6 +67,18 @@ LATENT_NAMES = [
 
 GROUP_COLUMNS = [
     "hidden_subtype",
+    "true_regime",
+    "attractor_state",
+    "qi_like_label",
+    "tcm_like_label",
+    "contrarian_signature",
+]
+
+CLUSTER_TARGETS = [
+    "hidden_subtype",
+    "true_regime",
+    "true_regime_id",
+    "attractor_state",
     "qi_like_label",
     "tcm_like_label",
     "contrarian_signature",
@@ -400,7 +412,7 @@ def cluster_embeddings(df: pd.DataFrame, modes: List[str]) -> Tuple[pd.DataFrame
             labels = KMeans(n_clusters=k, random_state=42, n_init=20).fit_predict(work[modes].to_numpy(float))
             work[f"cluster_k{k}"] = labels
             source_idx = work.index
-            for target in GROUP_COLUMNS:
+            for target in CLUSTER_TARGETS:
                 if target not in df.columns:
                     continue
                 target_codes, usable = safe_label_codes(df.loc[source_idx, target])
@@ -416,6 +428,39 @@ def cluster_embeddings(df: pd.DataFrame, modes: List[str]) -> Tuple[pd.DataFrame
                     }
                 )
     return work, pd.DataFrame(scores)
+
+
+def regime_label_mismatch(df: pd.DataFrame) -> pd.DataFrame:
+    """Compare true regimes against noisy semantic labels and hidden subtype."""
+
+    frames = []
+    for col in ["tcm_like_label", "qi_like_label", "hidden_subtype"]:
+        if "true_regime" in df.columns and col in df.columns:
+            frames.append(distribution_table(df, "true_regime", col))
+            frames.append(distribution_table(df, col, "true_regime"))
+    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+
+
+def regime_recovery_summary(cluster_scores: pd.DataFrame) -> Dict[str, float]:
+    """Summarize best cluster alignment against true regime targets."""
+
+    out = {
+        "best_cluster_nmi_true_regime": float("nan"),
+        "best_cluster_ari_true_regime": float("nan"),
+        "best_cluster_nmi_attractor_state": float("nan"),
+        "best_cluster_ari_attractor_state": float("nan"),
+    }
+    if cluster_scores.empty:
+        return out
+    for target, nmi_key, ari_key in [
+        ("true_regime", "best_cluster_nmi_true_regime", "best_cluster_ari_true_regime"),
+        ("attractor_state", "best_cluster_nmi_attractor_state", "best_cluster_ari_attractor_state"),
+    ]:
+        subset = cluster_scores[cluster_scores["target"] == target]
+        if not subset.empty:
+            out[nmi_key] = float(subset["normalized_mutual_info"].max())
+            out[ari_key] = float(subset["adjusted_rand_index"].max())
+    return out
 
 
 def save_json(path: Path, data: Dict[str, Any]) -> None:
@@ -531,6 +576,18 @@ def save_group_mean_modes(df: pd.DataFrame, modes: List[str], group_col: str, pa
     save_heatmap(grouped, path, f"Mean GRM Modes by {group_col}", "GRM mode", group_col)
 
 
+def save_regime_plots(df: pd.DataFrame, plot_dir: Path) -> None:
+    """Save true-regime occupancy and label mismatch plots."""
+
+    if {"hidden_subtype", "true_regime"}.issubset(df.columns):
+        counts = pd.crosstab(df["hidden_subtype"], df["true_regime"], normalize="index")
+        save_heatmap(counts, plot_dir / "true_regime_occupancy_by_hidden_subtype.png", "True Regime Occupancy by Hidden Subtype", "true_regime", "hidden_subtype")
+
+    if {"tcm_like_label", "true_regime"}.issubset(df.columns):
+        counts = pd.crosstab(df["tcm_like_label"], df["true_regime"], normalize="index")
+        save_heatmap(counts, plot_dir / "true_regime_distribution_by_tcm_label.png", "True Regime Distribution by TCM-Like Label", "true_regime", "tcm_like_label")
+
+
 def generate_plots(df: pd.DataFrame, corr_df: pd.DataFrame, modes: List[str], output_dir: Path) -> None:
     """Generate all required matplotlib plots."""
 
@@ -545,9 +602,12 @@ def generate_plots(df: pd.DataFrame, corr_df: pd.DataFrame, modes: List[str], ou
     )
     save_prediction_plots(df, plot_dir)
     save_mode_scatter(df, "hidden_subtype", plot_dir / "grm_modes_scatter_hidden_subtype.png")
+    save_mode_scatter(df, "true_regime", plot_dir / "grm_modes_scatter_true_regime.png")
     save_mode_scatter(df, "tcm_like_label", plot_dir / "grm_modes_scatter_tcm_like_label.png")
     save_group_mean_modes(df, modes, "hidden_subtype", plot_dir / "mean_grm_modes_by_hidden_subtype.png")
+    save_group_mean_modes(df, modes, "true_regime", plot_dir / "mean_grm_modes_by_true_regime.png")
     save_group_mean_modes(df, modes, "tcm_like_label", plot_dir / "mean_grm_modes_by_tcm_like_label.png")
+    save_regime_plots(df, plot_dir)
 
 
 def make_summary(
@@ -564,6 +624,7 @@ def make_summary(
     best_abs_corr = float(corr_df["abs_correlation"].max()) if not corr_df.empty else float("nan")
     best_cluster_nmi = float(cluster_scores["normalized_mutual_info"].max()) if not cluster_scores.empty else float("nan")
     best_cluster_ari = float(cluster_scores["adjusted_rand_index"].max()) if not cluster_scores.empty else float("nan")
+    regime_recovery = regime_recovery_summary(cluster_scores)
     return {
         "config": asdict(cfg),
         "n_analysis_rows": int(len(df)),
@@ -574,6 +635,7 @@ def make_summary(
         "flare_prediction": flare_stats(df),
         "best_cluster_normalized_mutual_info": best_cluster_nmi,
         "best_cluster_adjusted_rand_index": best_cluster_ari,
+        **regime_recovery,
         "n_grouped_performance_rows": int(len(grouped_df)),
         "n_contrarian_findings": int(len(findings_df)),
         "trainer_metrics": metrics,
@@ -594,11 +656,13 @@ def print_readme(output_dir: Path) -> None:
     print("  2. grm_latent_correlations.csv")
     print("  3. contrarian_findings.csv")
     print("  4. cluster_scores.csv")
-    print("  5. plots/grm_latent_correlation_heatmap.png")
+    print("  5. regime_label_mismatch.csv")
+    print("  6. plots/grm_latent_correlation_heatmap.png")
     print("\nInterpretation:")
     print("  - High GRM/latent correlation means the embedding recovered known synthetic state axes.")
     print("  - High ontology mismatch means semantic labels mix or split hidden synthetic subtypes.")
     print("  - High cluster NMI/ARI means embedding clusters align with a target label family.")
+    print("  - True-regime cluster scores test recovery of the redesigned switching-state simulator.")
     print("  - Poor prediction despite good latent recovery can mean the recovered modes are not the predictive axes,")
     print("    the baseline uses easier short-horizon information, or the target is dominated by observed raw features.")
     print("  - These are synthetic benchmark diagnostics, not evidence that TCM, Qi, or a biological mechanism is proven.")
@@ -635,6 +699,7 @@ def run(cfg: DiagnosticsConfig) -> None:
 
     print("[step] Detecting ontology mismatch")
     mismatch_df, findings_df = ontology_mismatch(df)
+    regime_mismatch_df = regime_label_mismatch(df)
 
     print("[step] Clustering GRM embeddings")
     cluster_assignments, cluster_scores = cluster_embeddings(df, modes)
@@ -645,6 +710,7 @@ def run(cfg: DiagnosticsConfig) -> None:
     save_table(output_dir / "latent_top_correlations.csv", latent_top)
     save_table(output_dir / "grouped_performance.csv", grouped_df)
     save_table(output_dir / "ontology_mismatch.csv", mismatch_df)
+    save_table(output_dir / "regime_label_mismatch.csv", regime_mismatch_df)
     save_table(output_dir / "contrarian_findings.csv", findings_df)
     save_table(output_dir / "cluster_assignments.csv", cluster_assignments)
     save_table(output_dir / "cluster_scores.csv", cluster_scores)

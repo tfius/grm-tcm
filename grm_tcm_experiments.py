@@ -48,6 +48,7 @@ class ExperimentConfig:
     ablations: List[str] = field(default_factory=lambda: list(ABLATIONS))
     n_subjects: int = 80
     n_days: int = 60
+    state_sources: List[str] = field(default_factory=lambda: ["kmeans_observation"])
     clean: bool = False
 
 
@@ -73,6 +74,11 @@ def parse_args() -> ExperimentConfig:
     parser.add_argument("--ablations", default=",".join(ABLATIONS))
     parser.add_argument("--n-subjects", type=int, default=80)
     parser.add_argument("--n-days", type=int, default=60)
+    parser.add_argument(
+        "--state-sources",
+        default="kmeans_observation",
+        help="Comma-separated dynamic GRM state sources: kmeans_observation,kmeans_dynamic,true_regime.",
+    )
     parser.add_argument("--clean", action="store_true", help="Remove the output directory before running.")
     args = parser.parse_args()
     return ExperimentConfig(
@@ -82,6 +88,7 @@ def parse_args() -> ExperimentConfig:
         ablations=parse_csv_list(args.ablations),
         n_subjects=args.n_subjects,
         n_days=args.n_days,
+        state_sources=parse_csv_list(args.state_sources),
         clean=args.clean,
     )
 
@@ -95,6 +102,10 @@ def validate_config(cfg: ExperimentConfig) -> None:
     unknown_ablations = sorted(set(cfg.ablations) - set(ABLATIONS))
     if unknown_ablations:
         raise ValueError(f"Unknown ablations: {unknown_ablations}. Choose from {sorted(ABLATIONS)}")
+    allowed_state_sources = {"kmeans_observation", "kmeans_dynamic", "true_regime"}
+    unknown_state_sources = sorted(set(cfg.state_sources) - allowed_state_sources)
+    if unknown_state_sources:
+        raise ValueError(f"Unknown state sources: {unknown_state_sources}. Choose from {sorted(allowed_state_sources)}")
 
 
 def read_json(path: Path) -> Dict[str, Any]:
@@ -113,10 +124,10 @@ def write_json(path: Path, data: Dict[str, Any]) -> None:
         json.dump(data, f, indent=2)
 
 
-def run_id(difficulty: str, seed: int, ablation: str) -> str:
+def run_id(difficulty: str, seed: int, ablation: str, state_source: str = "kmeans_observation") -> str:
     """Build a stable run id."""
 
-    return f"{difficulty}_seed{seed}_{ablation}"
+    return f"{difficulty}_seed{seed}_{ablation}_{state_source}"
 
 
 def maybe_permute_labels(data_dir: Path, seed: int) -> None:
@@ -167,6 +178,7 @@ def extract_metrics(
     difficulty: str,
     seed: int,
     ablation: str,
+    state_source: str,
     run_dir: Path,
 ) -> Dict[str, Any]:
     """Collect trainer and diagnostics metrics for one run."""
@@ -175,10 +187,11 @@ def extract_metrics(
     summary = read_json(run_dir / "diagnostics" / "diagnostics_summary.json")
     graph_mode = ABLATIONS[ablation]["graph_mode"]
     row: Dict[str, Any] = {
-        "run_id": run_id(difficulty, seed, ablation),
+        "run_id": run_id(difficulty, seed, ablation, state_source),
         "difficulty": difficulty,
         "seed": seed,
         "ablation": ablation,
+        "state_source": state_source,
         "graph_mode": graph_mode,
         "permuted_labels": bool(ABLATIONS[ablation]["permute_labels"]),
         "n_subjects": cfg.n_subjects,
@@ -217,6 +230,15 @@ def extract_metrics(
     row["dynamic_subject_soft_self_hidden_subtype_eta_squared"] = dynamic.get(
         "subject_soft_self_resonance_hidden_subtype_eta_squared", np.nan
     )
+    row["dynamic_soft_self_stuck_auc"] = dynamic.get("soft_self_resonance_stuck_auc", np.nan)
+    row["dynamic_true_regime_transition_accuracy_lift"] = dynamic.get("true_regime_transition_accuracy_lift", np.nan)
+    row["dynamic_subject_true_regime_transition_accuracy_lift"] = dynamic.get("subject_true_regime_transition_accuracy_lift", np.nan)
+    row["dynamic_frac_stuck_depleted_hidden_subtype_eta_squared"] = dynamic.get(
+        "frac_in_stuck_depleted_hidden_subtype_eta_squared", np.nan
+    )
+    row["dynamic_frac_stuck_agitated_hidden_subtype_eta_squared"] = dynamic.get(
+        "frac_in_stuck_agitated_hidden_subtype_eta_squared", np.nan
+    )
     row["dynamic_subject_transition_accuracy_lift"] = dynamic.get("subject_transition_accuracy_lift", np.nan)
     row["dynamic_subject_transition_log_loss_lift"] = dynamic.get("subject_transition_log_loss_lift", np.nan)
     row["dynamic_subject_transition_brier_lift"] = dynamic.get("subject_transition_brier_lift", np.nan)
@@ -224,10 +246,10 @@ def extract_metrics(
     return row
 
 
-def run_one(cfg: ExperimentConfig, output_dir: Path, difficulty: str, seed: int, ablation: str) -> Dict[str, Any]:
+def run_one(cfg: ExperimentConfig, output_dir: Path, difficulty: str, seed: int, ablation: str, state_source: str) -> Dict[str, Any]:
     """Run generator, trainer, diagnostics, and metric extraction for one experiment."""
 
-    rid = run_id(difficulty, seed, ablation)
+    rid = run_id(difficulty, seed, ablation, state_source)
     run_dir = output_dir / "runs" / rid
     data_dir = run_dir / "data"
     results_dir = run_dir / "results"
@@ -267,9 +289,16 @@ def run_one(cfg: ExperimentConfig, output_dir: Path, difficulty: str, seed: int,
     print("[run] running dynamic GRM")
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        run_dynamic(DynamicGRMConfig(data_dir=str(data_dir), results_dir=str(results_dir), output_dir=str(dynamic_dir)))
+        run_dynamic(
+            DynamicGRMConfig(
+                data_dir=str(data_dir),
+                results_dir=str(results_dir),
+                output_dir=str(dynamic_dir),
+                state_source=state_source,
+            )
+        )
 
-    return extract_metrics(cfg, difficulty, seed, ablation, run_dir)
+    return extract_metrics(cfg, difficulty, seed, ablation, state_source, run_dir)
 
 
 def go_no_go(results: pd.DataFrame) -> Dict[str, Any]:
@@ -336,7 +365,7 @@ def summarize_results(cfg: ExperimentConfig, results: pd.DataFrame) -> Dict[str,
     """Create experiment summary JSON."""
 
     grouped = (
-        results.groupby(["difficulty", "ablation"])
+        results.groupby(["difficulty", "ablation", "state_source"])
         .agg(
             runs=("run_id", "count"),
             mean_grm_next_day_r2=("grm_next_day_r2", "mean"),
@@ -354,6 +383,9 @@ def summarize_results(cfg: ExperimentConfig, results: pd.DataFrame) -> Dict[str,
             mean_dynamic_subject_self_resonance_flare_auc=("dynamic_subject_self_resonance_flare_auc", "mean"),
             mean_dynamic_subject_soft_self_resonance_flare_auc=("dynamic_subject_soft_self_resonance_flare_auc", "mean"),
             mean_dynamic_subject_transition_accuracy_lift=("dynamic_subject_transition_accuracy_lift", "mean"),
+            mean_dynamic_soft_self_stuck_auc=("dynamic_soft_self_stuck_auc", "mean"),
+            mean_dynamic_true_regime_transition_accuracy_lift=("dynamic_true_regime_transition_accuracy_lift", "mean"),
+            mean_dynamic_subject_true_regime_transition_accuracy_lift=("dynamic_subject_true_regime_transition_accuracy_lift", "mean"),
         )
         .reset_index()
     )
@@ -394,14 +426,15 @@ def run(cfg: ExperimentConfig) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     rows: List[Dict[str, Any]] = []
-    total = len(cfg.difficulties) * len(cfg.seeds) * len(cfg.ablations)
+    total = len(cfg.difficulties) * len(cfg.seeds) * len(cfg.ablations) * len(cfg.state_sources)
     done = 0
     for difficulty in cfg.difficulties:
         for seed in cfg.seeds:
             for ablation in cfg.ablations:
-                done += 1
-                print(f"\n[progress] {done}/{total}")
-                rows.append(run_one(cfg, output_dir, difficulty, seed, ablation))
+                for state_source in cfg.state_sources:
+                    done += 1
+                    print(f"\n[progress] {done}/{total}")
+                    rows.append(run_one(cfg, output_dir, difficulty, seed, ablation, state_source))
 
     results = pd.DataFrame(rows)
     results_path = output_dir / "experiment_results.csv"

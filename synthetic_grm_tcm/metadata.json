@@ -12,14 +12,17 @@
     "stress_event_rate": 0.1,
     "recovery_event_rate": 0.07,
     "treatment_event_rate": 0.12,
-    "flare_threshold": 0.65,
-    "crash_threshold": 0.85,
     "hidden_subtype_strength": 0.45,
-    "delayed_treatment_effect": 0.2,
-    "label_noise_rate": 0.03,
+    "delayed_treatment_effect": 0.25,
+    "label_noise_rate": 0.05,
     "practitioner_bias": 0.2,
-    "split_spleen_like_label": true,
-    "merge_liver_damp_like_labels": true
+    "obs_aliasing_strength": 0.55,
+    "sticky_strength": 0.1,
+    "subject_bias_strength": 1.0,
+    "missing_rate_severe_multiplier": 2.5,
+    "load_decay": 0.65,
+    "flare_threshold_logit": 2.2,
+    "crash_threshold_logit": 3.6
   },
   "latent_names": [
     "vitality_depletion",
@@ -46,19 +49,53 @@
     "recovery_event",
     "treatment_event"
   ],
-  "notes": {
-    "purpose": "Synthetic benchmark for GRM-style latent-state modeling of integrative physiology.",
-    "not_biology": "This is not a biological simulator or proof of TCM. It is a controlled benchmark.",
-    "contrarian_examples": [
-      "One syndrome-like label is split into hidden subtypes.",
-      "Some labels merge into a bridge state.",
-      "Treatment response depends partly on hidden subtype, not label."
-    ],
-    "recommended_tasks": [
-      "Predict next_day_score.",
-      "Predict flare_next_day.",
-      "Recover latent state from observations only.",
-      "Detect mismatch between latent clusters and semantic labels."
-    ]
-  }
+  "regime_names": [
+    "balanced",
+    "stressed_recoverable",
+    "inflammatory",
+    "digestive_instable",
+    "stuck_depleted",
+    "stuck_agitated",
+    "recovery"
+  ],
+  "stuck_regime_ids": [
+    4,
+    5
+  ],
+  "alias_groups": {
+    "0": "calm",
+    "1": "wired",
+    "2": "hot",
+    "3": "heavy",
+    "4": "heavy",
+    "5": "wired",
+    "6": "calm"
+  },
+  "ground_truth_files": {
+    "subjects.csv": "Subject-level metadata: hidden_subtype, sensitivities, attractor_susceptibility, recovery_efficiency.",
+    "visits.csv": "Per-(subject, day) observations, true_regime_id, dwell_time, latent_instability, delayed_*_load, outcomes.",
+    "latent_states.csv": "Continuous latent z_t per (subject, day).",
+    "events.csv": "Stress/recovery/treatment event log per (subject, day).",
+    "true_regimes.csv": "Regime registry: id, name, prototype z, drift strength, alias group, self-loop probability.",
+    "true_transition_matrices.csv": "Base 7x7 transition matrix and per-subject additive logit bias matrices.",
+    "true_attractor_states.csv": "Per-subject occupancy fraction and longest dwell in stuck regimes."
+  },
+  "design_notes": {
+    "model": "Switching state-space: discrete regime c_t in 7 categories + continuous latent z_t in R^4.",
+    "subtype_role": "hidden_subtype shifts a subject's transition-bias matrix (dynamic property), not just baseline z.",
+    "stuck_attractors": "stuck_depleted (4) and stuck_agitated (5) have high self-transition probability scaled by sticky_strength.",
+    "delayed_effects": "Stress/treatment/recovery loads decay exponentially (load_decay) and modulate regime transitions and flare risk.",
+    "observation_aliasing": "Regimes are grouped (calm/wired/hot/heavy) and share an observation offset, so different regimes can produce similar x_t.",
+    "outcomes": "next_day_score and flare_next_day depend on c_{t+1}, dwell_time_{t+1}, latent_instability, and delayed loads, with a small linear-in-observations component. Today's global_dysregulation_score alone is a weak predictor.",
+    "labels": "TCM-like labels are thresholded functions of NOISY observations with practitioner bias and label noise (not direct from regimes).",
+    "ontology_mismatch": "Aliased regimes (e.g. stuck_agitated vs stressed_recoverable) can yield the same label; same regime can yield different labels via noise."
+  },
+  "framing": "Synthetic benchmark for latent-state recovery and ontology mismatch detection. Not a biological simulator. Not evidence for TCM or Qi.",
+  "recommended_tasks": [
+    "Recover discrete regime c_t from observations only.",
+    "Detect stuck-attractor states via self-resonance.",
+    "Predict next_day_score / flare_next_day with subject-level dynamics, not just today's severity.",
+    "Compare TCM-like labels against true_regime to surface ontology mismatch.",
+    "Recover hidden_subtype from subject-level transition fingerprints."
+  ]
 }

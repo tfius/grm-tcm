@@ -461,4 +461,28 @@ The subject-level mean soft self-resonance does **not** recover `hidden_subtype`
 
 Sharpening the state graph with KNN similarity can further improve dynamic scores; for example, `--similarity-mode knn --state-similarity-k 3 --max-modes 16` increased soft self-resonance AUC in the current smoke test. Early-fit state assignment with `--state-fit-end-day 40` is more honest as a predictive diagnostic, but weaker, so future reported predictive claims should distinguish transductive diagnostics from early-fit validation.
 
+## Regime-Aware Diagnostics
+
+After the synthetic-world redesign, diagnostics now use the new ground truth:
+
+- `true_regime`
+- `true_regime_id`
+- `attractor_state`
+- `true_attractor_states.csv`
+
+Static diagnostics now report cluster alignment against true regimes. In the current run, GRM embedding clusters align substantially with `true_regime` (`NMI` about `0.56`, `ARI` about `0.49`) but much less with `attractor_state` (`NMI` about `0.19`, `ARI` about `0.16`). That means the static embedding can recover broad regime structure, but it does not cleanly isolate stuck-attractor states.
+
+Dynamic diagnostics now add:
+
+- inferred state vs true regime confusion
+- soft self-resonance stuck-state AUC
+- GRM/Markov transition accuracy after mapping inferred states to true regimes
+- hidden subtype eta-squared for true stuck occupancy
+- subject resonance vs true stuck occupancy
+- state-source comparison across observation KMeans, dynamic-feature KMeans, and oracle true regimes
+
+Current true-subtype signal is present in the generator ground truth: hidden subtype explains roughly `6%` of stuck-depleted occupancy variance and `11%` of stuck-agitated occupancy variance. The inferred dynamic resonance features do not fully recover that structure yet. This is the next modeling gap.
+
+The state vocabulary is now an explicit experimental lever via `--state-source`. `kmeans_observation` tests whether visible observations are enough, `kmeans_dynamic` adds short trajectory features to reduce aliasing, and `true_regime` is an oracle ceiling for the redesigned synthetic world. In the current comparison, dynamic-feature states improve soft self-resonance flare signal relative to observation-only states, while true-regime states mainly improve next-state transition accuracy. That split is meaningful: part of the remaining gap is state aliasing, and part is the difference between recovering regime transitions and predicting flare timing.
+
 Interpretation guardrail: these are synthetic benchmark results only. They test latent-state recovery, ontology mismatch detection, and ablation behavior; they do not prove TCM, Qi, or a biological mechanism.
