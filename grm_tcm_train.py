@@ -22,19 +22,20 @@ Outputs:
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
 from scipy import sparse
 from scipy.linalg import orthogonal_procrustes
+from scipy.optimize import minimize_scalar
 from scipy.sparse.linalg import eigsh
 from sklearn.base import BaseEstimator
 from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
 from sklearn.impute import SimpleImputer
 from sklearn.linear_model import LogisticRegression, Ridge
 from sklearn.metrics import accuracy_score, mean_absolute_error, mean_squared_error, r2_score, roc_auc_score
-from sklearn.model_selection import GroupShuffleSplit
+from sklearn.model_selection import GroupShuffleSplit, KFold
 from sklearn.neighbors import NearestNeighbors
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
@@ -44,9 +45,42 @@ from grm_tcm_persistence import (
     save_joblib,
     write_manifest,
 )
+from grm_tcm_projection import nystrom_extend_arrays, surrogate_project
 
 
 STATIC_SCHEMA_VERSION = "static-v2"
+
+
+def _sigmoid(z: np.ndarray) -> np.ndarray:
+    """Numerically stable sigmoid for arbitrary real-valued inputs."""
+
+    out = np.empty_like(z, dtype=float)
+    pos = z >= 0
+    neg = ~pos
+    out[pos] = 1.0 / (1.0 + np.exp(-z[pos]))
+    ez = np.exp(z[neg])
+    out[neg] = ez / (1.0 + ez)
+    return out
+
+
+def _fit_binary_temperature(z: np.ndarray, y: np.ndarray) -> float:
+    """Find T > 0 minimizing NLL of sigmoid(z / T) against binary labels y."""
+
+    z = np.asarray(z, dtype=float)
+    y = np.asarray(y, dtype=int)
+    if z.size == 0 or len(np.unique(y)) < 2:
+        return 1.0
+
+    def nll(t: float) -> float:
+        t_safe = max(float(t), 1e-3)
+        s = z / t_safe
+        # log(sigmoid(s)) and log(1 - sigmoid(s)) via softplus identities
+        log_p1 = -np.logaddexp(0.0, -s)
+        log_p0 = -np.logaddexp(0.0, s)
+        return float(-np.mean(np.where(y == 1, log_p1, log_p0)))
+
+    res = minimize_scalar(nll, bounds=(0.05, 10.0), method="bounded")
+    return float(res.x)
 
 
 OBSERVATION_NAMES = [
@@ -80,6 +114,14 @@ class GRMTrainConfig:
     target_regression: str = "next_day_score"
     target_classification: str = "flare_next_day"
 
+    # Strict inductive evaluation: split subjects first, fit scaler/KNN/graph/
+    # eigenbasis ONLY on train subjects, then project test subjects via the
+    # chosen projection method ('surrogate' or 'nystrom'). Reports honest
+    # held-out metrics; the persisted model is the train-only fit.
+    inductive: bool = False
+    projection: str = "surrogate"
+    n_neighbors_inductive: int = 12
+
 
 class GRMTCMTrainer:
     def __init__(self, config: GRMTrainConfig):
@@ -96,6 +138,7 @@ class GRMTCMTrainer:
         self.ridge_reg: Optional[BaseEstimator] = None
         self.logistic_clf: Optional[BaseEstimator] = None
         self.embedding_surrogate: Optional[BaseEstimator] = None
+        self.flare_temperature: Optional[float] = None
         self.train_idx: Optional[np.ndarray] = None
         self.test_idx: Optional[np.ndarray] = None
         self.procrustes_R: Optional[np.ndarray] = None
@@ -105,6 +148,11 @@ class GRMTCMTrainer:
     def run(self) -> Dict:
         visits, latent, events = self._load_data()
         visits = self._prepare_visits(visits)
+        if self.cfg.inductive:
+            return self._run_inductive(visits, latent, events)
+        return self._run_transductive(visits, latent, events)
+
+    def _run_transductive(self, visits, latent, events) -> Dict:
         self._visit_index = visits[["visit_id", "subject_id", "day"]].copy()
         X_obs, feature_names = self._make_observation_matrix(visits)
         self._X_obs = X_obs
@@ -122,6 +170,282 @@ class GRMTCMTrainer:
         self._write_outputs(embeddings_df, feature_modes_df, metrics, predictions_df)
         self._save_model()
         return metrics
+
+    def _run_inductive(self, visits: pd.DataFrame, latent: Optional[pd.DataFrame], events: Optional[pd.DataFrame]) -> Dict:
+        """Strict inductive evaluation: split subjects first, fit everything on train-only.
+
+        Pipeline:
+          1. Subject-level split (GroupShuffleSplit semantics; seed-controlled).
+          2. Fit obs_preprocessor, NN index, visit graph, eigenbasis, embedding surrogate,
+             ridge head, logistic head, Procrustes R --- all on TRAIN subjects only.
+          3. Project TEST-subject observations via cfg.projection ('surrogate' | 'nystrom').
+          4. Score test subjects (regression R², classification AUC, baselines, calibration,
+             out-of-sample latent recovery).
+          5. Persist the train-only model with manifest extra {inductive:True, ...} and write
+             inductive_eval_metrics.json next to the standard CSV outputs.
+        """
+
+        if self.cfg.projection not in {"surrogate", "nystrom"}:
+            raise ValueError(f"Unknown projection: {self.cfg.projection!r}; must be 'surrogate' or 'nystrom'.")
+
+        # 1. Subject split.
+        rng = np.random.default_rng(self.cfg.random_seed)
+        all_subjects = np.array(sorted(visits["subject_id"].unique()))
+        rng.shuffle(all_subjects)
+        n_test = max(1, int(round(self.cfg.test_size * len(all_subjects))))
+        if n_test >= len(all_subjects):
+            raise ValueError(f"test_size={self.cfg.test_size} leaves no training subjects.")
+        test_subjects = set(int(s) for s in all_subjects[:n_test])
+        train_subjects = set(int(s) for s in all_subjects[n_test:])
+
+        train_mask = visits["subject_id"].isin(train_subjects).to_numpy()
+        train_visits = visits[train_mask].sort_values(["subject_id", "day"]).reset_index(drop=True)
+        test_visits = visits[~train_mask].sort_values(["subject_id", "day"]).reset_index(drop=True)
+        train_visits["visit_id"] = np.arange(len(train_visits))
+        test_visits["visit_id"] = np.arange(len(train_visits), len(train_visits) + len(test_visits))
+
+        print(
+            f"[inductive] {len(train_subjects)} train subjects ({len(train_visits)} visits) / "
+            f"{len(test_subjects)} test subjects ({len(test_visits)} visits)"
+        )
+
+        # 2a. Fit observation preprocessor on train only.
+        X_train, feature_names = self._make_observation_matrix(train_visits)
+        self._X_obs = X_train
+
+        # 2b. Build train-only graph + eigenbasis.
+        W_train = self._build_visit_graph(train_visits, X_train, events)
+        eigenvalues, eigenvectors = self._spectral_decomposition(W_train)
+        eigenvectors = canonicalize_eigvec_signs(eigenvectors)
+        self.eigenvalues = eigenvalues
+        self.eigenvectors = eigenvectors
+        train_embeddings = self._make_grm_embeddings(eigenvalues, eigenvectors)
+
+        # 2c. Fit heads on ALL train embeddings (no within-graph split needed: the held-out
+        # set is the disjoint test subjects).
+        y_reg_train = train_visits[self.cfg.target_regression].to_numpy(float)
+        y_cls_train = train_visits[self.cfg.target_classification].astype(int).to_numpy()
+        self.train_idx = np.arange(len(train_visits))
+        self.test_idx = None  # No within-graph test split in inductive mode.
+
+        self.ridge_reg = Ridge(alpha=1.0).fit(train_embeddings, y_reg_train)
+        if len(np.unique(y_cls_train)) >= 2:
+            self.logistic_clf = LogisticRegression(max_iter=2000, class_weight="balanced").fit(
+                train_embeddings, y_cls_train
+            )
+        else:
+            self.logistic_clf = None
+
+        # 2d. Surrogate + temperature (both train-only).
+        self._fit_embedding_surrogate(X_train, train_embeddings)
+        self.flare_temperature = self._fit_flare_temperature(train_embeddings, y_cls_train, self.train_idx)
+
+        # 3. Project test observations.
+        X_test_raw = test_visits[OBSERVATION_NAMES].to_numpy(float)
+        X_test = self.obs_preprocessor.transform(X_test_raw)
+
+        if self.cfg.projection == "surrogate":
+            test_embeddings = surrogate_project(self.embedding_surrogate, X_test)
+        else:  # nystrom
+            if self.nn_index is None:
+                raise RuntimeError(
+                    f"Nyström projection requires a KNN-based graph_mode; got {self.cfg.graph_mode!r}."
+                )
+            test_embeddings = nystrom_extend_arrays(
+                X_test,
+                nn_index=self.nn_index,
+                knn_sigma=float(self.knn_sigma),
+                eigenvalues=self.eigenvalues,
+                eigenvectors=self.eigenvectors,
+                rho=float(self.cfg.rho),
+                normalized=bool(self.cfg.use_normalized_laplacian),
+                train_degrees=self.train_degrees,
+                n_neighbors=int(self.cfg.n_neighbors_inductive),
+            )
+
+        # 4. Score test subjects + baselines.
+        y_reg_test = test_visits[self.cfg.target_regression].to_numpy(float)
+        y_cls_test = test_visits[self.cfg.target_classification].astype(int).to_numpy()
+
+        pred_grm_reg = self.ridge_reg.predict(test_embeddings)
+        if self.logistic_clf is not None:
+            prob_grm_cls = self.logistic_clf.predict_proba(test_embeddings)[:, 1]
+            pred_grm_cls = (prob_grm_cls >= 0.5).astype(int)
+            if self.flare_temperature is not None and np.isfinite(self.flare_temperature):
+                z_test = self.logistic_clf.decision_function(test_embeddings)
+                prob_grm_cls_cal = _sigmoid(z_test / float(self.flare_temperature))
+                pred_grm_cls_cal = (prob_grm_cls_cal >= 0.5).astype(int)
+            else:
+                prob_grm_cls_cal = None
+                pred_grm_cls_cal = None
+        else:
+            prob_grm_cls = np.full(len(test_visits), 0.5)
+            pred_grm_cls = np.zeros(len(test_visits), dtype=int)
+            prob_grm_cls_cal = None
+            pred_grm_cls_cal = None
+
+        # Raw-observation baseline: fit RF on train_raw, predict on test_raw. Both rows
+        # come through the SAME preprocessor (fit on train) to keep the inductive contract.
+        raw_cols = OBSERVATION_NAMES + ["global_dysregulation_score"]
+        raw_pipe = Pipeline([("imputer", SimpleImputer(strategy="median")), ("scaler", StandardScaler())])
+        train_raw = raw_pipe.fit_transform(train_visits[raw_cols].to_numpy(float))
+        test_raw = raw_pipe.transform(test_visits[raw_cols].to_numpy(float))
+        raw_rf_reg = RandomForestRegressor(n_estimators=100, min_samples_leaf=4, random_state=42, n_jobs=-1).fit(
+            train_raw, y_reg_train
+        )
+        pred_raw_reg = raw_rf_reg.predict(test_raw)
+        if len(np.unique(y_cls_train)) >= 2:
+            raw_rf_cls = RandomForestClassifier(
+                n_estimators=100, min_samples_leaf=4, random_state=42, n_jobs=-1, class_weight="balanced"
+            ).fit(train_raw, y_cls_train)
+            prob_raw_cls = raw_rf_cls.predict_proba(test_raw)[:, 1]
+            pred_raw_cls = (prob_raw_cls >= 0.5).astype(int)
+        else:
+            prob_raw_cls = np.full(len(test_visits), 0.5)
+            pred_raw_cls = np.zeros(len(test_visits), dtype=int)
+
+        # Naive baseline: just use the current dysregulation score.
+        pred_naive_reg = test_visits["global_dysregulation_score"].to_numpy(float)
+        pred_naive_reg = np.nan_to_num(pred_naive_reg, nan=float(np.nanmedian(y_reg_train)))
+        naive_threshold = float(np.nanmedian(y_reg_train))
+        pred_naive_cls = (pred_naive_reg >= naive_threshold).astype(int)
+        prob_naive_cls = np.clip(
+            pred_naive_reg / max(float(np.nanmax(y_reg_train)), 1e-9), 0, 1
+        )
+
+        # 5. Out-of-sample latent recovery: fit Procrustes on train, apply to test.
+        latent_recovery = self._latent_recovery_inductive(
+            train_visits, train_embeddings, test_visits, test_embeddings, latent
+        )
+
+        metrics: Dict[str, Any] = {
+            "manifest": "model/manifest.json",
+            "evaluation_mode": "inductive",
+            "projection": self.cfg.projection,
+            "n_train_subjects": int(len(train_subjects)),
+            "n_test_subjects": int(len(test_subjects)),
+            "n_train_visits": int(len(train_visits)),
+            "n_test_visits": int(len(test_visits)),
+            "regression": {
+                "grm_ridge": self._reg_metrics(y_reg_test, pred_grm_reg),
+                "raw_random_forest": self._reg_metrics(y_reg_test, pred_raw_reg),
+                "naive_current_score": self._reg_metrics(y_reg_test, pred_naive_reg),
+            },
+            "classification": {
+                "grm_logistic": self._cls_metrics(y_cls_test, pred_grm_cls, prob_grm_cls),
+                "grm_logistic_calibrated": (
+                    self._cls_metrics(y_cls_test, pred_grm_cls_cal, prob_grm_cls_cal)
+                    if prob_grm_cls_cal is not None else {}
+                ),
+                "raw_random_forest": self._cls_metrics(y_cls_test, pred_raw_cls, prob_raw_cls),
+                "naive_current_score": self._cls_metrics(y_cls_test, pred_naive_cls, prob_naive_cls),
+            },
+            "flare_temperature": float(self.flare_temperature) if self.flare_temperature is not None else None,
+            "latent_recovery": latent_recovery,
+            "interpretation_guardrail": (
+                "Strict inductive evaluation: test subjects are disjoint from training and were "
+                "never seen by the graph, eigenbasis, or any fitted head. Compare against the "
+                "transductive metrics to see how much of the apparent signal is graph-leak."
+            ),
+        }
+
+        # 6. Build combined embeddings frame + test-only predictions frame.
+        embeddings_df = pd.concat(
+            [
+                self._make_embeddings_df(train_visits, train_embeddings).assign(split="train"),
+                self._make_embeddings_df(test_visits, test_embeddings).assign(split="test"),
+            ],
+            ignore_index=True,
+        )
+
+        pred_df = test_visits[
+            ["visit_id", "subject_id", "day", self.cfg.target_regression, self.cfg.target_classification]
+        ].copy()
+        pred_df["split"] = "test"
+        pred_df["pred_grm_next_score"] = pred_grm_reg
+        pred_df["pred_grm_flare_prob"] = prob_grm_cls
+        if prob_grm_cls_cal is not None:
+            pred_df["pred_grm_flare_prob_calibrated"] = prob_grm_cls_cal
+        pred_df["pred_raw_next_score"] = pred_raw_reg
+        pred_df["pred_raw_flare_prob"] = prob_raw_cls
+        pred_df["pred_naive_next_score"] = pred_naive_reg
+        pred_df["pred_naive_flare_prob"] = prob_naive_cls
+
+        feature_modes_df = self._feature_mode_correlations(train_visits, train_embeddings, feature_names)
+
+        # 7. Write outputs. The persisted model is the train-only fit; _visit_index for
+        # save_model is restricted to train rows so it aligns with eigenvectors.
+        self._visit_index = train_visits[["visit_id", "subject_id", "day"]].copy()
+        self._write_outputs(embeddings_df, feature_modes_df, metrics, pred_df)
+        with open(self.output_dir / "inductive_eval_metrics.json", "w", encoding="utf-8") as f:
+            json.dump(metrics, f, indent=2)
+
+        manifest_extra = {
+            "inductive": True,
+            "projection": self.cfg.projection,
+            "n_train_subjects": int(len(train_subjects)),
+            "n_test_subjects": int(len(test_subjects)),
+            "test_subjects": sorted(test_subjects),
+        }
+        self._save_model(manifest_extra=manifest_extra)
+        return metrics
+
+    def _latent_recovery_inductive(
+        self,
+        train_visits: pd.DataFrame,
+        train_embeddings: np.ndarray,
+        test_visits: pd.DataFrame,
+        test_embeddings: np.ndarray,
+        latent: Optional[pd.DataFrame],
+    ) -> Dict[str, Any]:
+        """Fit Procrustes on train, evaluate alignment in-sample (train) AND out-of-sample (test)."""
+
+        if latent is None:
+            return {}
+
+        def _merge_latent(v: pd.DataFrame) -> np.ndarray:
+            merged = v[["visit_id", "subject_id", "day"]].merge(
+                latent[["subject_id", "day"] + LATENT_NAMES], on=["subject_id", "day"], how="left"
+            )
+            return merged[LATENT_NAMES].to_numpy(float)
+
+        Z_train_raw = _merge_latent(train_visits)
+        Z_test_raw = _merge_latent(test_visits)
+        z_imputer = SimpleImputer(strategy="median").fit(Z_train_raw)
+        z_scaler = StandardScaler().fit(z_imputer.transform(Z_train_raw))
+        Z_train = z_scaler.transform(z_imputer.transform(Z_train_raw))
+        Z_test = z_scaler.transform(z_imputer.transform(Z_test_raw))
+
+        e_scaler = StandardScaler().fit(train_embeddings)
+        E_train = e_scaler.transform(train_embeddings)
+        E_test = e_scaler.transform(test_embeddings)
+
+        q = min(E_train.shape[1], Z_train.shape[1])
+        R, _ = orthogonal_procrustes(E_train[:, :q], Z_train[:, :q])
+        self.procrustes_R = R
+
+        def _corrs(E_aligned: np.ndarray, Z: np.ndarray) -> List[float]:
+            return [
+                float(np.corrcoef(E_aligned[:, j], Z[:, j])[0, 1]) if E_aligned.shape[0] > 1 else float("nan")
+                for j in range(q)
+            ]
+
+        train_corrs = _corrs(E_train[:, :q] @ R, Z_train[:, :q])
+        test_corrs = _corrs(E_test[:, :q] @ R, Z_test[:, :q])
+        return {
+            "in_sample_train": {
+                "mean_abs_aligned_correlation": float(np.nanmean(np.abs(train_corrs))),
+                "aligned_correlations": train_corrs,
+            },
+            "out_of_sample_test": {
+                "mean_abs_aligned_correlation": float(np.nanmean(np.abs(test_corrs))),
+                "aligned_correlations": test_corrs,
+            },
+            "note": (
+                "Synthetic-only metric. Procrustes rotation fit on train embeddings vs train latents, "
+                "applied to held-out test embeddings vs test latents."
+            ),
+        }
 
     def _load_data(self) -> Tuple[pd.DataFrame, Optional[pd.DataFrame], Optional[pd.DataFrame]]:
         visits_path = self.input_dir / "visits.csv"
@@ -304,6 +628,10 @@ class GRMTCMTrainer:
         pred_naive_cls = (pred_naive_reg >= naive_threshold).astype(int)
         prob_naive_cls = np.clip(pred_naive_reg / max(float(np.nanmax(y_reg[train_idx])), 1e-9), 0, 1)
 
+        self.flare_temperature = self._fit_flare_temperature(X_grm, y_cls, train_idx)
+        prob_grm_cls_calibrated = self._apply_flare_temperature(self.logistic_clf, X_grm, test_idx, self.flare_temperature)
+        pred_grm_cls_calibrated = (prob_grm_cls_calibrated >= 0.5).astype(int) if prob_grm_cls_calibrated is not None else None
+
         metrics: Dict = {
             "manifest": "model/manifest.json",
             "regression": {
@@ -313,9 +641,14 @@ class GRMTCMTrainer:
             },
             "classification": {
                 "grm_logistic": self._cls_metrics(y_cls[test_idx], pred_grm_cls, prob_grm_cls),
+                "grm_logistic_calibrated": (
+                    self._cls_metrics(y_cls[test_idx], pred_grm_cls_calibrated, prob_grm_cls_calibrated)
+                    if prob_grm_cls_calibrated is not None else {}
+                ),
                 "raw_random_forest": self._cls_metrics(y_cls[test_idx], pred_raw_cls, prob_raw_cls),
                 "naive_current_score": self._cls_metrics(y_cls[test_idx], pred_naive_cls, prob_naive_cls),
             },
+            "flare_temperature": float(self.flare_temperature) if self.flare_temperature is not None else None,
             "latent_recovery": self._latent_recovery_capture(visits, embeddings, latent) if latent is not None else {},
         }
 
@@ -328,6 +661,9 @@ class GRMTCMTrainer:
         pred_df.loc[test_idx, "pred_raw_next_score"] = pred_raw_reg
         pred_df["pred_grm_flare_prob"] = np.nan
         pred_df.loc[test_idx, "pred_grm_flare_prob"] = prob_grm_cls
+        if prob_grm_cls_calibrated is not None:
+            pred_df["pred_grm_flare_prob_calibrated"] = np.nan
+            pred_df.loc[test_idx, "pred_grm_flare_prob_calibrated"] = prob_grm_cls_calibrated
         pred_df["pred_raw_flare_prob"] = np.nan
         pred_df.loc[test_idx, "pred_raw_flare_prob"] = prob_raw_cls
         return metrics, pred_df
@@ -367,6 +703,47 @@ class GRMTCMTrainer:
         prob = clf.predict_proba(X[test_idx])[:, 1]
         return pred, prob, clf
 
+    def _fit_flare_temperature(
+        self, X: np.ndarray, y_cls: np.ndarray, train_idx: np.ndarray, n_inner_folds: int = 5,
+    ) -> Optional[float]:
+        """Fit a single temperature T > 0 for the flare classifier on inner-CV held-out logits.
+
+        Why inner CV: temperature must be fit on predictions the calibrator hasn't seen
+        in training, otherwise T collapses toward 1. We use KFold within train_idx so the
+        outer test fold is never touched.
+        """
+
+        if len(np.unique(y_cls[train_idx])) < 2 or len(train_idx) < n_inner_folds * 2:
+            return None
+        kf = KFold(n_splits=n_inner_folds, shuffle=True, random_state=self.cfg.random_seed)
+        logits: List[np.ndarray] = []
+        labels: List[np.ndarray] = []
+        for inner_tr, inner_val in kf.split(train_idx):
+            sub_tr = train_idx[inner_tr]
+            sub_val = train_idx[inner_val]
+            if len(np.unique(y_cls[sub_tr])) < 2:
+                continue
+            inner_clf = LogisticRegression(max_iter=2000, class_weight="balanced")
+            inner_clf.fit(X[sub_tr], y_cls[sub_tr])
+            logits.append(inner_clf.decision_function(X[sub_val]))
+            labels.append(y_cls[sub_val])
+        if not logits:
+            return None
+        z = np.concatenate(logits)
+        y = np.concatenate(labels)
+        return _fit_binary_temperature(z, y)
+
+    @staticmethod
+    def _apply_flare_temperature(
+        clf: Optional[BaseEstimator], X: np.ndarray, test_idx: np.ndarray, T: Optional[float],
+    ) -> Optional[np.ndarray]:
+        """Apply temperature T to a binary logistic classifier's decision_function on test_idx."""
+
+        if clf is None or T is None or not np.isfinite(T) or T <= 0:
+            return None
+        z = clf.decision_function(X[test_idx])
+        return _sigmoid(z / float(T))
+
     @staticmethod
     def _reg_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> Dict[str, float]:
         mse = mean_squared_error(y_true, y_pred)
@@ -380,6 +757,9 @@ class GRMTCMTrainer:
     def _cls_metrics(y_true: np.ndarray, y_pred: np.ndarray, y_prob: np.ndarray) -> Dict[str, float]:
         out = {"accuracy": float(accuracy_score(y_true, y_pred))}
         out["roc_auc"] = float(roc_auc_score(y_true, y_prob)) if len(np.unique(y_true)) > 1 else float("nan")
+        y_prob_safe = np.clip(np.asarray(y_prob, dtype=float), 1e-12, 1.0 - 1e-12)
+        out["log_loss"] = float(-np.mean(np.where(y_true == 1, np.log(y_prob_safe), np.log(1.0 - y_prob_safe))))
+        out["brier"] = float(np.mean((y_prob_safe - y_true) ** 2))
         return out
 
     def _latent_recovery_capture(self, visits: pd.DataFrame, embeddings: np.ndarray, latent: pd.DataFrame) -> Dict[str, object]:
@@ -438,7 +818,7 @@ class GRMTCMTrainer:
         with open(self.output_dir / "grm_metrics.json", "w", encoding="utf-8") as f:
             json.dump(metrics, f, indent=2)
 
-    def _save_model(self) -> None:
+    def _save_model(self, manifest_extra: Optional[Dict[str, Any]] = None) -> None:
         """Persist the fitted static GRM-TCM pipeline."""
 
         if self.eigenvalues is None or self.eigenvectors is None:
@@ -472,6 +852,17 @@ class GRMTCMTrainer:
             save_joblib(self.logistic_clf, model_dir / "logistic_flare.joblib")
         if self.embedding_surrogate is not None:
             save_joblib(self.embedding_surrogate, model_dir / "embedding_surrogate.joblib")
+        if self.flare_temperature is not None:
+            with open(model_dir / "flare_temperature.json", "w", encoding="utf-8") as f:
+                json.dump(
+                    {
+                        "T": float(self.flare_temperature),
+                        "fit_method": "inner_5fold_cv_on_train",
+                        "applies_to": "logistic_flare",
+                    },
+                    f,
+                    indent=2,
+                )
 
         if self.train_idx is not None and self.test_idx is not None:
             with open(model_dir / "split_indices.json", "w", encoding="utf-8") as f:
@@ -501,13 +892,51 @@ class GRMTCMTrainer:
             ],
             schema_version=STATIC_SCHEMA_VERSION,
             random_seed=self.cfg.random_seed,
+            extra=manifest_extra,
         )
 
 
+def _parse_cli() -> GRMTrainConfig:
+    """Parse CLI args into a GRMTrainConfig. Defaults match the dataclass."""
+
+    import argparse
+
+    defaults = GRMTrainConfig()
+    parser = argparse.ArgumentParser(description="Train the static GRM-TCM pipeline.")
+    parser.add_argument("--input-dir", default=defaults.input_dir)
+    parser.add_argument("--output-dir", default=defaults.output_dir)
+    parser.add_argument("--random-seed", type=int, default=defaults.random_seed)
+    parser.add_argument("--graph-mode", default=defaults.graph_mode,
+                        choices=["feature_only", "temporal_only", "feature_temporal",
+                                 "feature_temporal_treatment", "random_graph"])
+    parser.add_argument("--n-modes", type=int, default=defaults.n_modes)
+    parser.add_argument("--rho", type=float, default=defaults.rho)
+    parser.add_argument("--test-size", type=float, default=defaults.test_size)
+    parser.add_argument("--inductive", action="store_true",
+                        help="Strict inductive eval: split subjects first, fit on train only, "
+                             "project test subjects via --projection.")
+    parser.add_argument("--projection", choices=["surrogate", "nystrom"], default=defaults.projection,
+                        help="Inductive-only: how to project test-subject visits.")
+    parser.add_argument("--n-neighbors-inductive", type=int, default=defaults.n_neighbors_inductive)
+    args = parser.parse_args()
+    return GRMTrainConfig(
+        input_dir=args.input_dir,
+        output_dir=args.output_dir,
+        random_seed=args.random_seed,
+        graph_mode=args.graph_mode,
+        n_modes=args.n_modes,
+        rho=args.rho,
+        test_size=args.test_size,
+        inductive=args.inductive,
+        projection=args.projection,
+        n_neighbors_inductive=args.n_neighbors_inductive,
+    )
+
+
 if __name__ == "__main__":
-    cfg = GRMTrainConfig()
+    cfg = _parse_cli()
     trainer = GRMTCMTrainer(cfg)
     metrics = trainer.run()
-    print("GRM-TCM training complete.")
+    print(f"\nGRM-TCM training complete ({'inductive' if cfg.inductive else 'transductive'}).")
     print(f"Results written to: {Path(cfg.output_dir).resolve()}")
     print(json.dumps(metrics, indent=2))
