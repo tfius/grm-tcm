@@ -67,12 +67,17 @@ After training, run `predict.py` to score new visits without retraining:
 uv run python predict.py --visits NEW_VISITS.csv \
     --static-model grm_tcm_results/model \
     --dynamic-model grm_tcm_dynamic/model \
+    --projection surrogate \
     --out predictions.csv
 ```
 
-Inputs must include the 12 observation columns plus `subject_id` and `day`. Outputs include `grm_mode_*` coordinates (via Nyström extension), `pred_next_day_score`, `pred_flare_prob`, and optionally `state_id`, `self_resonance`, `soft_self_resonance`, `top1_next_state`, `top1_next_state_prob`.
+Inputs must include the 12 observation columns plus `subject_id` and `day`. Outputs include `grm_mode_*` coordinates, `pred_next_day_score`, `pred_flare_prob`, and (with `--dynamic-model`) `state_id`, `self_resonance`, `soft_self_resonance`, `top1_next_state`, `top1_next_state_prob`.
 
-Nyström uses feature-only KNN edges, so it is a defensible approximation for visits feature-close to training data and increasingly noisy for far-out points. Temporal and treatment edges from the training graph are not reconstructed.
+Two projection modes are supported:
+- `--projection surrogate` (default): persisted Ridge regressor `X_obs → embeddings`. Deterministic; the recommended path for downstream prediction.
+- `--projection nystrom`: feature-only KNN extension of the spectral basis. Available when the static model used a graph_mode that includes KNN.
+
+Neither mode faithfully reproduces the GRM spectral embedding for new visits — those coordinates depend on multi-relational graph position (temporal + treatment + KNN edges), not on observations alone. Both modes are useful proxies for the downstream ridge/logistic heads; nothing more should be read into the `grm_mode_*` values in `predictions.csv`.
 
 ## Tests
 
@@ -80,6 +85,30 @@ Nyström uses feature-only KNN edges, so it is a defensible approximation for vi
 uv sync --group dev
 uv run pytest
 ```
+
+## Falsifiable-verdicts eval
+
+After training the static + dynamic models, run the eval pipeline to score whether the headline GRM claims survive bootstrap CIs:
+
+```bash
+uv run python grm_tcm_dynamic_eval.py \
+    --static-model-dir grm_tcm_results/model \
+    --dynamic-model-dir grm_tcm_dynamic/model
+```
+
+It writes `dynamic_eval_certificates.json` and prints a boxed summary at end-of-run, e.g.:
+
+```text
+┌───────────────────────────────────────────┬────────┬──────────────────┬──────────┐
+│                    Test                   │   Δ    │      95% CI      │ Verdict  │
+├───────────────────────────────────────────┼────────┼──────────────────┼──────────┤
+│ T1 GRM separates aliased states (entropy) │ +0.182 │ [+0.163, +0.201] │ PASS     │
+│ T2 attractor AUC lift on aliased          │ +0.052 │ [+0.030, +0.075] │ PASS     │
+│ ...                                       │ ...    │ ...              │ ...      │
+└───────────────────────────────────────────┴────────┴──────────────────┴──────────┘
+```
+
+Row labels and order live in `grm_tcm_dynamic_eval.VERDICT_LABELS`. Verdicts present in the certificate but not in the map render under their raw key.
 
 To run the multi-seed difficulty/ablation sweep:
 

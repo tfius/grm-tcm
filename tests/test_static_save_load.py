@@ -31,10 +31,17 @@ def test_artifacts_present(trained_model_dir: Path):
         "knn_sigma.json",
         "ridge_next_day.joblib",
         "logistic_flare.joblib",
+        "embedding_surrogate.joblib",
         "split_indices.json",
         "visit_index.parquet",
     ]:
         assert (trained_model_dir / name).exists(), f"Missing artifact {name}"
+
+
+def test_manifest_is_static_v2(trained_model_dir: Path):
+    import json
+    m = json.load(open(trained_model_dir / "manifest.json"))
+    assert m["schema_version"] == "static-v2"
 
 
 def test_load_static_round_trip(trained_model_dir: Path):

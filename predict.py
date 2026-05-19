@@ -10,18 +10,20 @@ Usage:
         --out predictions.csv
 
 Pipeline:
-  1. Load static GRM model (preprocessor, eigenbasis, KNN index, regressors).
+  1. Load static GRM model (preprocessor, eigenbasis, regressors, optional surrogate).
   2. Apply obs_preprocessor to the new visits' observation columns.
-  3. Nyström-extend the spectral basis onto new visits, then weight by 1/(1+rho^2*lambda).
+  3. Project to GRM coordinates via one of two modes:
+     - surrogate (default): persisted Ridge X_obs -> embeddings. Faithful and fast.
+       Recovers training embeddings to high accuracy by construction.
+     - nystrom: feature-only KNN + RBF extension of the spectral basis. Approximate
+       because the training graph has multi-relational edges (temporal, treatment,
+       mutual-KNN augmentation) that feature-only Nyström cannot reconstruct.
+       Available when the static model was trained with a graph_mode that includes
+       KNN (feature_only / feature_temporal / feature_temporal_treatment).
   4. Apply ridge/logistic heads for next_day_score / flare probability.
   5. (Optional) Apply state preprocessor + KMeans from the dynamic model, look up the
      most-recent G^(t) <= visit day, emit self-resonance / soft-self-resonance and
      top-1 next-state transition probability.
-
-Nyström extension uses feature-only edges (KNN + RBF) against training visits. Temporal
-and treatment edges from the training graph cannot be reconstructed for unseen visits,
-so the extension is an approximation: defensible for visits feature-close to training
-data, increasingly noisy for far-out points. No retraining is performed.
 """
 
 import argparse
@@ -54,6 +56,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--static-model", default="grm_tcm_results/model", help="Path to static model dir.")
     parser.add_argument("--dynamic-model", default=None, help="Optional path to dynamic model dir.")
     parser.add_argument("--out", default="predictions.csv", help="Output CSV path.")
+    parser.add_argument(
+        "--projection",
+        choices=["surrogate", "nystrom"],
+        default="surrogate",
+        help="How to project new visits into GRM coordinates. 'surrogate' uses the persisted Ridge head "
+        "X_obs -> embeddings (default, recovers training visits exactly by construction). 'nystrom' uses "
+        "feature-only KNN + RBF extension of the spectral basis (approximate; requires graph_mode with KNN).",
+    )
     parser.add_argument("--n-neighbors", type=int, default=12, help="Neighbors used in Nyström extension.")
     return parser.parse_args()
 
@@ -150,6 +160,27 @@ def nystrom_grm_coordinates(
 
     spectral_weights = 1.0 / (1.0 + (rho**2) * lambdas)
     return coords * spectral_weights.reshape(1, -1)
+
+
+def surrogate_grm_coordinates(static: StaticGRMModel, X_new_scaled: np.ndarray) -> np.ndarray:
+    """Project new visits via the persisted Ridge surrogate.
+
+    Important caveat: the surrogate does NOT faithfully reproduce the spectral
+    GRM embedding even on training visits. GRM coordinates depend on
+    multi-relational graph position (KNN + mutual augmentation + temporal +
+    treatment edges), not on observations alone, so no linear (or even kNN)
+    model in X_obs can recover them with high fidelity. The surrogate is a
+    deterministic, fast proxy for feeding the downstream ridge/logistic heads;
+    its outputs should not be interpreted as 'the GRM coordinates for this
+    visit.' See CLAUDE.md for the full caveat.
+    """
+
+    if static.embedding_surrogate is None:
+        raise RuntimeError(
+            "Loaded static model has no embedding_surrogate. The model was likely trained before "
+            "static-v2 schema; retrain or use --projection nystrom."
+        )
+    return np.asarray(static.embedding_surrogate.predict(X_new_scaled), dtype=float)
 
 
 def apply_static_heads(static: StaticGRMModel, grm_coords: np.ndarray) -> Dict[str, np.ndarray]:
@@ -259,8 +290,12 @@ def main() -> None:
 
     X_obs = static.obs_preprocessor.transform(visits[OBSERVATION_NAMES].to_numpy(float))
 
-    print(f"[step] Nyström-extending GRM basis to {len(visits)} new visits")
-    grm_coords = nystrom_grm_coordinates(static, X_obs, n_neighbors=args.n_neighbors)
+    if args.projection == "surrogate":
+        print(f"[step] Projecting {len(visits)} new visits via the Ridge embedding surrogate")
+        grm_coords = surrogate_grm_coordinates(static, X_obs)
+    else:
+        print(f"[step] Nyström-extending GRM basis to {len(visits)} new visits")
+        grm_coords = nystrom_grm_coordinates(static, X_obs, n_neighbors=args.n_neighbors)
 
     out = visits[["subject_id", "day"]].copy()
     for j in range(grm_coords.shape[1]):

@@ -25,7 +25,7 @@ from grm_tcm_persistence import (
 )
 
 
-STATIC_SCHEMA_VERSIONS = ["static-v1"]
+STATIC_SCHEMA_VERSIONS = ["static-v1", "static-v2"]
 DYNAMIC_SCHEMA_VERSIONS = ["dynamic-v1"]
 
 
@@ -47,6 +47,7 @@ class StaticGRMModel:
     knn_sigma: Optional[float] = None
     ridge_reg: Optional[Any] = None
     logistic_clf: Optional[Any] = None
+    embedding_surrogate: Optional[Any] = None
     procrustes_R: Optional[np.ndarray] = None
     visit_index: Optional[pd.DataFrame] = None
     split_indices: Optional[Dict[str, Any]] = None
@@ -91,6 +92,11 @@ def load_static_model(model_dir: Path) -> StaticGRMModel:
 
     ridge_reg = load_joblib(model_dir / "ridge_next_day.joblib") if (model_dir / "ridge_next_day.joblib").exists() else None
     logistic_clf = load_joblib(model_dir / "logistic_flare.joblib") if (model_dir / "logistic_flare.joblib").exists() else None
+    embedding_surrogate = (
+        load_joblib(model_dir / "embedding_surrogate.joblib")
+        if (model_dir / "embedding_surrogate.joblib").exists()
+        else None
+    )
     procrustes_R = np.load(model_dir / "procrustes_R.npy") if (model_dir / "procrustes_R.npy").exists() else None
     visit_index = pd.read_parquet(model_dir / "visit_index.parquet") if (model_dir / "visit_index.parquet").exists() else None
     split = json.load(open(model_dir / "split_indices.json")) if (model_dir / "split_indices.json").exists() else None
@@ -110,6 +116,7 @@ def load_static_model(model_dir: Path) -> StaticGRMModel:
         knn_sigma=knn_sigma,
         ridge_reg=ridge_reg,
         logistic_clf=logistic_clf,
+        embedding_surrogate=embedding_surrogate,
         procrustes_R=procrustes_R,
         visit_index=visit_index,
         split_indices=split,

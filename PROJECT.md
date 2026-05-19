@@ -1,3 +1,6 @@
+Be careful about the scientific boundary: this is framed as synthetic benchmark validation, not TCM validation. The main assumptions to probe are therefore technical: leakage, whether out-of-sample prediction truly matches training evaluation, and whether
+dynamic “resonance” metrics are compared against baselines fairly.
+
 # PHASE 1
 
 ## Layer A: whole-body observables

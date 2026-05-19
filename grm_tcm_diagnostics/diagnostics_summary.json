@@ -16,15 +16,15 @@
     "grm_mode_7",
     "grm_mode_8"
   ],
-  "best_abs_grm_latent_correlation": 0.5358639767239031,
+  "best_abs_grm_latent_correlation": 0.5358639767239033,
   "next_day_prediction": {
     "n": 1180,
     "mae": 0.13477090922811794,
-    "rmse": 0.17042133202693616,
-    "bias": 2.3512172635655033e-05,
-    "mean_error": 2.3512172635655033e-05,
+    "rmse": 0.17042133202693618,
+    "bias": 2.351217263566557e-05,
+    "mean_error": 2.351217263566557e-05,
     "median_abs_error": 0.10631638149040351,
-    "error_std": 0.17042133040500815
+    "error_std": 0.17042133040500818
   },
   "flare_prediction": {
     "n": 1180,
@@ -41,26 +41,10 @@
   "n_grouped_performance_rows": 27,
   "n_contrarian_findings": 8,
   "trainer_metrics": {
-    "config": {
-      "input_dir": "synthetic_grm_tcm",
-      "output_dir": "grm_tcm_results",
-      "random_seed": 42,
-      "n_neighbors": 12,
-      "similarity_sigma": null,
-      "temporal_edge_weight": 0.75,
-      "same_subject_edge_weight": 0.15,
-      "treatment_edge_weight": 0.2,
-      "graph_mode": "feature_temporal_treatment",
-      "n_modes": 8,
-      "rho": 1.0,
-      "use_normalized_laplacian": true,
-      "test_size": 0.25,
-      "target_regression": "next_day_score",
-      "target_classification": "flare_next_day"
-    },
+    "manifest": "model/manifest.json",
     "regression": {
       "grm_ridge": {
-        "mae": 0.13477090922811794,
+        "mae": 0.13477090922811796,
         "rmse": 0.17042133202693618,
         "r2": 0.20299564857052654
       },
@@ -90,12 +74,12 @@
       }
     },
     "latent_recovery": {
-      "mean_abs_aligned_correlation": 0.44137728750344146,
+      "mean_abs_aligned_correlation": 0.44137728750344124,
       "aligned_correlations": [
-        0.3223591391426382,
-        0.5400863144231863,
+        0.3223591391426377,
+        0.5400863144231866,
         0.4638041596357359,
-        0.4392595368122055
+        0.43925953681220475
       ],
       "note": "Synthetic-only metric: GRM embedding aligned to true latent states by orthogonal Procrustes."
     }

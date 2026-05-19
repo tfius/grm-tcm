@@ -39,6 +39,7 @@ Methodological caveats (recorded in dynamic_eval_certificates.json["caveats"]):
 
 import argparse
 import json
+import math
 import os
 import warnings
 from dataclasses import asdict, dataclass
@@ -1469,6 +1470,101 @@ def _verdict(magnitude: float, ci_low: float, ci_high: float, *, positive_is_pas
 # ---------------------------------------------------------------------------
 
 
+# Human-readable display labels for each verdict key. Determines render order
+# in the boxed summary; verdicts present in the certificate but not in this map
+# are appended at the end under their raw key.
+VERDICT_LABELS: Dict[str, str] = {
+    "grm_separates_aliased_states": "T1 GRM separates aliased states (entropy)",
+    "grm_attractor_auc_lift_aliased": "T2 attractor AUC lift on aliased",
+    "grm_next_regime_top1_lift_aliased": "T3 next-regime top-1 lift on aliased",
+    "grm_silhouette_lift_aliased": "T4 silhouette lift on aliased",
+    "grm_helps_hidden_subtype_recovery": "Fingerprint lift over strong baseline",
+    "grm_beats_markov_log_loss": "GRM beats Markov log-loss",
+    "grm_beats_strong_baseline_log_loss": "GRM beats strong baseline log-loss",
+    "grm_beats_markov_brier": "GRM beats Markov Brier",
+}
+
+
+def _verdict_text(passes: Optional[bool]) -> str:
+    if passes is True:
+        return "PASS"
+    if passes is False:
+        return "FAIL"
+    return "MARGINAL"
+
+
+def _format_delta(mag: Optional[float]) -> str:
+    if mag is None or not math.isfinite(float(mag)):
+        return ""
+    return f"{float(mag):+.3f}"
+
+
+def _format_ci(lo: Optional[float], hi: Optional[float]) -> str:
+    if lo is None or hi is None:
+        return ""
+    lo_f, hi_f = float(lo), float(hi)
+    if not (math.isfinite(lo_f) and math.isfinite(hi_f)):
+        return ""
+    return f"[{lo_f:+.3f}, {hi_f:+.3f}]"
+
+
+def render_verdicts_table(verdicts: Dict[str, Any], label_map: Dict[str, str] = VERDICT_LABELS) -> str:
+    """Render a boxed Unicode table from a certificate's verdicts dict.
+
+    Rows are ordered by label_map; certificate keys absent from label_map are
+    appended under their raw key. Returns an empty string when there are no
+    renderable verdict rows.
+    """
+
+    headers = ["Test", "Δ", "95% CI", "Verdict"]
+    rows: List[List[str]] = []
+    ordered_keys = [k for k in label_map if k in verdicts]
+    extra_keys = [k for k in verdicts if k not in label_map]
+    for key in ordered_keys + extra_keys:
+        v = verdicts[key]
+        if not isinstance(v, dict):
+            continue
+        rows.append([
+            label_map.get(key, key),
+            _format_delta(v.get("magnitude")),
+            _format_ci(v.get("ci_low"), v.get("ci_high")),
+            _verdict_text(v.get("passes")),
+        ])
+    if not rows:
+        return ""
+
+    widths = [
+        max(len(headers[c]), max(len(r[c]) for r in rows))
+        for c in range(len(headers))
+    ]
+
+    def hline(left: str, mid: str, right: str) -> str:
+        return left + mid.join("─" * (w + 2) for w in widths) + right
+
+    aligns = ["<", ">", "^", "<"]
+
+    def cell(text: str, width: int, align: str) -> str:
+        if align == ">":
+            return " " + text.rjust(width) + " "
+        if align == "^":
+            return " " + text.center(width) + " "
+        return " " + text.ljust(width) + " "
+
+    def data_row(cells: List[str], row_aligns: List[str]) -> str:
+        return "│" + "│".join(cell(c, w, a) for c, w, a in zip(cells, widths, row_aligns)) + "│"
+
+    out: List[str] = []
+    out.append(hline("┌", "┬", "┐"))
+    out.append(data_row(headers, ["^"] * len(headers)))
+    out.append(hline("├", "┼", "┤"))
+    for i, row in enumerate(rows):
+        out.append(data_row(row, aligns))
+        if i < len(rows) - 1:
+            out.append(hline("├", "┼", "┤"))
+    out.append(hline("└", "┴", "┘"))
+    return "\n".join(out)
+
+
 def print_summary(cert: Dict[str, Any], setup: EvalSetup) -> None:
     """Print headline verdicts at the end of the run."""
     print()
@@ -1477,25 +1573,13 @@ def print_summary(cert: Dict[str, Any], setup: EvalSetup) -> None:
     print("=" * 72)
     print(f"Outputs written to: {setup.cfg.output_dir.resolve()}")
     print()
-    verdicts = cert.get("verdicts", {})
-    for key, v in verdicts.items():
-        if not isinstance(v, dict):
-            continue
-        mag = v.get("magnitude")
-        ci_lo = v.get("ci_low")
-        ci_hi = v.get("ci_high")
-        passes = v.get("passes")
-        verdict_str = (
-            "PASS" if passes is True else "FAIL" if passes is False else "MARGINAL"
-        )
-        if ci_lo is not None and ci_hi is not None:
-            ci_str = f"({ci_lo:+.4f}, {ci_hi:+.4f})"
-        else:
-            ci_str = ""
-        print(f"  [{verdict_str:8s}] {key:48s} Δ={mag:+.4f} {ci_str}")
-        print(f"             {v.get('description', '')}")
-    print()
-    print("Scientific framing: " + cert.get("framing", ""))
+    table = render_verdicts_table(cert.get("verdicts", {}))
+    if table:
+        print(table)
+        print()
+    framing = cert.get("framing", "")
+    if framing:
+        print("Scientific framing: " + framing)
 
 
 # ---------------------------------------------------------------------------

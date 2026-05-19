@@ -25,7 +25,8 @@ Each stage reads only the outputs of the previous stages, so they are independen
 | `grm_tcm_dynamic_grm.py` | Rolling-window GRM diagnostics: G^(t), regime-change, self-resonance, transition reliability |
 | `grm_tcm_persistence.py` | Manifest + npz/joblib helpers shared by train and dynamic pipelines |
 | `grm_tcm_load.py` | `load_static_model` / `load_dynamic_model` — typed dataclass loaders |
-| `predict.py` | Out-of-sample inference via Nyström extension; no retraining |
+| `predict.py` | Out-of-sample inference via surrogate (default) or Nyström extension; no retraining |
+| `grm_tcm_dynamic_eval.py` | Falsifiable-verdicts eval: bootstrap CIs, JSON certificate, boxed-table console summary |
 | `tests/` | pytest suite (`uv run pytest`) |
 | `pyproject.toml` | Deps: numpy, pandas, scipy, scikit-learn, matplotlib, joblib, pyarrow (managed by uv) |
 
@@ -34,11 +35,12 @@ Each stage reads only the outputs of the previous stages, so they are independen
 Each output dir gets a `model/` subdirectory written next to the existing CSVs.
 
 `grm_tcm_results/model/`:
-- `manifest.json` — config, git sha, input hashes, package versions, schema `static-v1`
+- `manifest.json` — config, git sha, input hashes, package versions, schema `static-v2` (loader still accepts `static-v1`)
 - `obs_preprocessor.joblib` — median-impute + standardize over the 12 observations
 - `grm_basis.npz` — eigenvalues, eigenvectors, `rho`, `normalized` flag, `train_degrees`
 - `nn_index.joblib` + `knn_sigma.json` — KNN attach for Nyström extension
 - `ridge_next_day.joblib`, `logistic_flare.joblib` — prediction heads
+- `embedding_surrogate.joblib` — Ridge `X_obs → embeddings` for predict.py's default projection mode (added in `static-v2`)
 - `split_indices.json` — train/test indices used in evaluation
 - `procrustes_R.npy` — synthetic-only latent-recovery rotation
 - `visit_index.parquet` — `(visit_id, subject_id, day)` aligned with eigenvector rows
@@ -51,7 +53,15 @@ Each output dir gets a `model/` subdirectory written next to the existing CSVs.
 - `spectral_basis_per_window.npz` + `spectral_basis_sidecar.json` — Λ^(t), Ψ^(t), r_s, selected_modes per window.
 - `window_index.parquet` — per-window audit log.
 
-`predict.py` consumes both manifests, applies Nyström extension to new visits, and emits ridge/logistic predictions plus optional dynamic scores (state, self-resonance, top-1 next-state). Nyström uses feature-only edges, so it is an approximation of the multi-relational training graph.
+`predict.py` consumes both manifests and supports two projection modes:
+- `--projection surrogate` (default, `static-v2`+): persisted Ridge `X_obs → embeddings`. Deterministic, fast. Note: the synthetic-benchmark GRM embeddings carry graph-position information that is not a function of observations alone, so the surrogate does not faithfully reproduce the spectral coordinates — it is a useful proxy for the downstream ridge/logistic heads, nothing more.
+- `--projection nystrom`: feature-only KNN + RBF extension of the spectral basis. Approximate for the same reason (training graph has temporal + treatment + mutual-KNN edges that feature-only Nyström cannot reconstruct). Requires a graph_mode that includes KNN.
+
+Both modes feed the ridge/logistic heads identically. Manifest schema is bumped to `static-v2`; the loader still accepts `static-v1` artifacts (surrogate will be absent, surrogate projection raises).
+
+## Falsifiable-verdicts eval
+
+`grm_tcm_dynamic_eval.py` consumes the persisted static + dynamic models and writes a structured `dynamic_eval_certificates.json` (bootstrap CIs per claim) plus a boxed Unicode summary table at end-of-run. Verdict row labels live in `grm_tcm_dynamic_eval.VERDICT_LABELS` (raw verdict key → display name); that dict also determines render order. Adding a new verdict: emit it from `write_certificate` and add a display label to the map. The renderer (`render_verdicts_table`) falls back to the raw key if no label is registered, so a missing label is visible but non-blocking. Box drawing is hand-rolled; no extra deps.
 
 ## Key data schemas
 

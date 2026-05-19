@@ -1,0 +1,75 @@
+{
+  "verdicts": {
+    "F_temp_beats_F_raw_log_loss": {
+      "magnitude": 0.0011283936149282248,
+      "ci_low": -0.052996033853118796,
+      "ci_high": 0.05567097151891076,
+      "passes": null,
+      "description": "F_temp log-loss vs raw F (positive = recalibration reduced log-loss)."
+    },
+    "F_temp_beats_F_raw_ece": {
+      "magnitude": 0.009362417907964835,
+      "ci_low": -0.012091720216030546,
+      "ci_high": 0.027978606668666268,
+      "passes": null,
+      "description": "F_temp ECE vs raw F (positive = recalibration reduced ECE)."
+    },
+    "F_vector_beats_F_raw_log_loss": {
+      "magnitude": -0.005655733441591426,
+      "ci_low": -0.06005936944654522,
+      "ci_high": 0.049456200571758036,
+      "passes": null,
+      "description": "F_vector log-loss vs raw F (positive = recalibration reduced log-loss)."
+    },
+    "F_vector_beats_F_raw_ece": {
+      "magnitude": 0.006266133679973208,
+      "ci_low": -0.014276581076720066,
+      "ci_high": 0.026147447377349125,
+      "passes": null,
+      "description": "F_vector ECE vs raw F (positive = recalibration reduced ECE)."
+    },
+    "F_isotonic_beats_F_raw_log_loss": {
+      "magnitude": -0.06645481034100786,
+      "ci_low": -0.1417291606564577,
+      "ci_high": 0.007747208996651711,
+      "passes": null,
+      "description": "F_isotonic log-loss vs raw F (positive = recalibration reduced log-loss)."
+    },
+    "F_isotonic_beats_F_raw_ece": {
+      "magnitude": -0.00817682088280763,
+      "ci_low": -0.03286579206130172,
+      "ci_high": 0.014243739753081082,
+      "passes": null,
+      "description": "F_isotonic ECE vs raw F (positive = recalibration reduced ECE)."
+    },
+    "GRM_temp_beats_GRM_raw_log_loss": {
+      "magnitude": 0.006822346936770529,
+      "ci_low": -0.06430225356987185,
+      "ci_high": 0.0798495362708409,
+      "passes": null,
+      "description": "GRM_temp log-loss vs raw GRM (positive = recalibration reduced log-loss)."
+    },
+    "GRM_isotonic_beats_GRM_raw_log_loss": {
+      "magnitude": -0.012818872161770134,
+      "ci_low": -0.0910281233565633,
+      "ci_high": 0.06984799541028153,
+      "passes": null,
+      "description": "GRM_isotonic log-loss vs raw GRM (positive = recalibration reduced log-loss)."
+    },
+    "blend_still_beats_recalibrated_F": {
+      "magnitude": 0.004360093351559957,
+      "ci_low": -0.048743396207671985,
+      "ci_high": 0.056684468715782366,
+      "passes": null,
+      "description": "Best blend (blend_linear_F_temp_GRM_raw_beta_0.70) log-loss vs best recalibrated F (F_temp)."
+    }
+  },
+  "config": {
+    "autotune_dir": "grm_tcm_autotune",
+    "output_dir": "grm_tcm_autotune/calibration",
+    "seed": 42,
+    "cv_splits": 5,
+    "bootstrap_n": 200
+  },
+  "framing": "Tier 1.5 recalibration on a synthetic benchmark. Verdicts describe whether post-hoc remap of transition probabilities helps log-loss/ECE on this dataset. Not a clinical claim."
+}

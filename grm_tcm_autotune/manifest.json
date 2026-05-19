@@ -1,0 +1,18 @@
+{
+  "config": {
+    "data_dir": "synthetic_grm_tcm",
+    "static_model_dir": "grm_tcm_results/model",
+    "dynamic_model_dir": "grm_tcm_dynamic/model",
+    "output_dir": "grm_tcm_autotune",
+    "seed": 42,
+    "cv_splits": 5,
+    "bootstrap_n": 200,
+    "density_k": 10,
+    "top_k_plot": 3
+  },
+  "git_commit": {
+    "sha": "c2b8daa68687f9747511d038f6b51966d4f479cf",
+    "dirty": true
+  },
+  "tier": "eval-blending-only"
+}
