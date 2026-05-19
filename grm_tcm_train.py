@@ -20,7 +20,7 @@ Outputs:
 """
 
 import json
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -301,7 +301,7 @@ class GRMTCMTrainer:
         prob_naive_cls = np.clip(pred_naive_reg / max(float(np.nanmax(y_reg[train_idx])), 1e-9), 0, 1)
 
         metrics: Dict = {
-            "config": asdict(self.cfg),
+            "manifest": "model/manifest.json",
             "regression": {
                 "grm_ridge": self._reg_metrics(y_reg[test_idx], pred_grm_reg),
                 "raw_random_forest": self._reg_metrics(y_reg[test_idx], pred_raw_reg),

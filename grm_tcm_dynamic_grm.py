@@ -20,7 +20,7 @@ import argparse
 import json
 import os
 import sys
-from dataclasses import asdict, dataclass, field, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
@@ -56,6 +56,7 @@ from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 
 from grm_tcm_persistence import (
+    canonicalize_eigvec_signs,
     manifest_sha,
     save_int_keyed_npz,
     save_joblib,
@@ -229,24 +230,6 @@ def dynamic_state_features(visits: pd.DataFrame) -> Tuple[np.ndarray, Pipeline, 
     return X, pipe, used
 
 
-def make_state_features(visits: pd.DataFrame, embeddings: Optional[pd.DataFrame]) -> Tuple[np.ndarray, List[int], List[str]]:
-    """Build legacy feature matrix used for fixed state-space discretization."""
-
-    if embeddings is not None:
-        modes = mode_columns(embeddings)
-        if modes:
-            merged = visits[["visit_id", "subject_id", "day"]].merge(
-                embeddings[["subject_id", "day"] + modes], on=["subject_id", "day"], how="left"
-            )
-            complete = merged[modes].notna().all(axis=1)
-            if complete.mean() >= 0.5:
-                pipe = Pipeline([("imputer", SimpleImputer(strategy="median")), ("scaler", StandardScaler())])
-                return pipe.fit_transform(merged[modes].to_numpy(float)), merged.index.to_list(), modes
-
-    X, _pipe, cols = observation_state_features(visits)
-    return X, visits.index.to_list(), cols
-
-
 def hard_assignment_centroids(X: np.ndarray, labels: np.ndarray, n_states: int) -> np.ndarray:
     """Compute centroids from assigned rows with global-mean fallback for empty states."""
 
@@ -256,26 +239,6 @@ def hard_assignment_centroids(X: np.ndarray, labels: np.ndarray, n_states: int) 
         mask = labels == state
         centroids.append(X[mask].mean(axis=0) if mask.any() else global_mean)
     return np.vstack(centroids)
-
-
-def assign_states(visits: pd.DataFrame, embeddings: Optional[pd.DataFrame], cfg: DynamicGRMConfig) -> Tuple[pd.DataFrame, np.ndarray]:
-    """Assign each visit to a fixed discrete state."""
-
-    X, rows, feature_names = make_state_features(visits, embeddings)
-    n_states = min(cfg.n_states, max(2, len(visits) // 5))
-    print(f"[step] Discretizing visits into {n_states} states using {len(feature_names)} features")
-    fit_mask = np.ones(len(visits), dtype=bool)
-    if cfg.state_fit_end_day is not None:
-        fit_mask = visits["day"].to_numpy(int) <= cfg.state_fit_end_day
-        if fit_mask.sum() < n_states:
-            raise ValueError(f"state_fit_end_day leaves fewer rows than n_states: {fit_mask.sum()} < {n_states}")
-        print(f"[step] Fitting states on visits through day {cfg.state_fit_end_day}; assigning all visits")
-    kmeans = KMeans(n_clusters=n_states, random_state=cfg.random_seed, n_init=20).fit(X[fit_mask])
-    labels = kmeans.predict(X)
-    out = visits.copy()
-    out["state_id"] = labels
-    centroids = np.vstack([X[out["state_id"].to_numpy() == state].mean(axis=0) for state in range(n_states)])
-    return out, centroids
 
 
 def soft_state_weights(X: np.ndarray, centroids: np.ndarray, sigma: Optional[float] = None) -> Tuple[np.ndarray, float]:
@@ -494,7 +457,7 @@ def spectral_grm(W: np.ndarray, r_s: float, cfg: DynamicGRMConfig) -> Tuple[np.n
         selected = max(1, min(selected, cfg.max_modes, len(positive)))
     idx = slice(1, selected + 1)
     lambdas = eigenvalues[idx]
-    psi = eigenvectors[:, idx]
+    psi = canonicalize_eigvec_signs(eigenvectors[:, idx])
     weights = 1.0 / (1.0 + (r_s**2) * lambdas)
     G = (psi * weights.reshape(1, -1)) @ psi.T
     return G, lambdas, psi, selected, cumulative_energy
@@ -1074,7 +1037,7 @@ def run_dynamic(cfg: DynamicGRMConfig) -> Dict[str, Any]:
     )
 
     metrics = {
-        "config": asdict(cfg),
+        "manifest": "model/manifest.json",
         "n_windows": int(len(regime_df)),
         "n_states": int(len(centroids)),
         "state_source": cfg.state_source,
