@@ -167,7 +167,11 @@ DIFFICULTY_PRESETS: Dict[str, DifficultyProfile] = {
 
 @dataclass
 class GeneratorConfig:
-    """Generator configuration. CLI-overridable knobs."""
+    """Generator configuration. CLI-overridable knobs.
+
+    Preset-overrideable fields default to None and are filled from the chosen
+    difficulty preset in __post_init__ only when the user didn't pass a value.
+    """
 
     n_subjects: int = 80
     n_days: int = 60
@@ -176,20 +180,20 @@ class GeneratorConfig:
     output_dir: str = "synthetic_grm_tcm"
     difficulty: str = "medium"
 
-    latent_noise_std: float = 0.18
-    obs_noise_std: float = 0.45
-    missing_rate: float = 0.03
-    stress_event_rate: float = 0.10
-    recovery_event_rate: float = 0.07
-    treatment_event_rate: float = 0.12
-    hidden_subtype_strength: float = 0.45
-    delayed_treatment_effect: float = 0.25
-    label_noise_rate: float = 0.05
-    practitioner_bias: float = 0.20
-    obs_aliasing_strength: float = 0.55
-    sticky_strength: float = 0.10
-    subject_bias_strength: float = 1.00
-    missing_rate_severe_multiplier: float = 2.5
+    latent_noise_std: Optional[float] = None
+    obs_noise_std: Optional[float] = None
+    missing_rate: Optional[float] = None
+    stress_event_rate: Optional[float] = None
+    recovery_event_rate: Optional[float] = None
+    treatment_event_rate: Optional[float] = None
+    hidden_subtype_strength: Optional[float] = None
+    delayed_treatment_effect: Optional[float] = None
+    label_noise_rate: Optional[float] = None
+    practitioner_bias: Optional[float] = None
+    obs_aliasing_strength: Optional[float] = None
+    sticky_strength: Optional[float] = None
+    subject_bias_strength: Optional[float] = None
+    missing_rate_severe_multiplier: Optional[float] = None
 
     load_decay: float = 0.65
     flare_threshold_logit: float = 2.2
@@ -199,7 +203,8 @@ class GeneratorConfig:
         if self.difficulty not in DIFFICULTY_PRESETS:
             raise ValueError(f"Unknown difficulty: {self.difficulty}. Choose from {sorted(DIFFICULTY_PRESETS)}")
         for key, value in asdict(DIFFICULTY_PRESETS[self.difficulty]).items():
-            setattr(self, key, value)
+            if getattr(self, key) is None:
+                setattr(self, key, value)
 
 
 # ---------------------------------------------------------------------------
@@ -379,11 +384,15 @@ class SyntheticGRMTCMGenerator:
     def _generate_subjects(self) -> pd.DataFrame:
         """Generate per-subject metadata including transition-bias matrices."""
         rows: List[Dict] = []
+        # Map subtype -> proximate-attractor regime used for the baseline-z prior.
+        # 0 (digestive responder) -> stuck_depleted, 1 (stress) -> stuck_agitated,
+        # 2 (inflammatory) -> inflammatory (its proximate regime before stuck_depleted).
+        baseline_proto_by_subtype = {0: 4, 1: 5, 2: 2}
         for sid in range(self.cfg.n_subjects):
             subtype = int(self.rng.integers(0, 3))
             baseline = self.rng.normal(0.0, 0.30, self.cfg.latent_dim)
             # baseline z is a weak prior; the dominant subtype signal is in dynamics
-            subtype_offset = REGIME_PROTOTYPES[4 + (subtype % 2)][: self.cfg.latent_dim] * 0.15
+            subtype_offset = REGIME_PROTOTYPES[baseline_proto_by_subtype[subtype]][: self.cfg.latent_dim] * 0.15
             z0 = baseline + subtype_offset * self.cfg.hidden_subtype_strength
 
             bias_proto = _subtype_bias_prototype(subtype) * self.cfg.subject_bias_strength
@@ -428,7 +437,9 @@ class SyntheticGRMTCMGenerator:
                 subj.baseline_inflammatory_load,
                 subj.baseline_digestive_instability,
             ], dtype=float)
-            c = 0
+            # Sample initial regime so subject bias shapes day 0, not just day 1+.
+            init_logits = np.log(self.transition_matrix[0] + 1e-9) + bias[0]
+            c = int(self.rng.choice(N_REGIMES, p=_softmax(init_logits)))
             dwell = 0
             delayed_stress = 0.0
             delayed_treatment = 0.0
@@ -454,7 +465,12 @@ class SyntheticGRMTCMGenerator:
 
                 probs = _softmax(base_logits + bias_logits + event_logits)
                 c_next = int(self.rng.choice(N_REGIMES, p=probs))
-                dwell = dwell + 1 if c_next == c else 0
+                # Day 0 has no prior recorded day in c_next, so dwell starts at 0.
+                # After day 0, dwell counts consecutive days already spent in c_next.
+                if day == 0:
+                    dwell = 0
+                else:
+                    dwell = dwell + 1 if c_next == c else 0
 
                 proto = REGIME_PROTOTYPES[c_next]
                 alpha = REGIME_DRIFT_STRENGTH[c_next]
@@ -582,22 +598,25 @@ class SyntheticGRMTCMGenerator:
         crash_prob = 1.0 / (1.0 + np.exp(-(flare_logit - self.cfg.crash_threshold_logit)))
 
         last_day_mask = df["next_true_regime_id"].isna()
-        flare_draws = self.rng.random(len(df))
-        crash_draws = self.rng.random(len(df))
-        df["flare_next_day"] = pd.array(np.where(flare_draws < flare_prob, 1, 0), dtype="Int64")
-        df["crash_next_day"] = pd.array(np.where(crash_draws < crash_prob, 1, 0), dtype="Int64")
+        # Shared uniform draw: since crash_prob <= flare_prob always (thresholds 3.6 > 2.2),
+        # this guarantees crash=1 implies flare=1, preserving the severity hierarchy.
+        draws = self.rng.random(len(df))
+        df["flare_next_day"] = pd.array(np.where(draws < flare_prob, 1, 0), dtype="Int64")
+        df["crash_next_day"] = pd.array(np.where(draws < crash_prob, 1, 0), dtype="Int64")
         df.loc[last_day_mask, ["flare_next_day", "crash_next_day"]] = pd.NA
+        # next_day_score on the final visit per subject is computed from zero-filled
+        # next-day features (no real tomorrow exists) — mark it missing instead.
+        df.loc[last_day_mask, "next_day_score"] = np.nan
 
         df["next_day_fatigue"] = df.groupby("subject_id")["fatigue"].shift(-1)
         df["next_day_pain"] = df.groupby("subject_id")["pain"].shift(-1)
         score_p2 = df.groupby("subject_id")["global_dysregulation_score"].shift(-2)
-        df["worsening_2day"] = ((score_p2 - df["global_dysregulation_score"]) >= 0.18).astype("Int64")
-        df.loc[df["next_day_score"].isna(), "next_day_score"] = np.nan
-        df = df.drop(columns=[c for c in df.columns if c.startswith("next_") and c not in {
-            "next_day_score", "next_day_fatigue", "next_day_pain",
-            "next_true_regime_id", "next_dwell_time",
-            "next_latent_instability", "next_delayed_stress_load", "next_delayed_recovery_load",
-        }])
+        worsening_diff = score_p2 - df["global_dysregulation_score"]
+        worsening_int = np.where(worsening_diff >= 0.18, 1, 0)
+        df["worsening_2day"] = pd.array(
+            np.where(worsening_diff.isna(), pd.NA, worsening_int),
+            dtype="Int64",
+        )
         return df
 
     @staticmethod
@@ -729,8 +748,10 @@ class SyntheticGRMTCMGenerator:
             n = len(regimes)
             frac_dep = float(np.mean(regimes == 4)) if n else 0.0
             frac_ag = float(np.mean(regimes == 5)) if n else 0.0
-            longest = int(np.max(dwell[regimes == 4]) if np.any(regimes == 4) else 0)
-            longest_ag = int(np.max(dwell[regimes == 5]) if np.any(regimes == 5) else 0)
+            # dwell counter starts at 0 on the first day of a regime entry, so the
+            # actual run length is max(dwell) + 1. Returns 0 when the regime is never visited.
+            longest = int(np.max(dwell[regimes == 4]) + 1) if np.any(regimes == 4) else 0
+            longest_ag = int(np.max(dwell[regimes == 5]) + 1) if np.any(regimes == 5) else 0
             n_entries = int(np.sum((regimes[1:] != regimes[:-1]) & np.isin(regimes[1:], STUCK_REGIME_IDS))) if n > 1 else 0
             rows.append({
                 "subject_id": int(sid),
