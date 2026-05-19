@@ -59,6 +59,17 @@ Each output dir gets a `model/` subdirectory written next to the existing CSVs.
 
 Both modes feed the ridge/logistic heads identically. Manifest schema is bumped to `static-v2`; the loader still accepts `static-v1` artifacts (surrogate will be absent, surrogate projection raises).
 
+## Strict inductive evaluation
+
+`grm_tcm_train.py --inductive` runs the trainer in honest held-out mode. Pipeline:
+
+1. Subjects are split first via GroupShuffleSplit (seed-controlled, fraction = `--test-size`).
+2. The obs_preprocessor, NN index, visit graph, Laplacian eigenbasis, embedding surrogate, ridge head, logistic head, temperature, and Procrustes rotation are ALL fit on TRAIN subjects only — the test subjects are never seen by the graph or any head.
+3. Test-subject observations are projected via `--projection {surrogate, nystrom}` and scored with the persisted heads.
+4. Test-subject metrics (regression R², classification AUC, calibrated AUC, baselines, out-of-sample latent recovery) are written to `inductive_eval_metrics.json` next to the standard CSVs. The persisted model is the train-only fit; its manifest carries `extra.inductive: true` plus the held-out subject IDs for audit.
+
+Compare inductive numbers against transductive to see how much of the apparent signal is graph-leak. Projection math (Nyström + surrogate) lives in `grm_tcm_projection.py` so both `predict.py` and the inductive trainer use the same code path.
+
 ## Falsifiable-verdicts eval
 
 `grm_tcm_dynamic_eval.py` consumes the persisted static + dynamic models and writes a structured `dynamic_eval_certificates.json` (bootstrap CIs per claim) plus a boxed Unicode summary table at end-of-run. Verdict row labels live in `grm_tcm_dynamic_eval.VERDICT_LABELS` (raw verdict key → display name); that dict also determines render order. Adding a new verdict: emit it from `write_certificate` and add a display label to the map. The renderer (`render_verdicts_table`) falls back to the raw key if no label is registered, so a missing label is visible but non-blocking. Box drawing is hand-rolled; no extra deps.

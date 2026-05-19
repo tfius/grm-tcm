@@ -79,6 +79,20 @@ Two projection modes are supported:
 
 Neither mode faithfully reproduces the GRM spectral embedding for new visits — those coordinates depend on multi-relational graph position (temporal + treatment + KNN edges), not on observations alone. Both modes are useful proxies for the downstream ridge/logistic heads; nothing more should be read into the `grm_mode_*` values in `predictions.csv`.
 
+## Strict inductive evaluation
+
+The default `grm_tcm_train.py` invocation is *transductive*: the visit graph and eigenbasis see every visit, then outcome metrics are reported on a within-graph train/test split — so the eigenbasis has already seen the "test" rows. To get honest held-out metrics, run:
+
+```bash
+uv run python grm_tcm_train.py --inductive \
+    --projection surrogate \
+    --output-dir grm_tcm_results_inductive
+```
+
+This splits subjects first (seed-controlled), fits scaler/NN-index/graph/eigenbasis/surrogate/heads on train subjects only, then projects test-subject visits via `--projection {surrogate, nystrom}` and scores them with the persisted heads. Results go to `inductive_eval_metrics.json` next to the standard CSVs; the persisted model in `model/` is the train-only fit and its `manifest.json` carries `extra.inductive: true` plus the held-out subject IDs for audit.
+
+Compare against the transductive numbers in `grm_tcm_results/grm_metrics.json` to see how much of the apparent signal is graph-leak vs. real generalization.
+
 ## Tests
 
 ```bash
