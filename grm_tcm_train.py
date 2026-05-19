@@ -46,7 +46,7 @@ from grm_tcm_persistence import (
 )
 
 
-STATIC_SCHEMA_VERSION = "static-v1"
+STATIC_SCHEMA_VERSION = "static-v2"
 
 
 OBSERVATION_NAMES = [
@@ -95,16 +95,19 @@ class GRMTCMTrainer:
         self.train_degrees: Optional[np.ndarray] = None
         self.ridge_reg: Optional[BaseEstimator] = None
         self.logistic_clf: Optional[BaseEstimator] = None
+        self.embedding_surrogate: Optional[BaseEstimator] = None
         self.train_idx: Optional[np.ndarray] = None
         self.test_idx: Optional[np.ndarray] = None
         self.procrustes_R: Optional[np.ndarray] = None
         self._visit_index: Optional[pd.DataFrame] = None
+        self._X_obs: Optional[np.ndarray] = None
 
     def run(self) -> Dict:
         visits, latent, events = self._load_data()
         visits = self._prepare_visits(visits)
         self._visit_index = visits[["visit_id", "subject_id", "day"]].copy()
         X_obs, feature_names = self._make_observation_matrix(visits)
+        self._X_obs = X_obs
         W = self._build_visit_graph(visits, X_obs, events)
         eigenvalues, eigenvectors = self._spectral_decomposition(W)
         eigenvectors = canonicalize_eigvec_signs(eigenvectors)
@@ -114,6 +117,7 @@ class GRMTCMTrainer:
 
         embeddings_df = self._make_embeddings_df(visits, embeddings)
         metrics, predictions_df = self._evaluate(visits, embeddings, latent)
+        self._fit_embedding_surrogate(X_obs, embeddings)
         feature_modes_df = self._feature_mode_correlations(visits, embeddings, feature_names)
         self._write_outputs(embeddings_df, feature_modes_df, metrics, predictions_df)
         self._save_model()
@@ -410,6 +414,23 @@ class GRMTCMTrainer:
                 rows.append({"mode": f"grm_mode_{m + 1}", "feature": feat, "correlation": corr, "abs_correlation": abs(corr)})
         return pd.DataFrame(rows).sort_values(["mode", "abs_correlation"], ascending=[True, False])
 
+    def _fit_embedding_surrogate(self, X_obs: np.ndarray, embeddings: np.ndarray) -> None:
+        """Fit a Ridge regressor X_obs -> embeddings on the training split.
+
+        The surrogate is the default projection used by predict.py: at inference
+        we feed standardized observations through it and treat the output as the
+        GRM coordinates. This is faithful for downstream heads that consume the
+        embeddings as features, and avoids the structural inaccuracy of feature-only
+        Nyström extension on the multi-relational training graph. Fit on train_idx
+        only so the surrogate carries the same train/test discipline as the heads.
+        """
+
+        if self.train_idx is None or len(self.train_idx) == 0:
+            return
+        surrogate = Ridge(alpha=1.0)
+        surrogate.fit(X_obs[self.train_idx], embeddings[self.train_idx])
+        self.embedding_surrogate = surrogate
+
     def _write_outputs(self, embeddings_df: pd.DataFrame, feature_modes: pd.DataFrame, metrics: Dict, predictions: pd.DataFrame) -> None:
         embeddings_df.to_csv(self.output_dir / "grm_visit_embeddings.csv", index=False)
         feature_modes.to_csv(self.output_dir / "grm_feature_modes.csv", index=False)
@@ -449,6 +470,8 @@ class GRMTCMTrainer:
             save_joblib(self.ridge_reg, model_dir / "ridge_next_day.joblib")
         if self.logistic_clf is not None:
             save_joblib(self.logistic_clf, model_dir / "logistic_flare.joblib")
+        if self.embedding_surrogate is not None:
+            save_joblib(self.embedding_surrogate, model_dir / "embedding_surrogate.joblib")
 
         if self.train_idx is not None and self.test_idx is not None:
             with open(model_dir / "split_indices.json", "w", encoding="utf-8") as f:
