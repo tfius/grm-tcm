@@ -21,9 +21,9 @@
     "n": 1180,
     "mae": 0.13477090922811794,
     "rmse": 0.17042133202693618,
-    "bias": 2.351217263566557e-05,
-    "mean_error": 2.351217263566557e-05,
-    "median_abs_error": 0.10631638149040351,
+    "bias": 2.3512172635664066e-05,
+    "mean_error": 2.3512172635664066e-05,
+    "median_abs_error": 0.10631638149040355,
     "error_std": 0.17042133040500818
   },
   "flare_prediction": {
@@ -44,7 +44,7 @@
     "manifest": "model/manifest.json",
     "regression": {
       "grm_ridge": {
-        "mae": 0.13477090922811796,
+        "mae": 0.13477090922811794,
         "rmse": 0.17042133202693618,
         "r2": 0.20299564857052654
       },
@@ -62,24 +62,37 @@
     "classification": {
       "grm_logistic": {
         "accuracy": 0.5567796610169492,
-        "roc_auc": 0.5801470616527697
+        "roc_auc": 0.5801470616527697,
+        "log_loss": 0.6899653439787373,
+        "brier": 0.24840941046280068
+      },
+      "grm_logistic_calibrated": {
+        "accuracy": 0.5567796610169492,
+        "roc_auc": 0.5801470616527697,
+        "log_loss": 0.6865336432494322,
+        "brier": 0.24649259600728912
       },
       "raw_random_forest": {
         "accuracy": 0.7330508474576272,
-        "roc_auc": 0.5812475230000269
+        "roc_auc": 0.5812475230000269,
+        "log_loss": 0.5751928251098002,
+        "brier": 0.1936178147455133
       },
       "naive_current_score": {
         "accuracy": 0.30677966101694915,
-        "roc_auc": 0.5835600309360462
+        "roc_auc": 0.5835600309360462,
+        "log_loss": 0.6203896450278684,
+        "brier": 0.21511626180326782
       }
     },
+    "flare_temperature": 0.12237761264271914,
     "latent_recovery": {
-      "mean_abs_aligned_correlation": 0.44137728750344124,
+      "mean_abs_aligned_correlation": 0.4413772875034412,
       "aligned_correlations": [
-        0.3223591391426377,
+        0.32235913914263803,
         0.5400863144231866,
-        0.4638041596357359,
-        0.43925953681220475
+        0.46380415963573557,
+        0.43925953681220464
       ],
       "note": "Synthetic-only metric: GRM embedding aligned to true latent states by orthogonal Procrustes."
     }
