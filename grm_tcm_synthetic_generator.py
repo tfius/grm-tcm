@@ -109,6 +109,109 @@ ALIAS_OFFSETS: Dict[str, np.ndarray] = {
 }
 
 
+# ---------------------------------------------------------------------------
+# v2 holism layer: constitution + cross-modal coupling + qualitative obs
+#
+# Goal: provide a *cross-modal coherence* signal that no single observation
+# reveals. Constitution is a stable subject-level vector that biases every
+# modality coherently; recovering it requires aggregating across modalities,
+# which is the actual computational claim of "holistic" pattern recognition.
+# ---------------------------------------------------------------------------
+
+# Stable subject-level constitution axes. Distinct from `hidden_subtype` (which
+# is a discrete dynamics fingerprint); constitution is a *continuous* observation
+# pattern that biases every channel without affecting the regime transition matrix.
+CONSTITUTION_NAMES: List[str] = [
+    "constitution_thermal",    # cold <-> hot tendency
+    "constitution_energy",     # depleted <-> exuberant baseline
+    "constitution_stability",  # chaotic <-> stable regulation
+]
+N_CONSTITUTION = len(CONSTITUTION_NAMES)
+
+# Per-subtype mean bias on constitution. Subtype influences both dynamics
+# (transition matrix) and constitution mean; the two carry partially-overlapping
+# information, like in real populations.
+CONSTITUTION_SUBTYPE_BIAS: Dict[int, np.ndarray] = {
+    0: np.array([-0.30, -0.40, +0.10]),  # digestive responder: cooler, depleted
+    1: np.array([+0.40, +0.30, -0.40]),  # stress responder: warmer, exuberant, chaotic
+    2: np.array([+0.50, -0.20, -0.10]),  # inflammatory responder: hot, mildly depleted
+}
+
+# Constitution -> continuous-observation projection. Each constitution axis biases
+# multiple channels coherently, so the signal lives in cross-channel patterns.
+#                                  thermal  energy stability
+D_MATRIX = np.array([
+    [+0.05, +0.25, +0.05],   # sleep_quality
+    [+0.00, +0.30, +0.15],   # hrv
+    [+0.00, -0.20, -0.15],   # resting_hr
+    [+0.35, +0.05, +0.00],   # body_temp
+    [+0.05, -0.30, -0.05],   # fatigue
+    [+0.25, +0.00, -0.20],   # pain
+    [+0.00, +0.20, +0.05],   # appetite
+    [+0.00, +0.15, +0.15],   # bowel_quality
+    [-0.05, +0.30, +0.15],   # mood_calm
+    [+0.00, +0.35, +0.05],   # energy
+    [-0.10, -0.20, -0.05],   # heaviness
+    [+0.40, +0.05, +0.00],   # cold_hot
+])
+
+# Modality grouping for cross-modal coupling. Each modality's value at day t
+# depends on the previous day's other-modality means with realistic delays.
+MODALITY_GROUPS: Dict[str, List[str]] = {
+    "vital_signs":  ["hrv", "resting_hr", "body_temp"],
+    "sleep_energy": ["sleep_quality", "energy", "fatigue"],
+    "digestive":    ["appetite", "bowel_quality", "heaviness"],
+    "pain_mood":    ["pain", "mood_calm", "cold_hot"],
+}
+MODALITY_ORDER: List[str] = list(MODALITY_GROUPS.keys())
+
+# Cross-modal coupling: row = target modality (today), col = source modality
+# (yesterday). Diagonal is zero (within-modality dynamics live in z, not here).
+# Positive entry: yesterday's source severity raises today's target observation.
+MODALITY_COUPLING = np.array([
+    # source: vit_s   sleep   dig     pain     # target =
+    [        0.00,   0.20,   0.10,   0.10],    # vital_signs
+    [        0.25,   0.00,   0.10,   0.20],    # sleep_energy
+    [        0.05,   0.20,   0.00,   0.10],    # digestive
+    [        0.10,   0.25,   0.10,   0.00],    # pain_mood
+])
+
+# Qualitative (ordinal) observations. Driven by z + constitution + noise; threshold
+# into ordered categorical levels. Stored as int ordinal in visits.csv plus a
+# parallel `<name>_label` string for human reading.
+QUALITATIVE_OBS_NAMES: List[str] = ["pulse_quality_like", "tongue_state_like", "complexion_like"]
+QUALITATIVE_LABEL_MAP: Dict[str, List[str]] = {
+    "pulse_quality_like": ["weak", "normal", "strong"],
+    "tongue_state_like":  ["pale", "normal", "red", "dark"],
+    "complexion_like":    ["pale", "normal", "flushed"],
+}
+# (z_weights[4], k_weights[3]) per qualitative obs.
+QUAL_DRIVERS: Dict[str, Tuple[np.ndarray, np.ndarray]] = {
+    # pulse strength: low when depleted/stressed; high with energetic constitution.
+    "pulse_quality_like": (
+        np.array([-0.40, +0.20, +0.00, -0.10]),
+        np.array([+0.10, +0.50, +0.05]),
+    ),
+    # tongue: inflammatory load reddens; thermal constitution dominates.
+    "tongue_state_like": (
+        np.array([-0.20, +0.10, +0.55, +0.05]),
+        np.array([+0.45, +0.05, +0.00]),
+    ),
+    # complexion: stressed flushes, depleted pales; thermal modulates.
+    "complexion_like": (
+        np.array([-0.30, +0.25, +0.15, -0.05]),
+        np.array([+0.35, +0.15, +0.00]),
+    ),
+}
+# Cumulative-threshold offsets for the ordinal sampler. The first threshold sets
+# the location, subsequent are gaps; total levels = len(thresholds)+1.
+QUALITATIVE_THRESHOLDS: Dict[str, np.ndarray] = {
+    "pulse_quality_like": np.array([-0.50, +0.50]),               # 3 levels
+    "tongue_state_like":  np.array([-0.70, +0.00, +0.70]),        # 4 levels
+    "complexion_like":    np.array([-0.50, +0.50]),               # 3 levels
+}
+
+
 @dataclass
 class DifficultyProfile:
     """Difficulty-scaled simulator knobs."""
@@ -127,6 +230,11 @@ class DifficultyProfile:
     sticky_strength: float
     subject_bias_strength: float
     missing_rate_severe_multiplier: float
+    # v2 holism layer knobs.
+    constitution_strength: float       # scales D_MATRIX @ K contribution to obs
+    cross_modal_strength: float        # scales prev-day-modality coupling
+    seasonal_strength: float           # amplitude of subject-specific 45-day wave
+    qualitative_noise_std: float       # ordinal-sampling noise
 
 
 DIFFICULTY_PRESETS: Dict[str, DifficultyProfile] = {
@@ -137,6 +245,8 @@ DIFFICULTY_PRESETS: Dict[str, DifficultyProfile] = {
         label_noise_rate=0.00, practitioner_bias=0.05,
         obs_aliasing_strength=0.30, sticky_strength=0.05,
         subject_bias_strength=1.40, missing_rate_severe_multiplier=2.0,
+        constitution_strength=0.45, cross_modal_strength=0.25,
+        seasonal_strength=0.15, qualitative_noise_std=0.30,
     ),
     "medium": DifficultyProfile(
         latent_noise_std=0.18, obs_noise_std=0.45, missing_rate=0.03,
@@ -145,6 +255,8 @@ DIFFICULTY_PRESETS: Dict[str, DifficultyProfile] = {
         label_noise_rate=0.05, practitioner_bias=0.20,
         obs_aliasing_strength=0.55, sticky_strength=0.10,
         subject_bias_strength=1.00, missing_rate_severe_multiplier=2.5,
+        constitution_strength=0.35, cross_modal_strength=0.20,
+        seasonal_strength=0.12, qualitative_noise_std=0.45,
     ),
     "hard": DifficultyProfile(
         latent_noise_std=0.28, obs_noise_std=0.70, missing_rate=0.08,
@@ -153,6 +265,8 @@ DIFFICULTY_PRESETS: Dict[str, DifficultyProfile] = {
         label_noise_rate=0.12, practitioner_bias=0.45,
         obs_aliasing_strength=0.80, sticky_strength=0.15,
         subject_bias_strength=0.60, missing_rate_severe_multiplier=3.5,
+        constitution_strength=0.22, cross_modal_strength=0.15,
+        seasonal_strength=0.08, qualitative_noise_std=0.65,
     ),
     "chaotic": DifficultyProfile(
         latent_noise_std=0.40, obs_noise_std=0.95, missing_rate=0.15,
@@ -161,6 +275,8 @@ DIFFICULTY_PRESETS: Dict[str, DifficultyProfile] = {
         label_noise_rate=0.22, practitioner_bias=0.75,
         obs_aliasing_strength=1.10, sticky_strength=0.20,
         subject_bias_strength=0.30, missing_rate_severe_multiplier=5.0,
+        constitution_strength=0.12, cross_modal_strength=0.10,
+        seasonal_strength=0.05, qualitative_noise_std=0.90,
     ),
 }
 
@@ -194,6 +310,11 @@ class GeneratorConfig:
     sticky_strength: Optional[float] = None
     subject_bias_strength: Optional[float] = None
     missing_rate_severe_multiplier: Optional[float] = None
+    # v2 holism knobs (None => preset).
+    constitution_strength: Optional[float] = None
+    cross_modal_strength: Optional[float] = None
+    seasonal_strength: Optional[float] = None
+    qualitative_noise_std: Optional[float] = None
 
     load_decay: float = 0.65
     flare_threshold_logit: float = 2.2
@@ -361,6 +482,9 @@ class SyntheticGRMTCMGenerator:
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.transition_matrix = _build_base_transition(config.sticky_strength)
         self.subject_bias_matrices: Dict[int, np.ndarray] = {}
+        # v2: stable per-subject constitution (vector) and seasonal phase.
+        self.subject_constitution: Dict[int, np.ndarray] = {}
+        self.subject_seasonal_phase: Dict[int, float] = {}
 
     # ---- top-level orchestration --------------------------------------------
 
@@ -399,6 +523,14 @@ class SyntheticGRMTCMGenerator:
             jitter = self.rng.normal(0.0, 0.10 * self.cfg.subject_bias_strength, size=(N_REGIMES, N_REGIMES))
             self.subject_bias_matrices[sid] = bias_proto + jitter
 
+            # v2: constitution = stable continuous fingerprint, biased by subtype.
+            # Magnitude is independent of subtype_strength so it's a separate signal axis.
+            constitution = self.rng.normal(0.0, 1.0, N_CONSTITUTION)
+            constitution += CONSTITUTION_SUBTYPE_BIAS[subtype] * self.cfg.hidden_subtype_strength
+            self.subject_constitution[sid] = constitution
+            seasonal_phase = float(self.rng.uniform(0.0, 45.0))
+            self.subject_seasonal_phase[sid] = seasonal_phase
+
             rows.append({
                 "subject_id": sid,
                 "hidden_subtype": subtype,
@@ -413,6 +545,8 @@ class SyntheticGRMTCMGenerator:
                 "attractor_susceptibility": float(np.clip(self.rng.normal(0.5 + 0.2 * (subtype != 1), 0.20), 0.0, 1.0)),
                 "recovery_efficiency": float(np.clip(self.rng.normal(0.55, 0.18), 0.05, 0.95)),
                 "subject_transition_bias_id": sid,
+                **{name: float(constitution[i]) for i, name in enumerate(CONSTITUTION_NAMES)},
+                "seasonal_phase_days": seasonal_phase,
             })
         return pd.DataFrame(rows)
 
@@ -430,6 +564,11 @@ class SyntheticGRMTCMGenerator:
             bias = self.subject_bias_matrices[sid]
             susc = float(subj.attractor_susceptibility)
             recov_eff = float(subj.recovery_efficiency)
+            constitution = self.subject_constitution[sid]
+            seasonal_phase = self.subject_seasonal_phase[sid]
+            # Stability constitution dampens the seasonal wave amplitude. Subjects
+            # with high constitution_stability ride a flatter 45-day curve.
+            stability_damping = float(max(0.3, 1.0 - 0.5 * constitution[2]))
 
             z = np.array([
                 subj.baseline_vitality_depletion,
@@ -445,6 +584,9 @@ class SyntheticGRMTCMGenerator:
             delayed_treatment = 0.0
             delayed_recovery = 0.0
             recent_zs: List[np.ndarray] = [z.copy()]
+            # Yesterday's z-space observation vector for cross-modal coupling.
+            # Initialized to zeros so day 0 has no coupling contribution.
+            prev_raw_obs = np.zeros(len(OBSERVATION_NAMES))
 
             for day in range(self.cfg.n_days):
                 events_today = self._sample_events(z)
@@ -488,12 +630,22 @@ class SyntheticGRMTCMGenerator:
 
                 weekly_rhythm = 0.04 * np.sin(2 * np.pi * day / 7.0)
                 z_next[1] += weekly_rhythm
+                # Slow 45-day "seasonal" wave on inflammatory load, attenuated by
+                # the subject's stability constitution. This is a longer timescale
+                # than regime dwell, so its detection requires cross-day aggregation.
+                z_next[2] += (
+                    self.cfg.seasonal_strength
+                    * stability_damping
+                    * float(np.sin(2 * np.pi * (day + seasonal_phase) / 45.0))
+                )
 
                 instability = float(np.linalg.norm(z_next - z))
                 if len(recent_zs) >= 2:
                     instability += 0.5 * float(np.linalg.norm(z - recent_zs[-2]))
 
-                obs = self._sample_observations(z_next, c_next)
+                obs, raw_obs = self._sample_observations(z_next, c_next, constitution, prev_raw_obs)
+                qual = self._sample_qualitative(z_next, constitution)
+                prev_raw_obs = raw_obs
 
                 # Decay then add today's impulses for next-day forecasting.
                 delayed_stress = self.cfg.load_decay * delayed_stress + stress_today
@@ -513,6 +665,7 @@ class SyntheticGRMTCMGenerator:
                     "delayed_recovery_load": float(delayed_recovery),
                     "subject_transition_bias_id": sid,
                     **obs,
+                    **qual,
                 })
                 latent_rows.append({
                     "subject_id": sid, "day": day,
@@ -542,13 +695,47 @@ class SyntheticGRMTCMGenerator:
             events.append("treatment_event")
         return events
 
-    def _sample_observations(self, z: np.ndarray, regime_id: int) -> Dict[str, float]:
-        """Project z to observations with regime-aliased offsets and noise."""
+    def _sample_observations(
+        self,
+        z: np.ndarray,
+        regime_id: int,
+        constitution: np.ndarray,
+        prev_raw_obs: np.ndarray,
+    ) -> Tuple[Dict[str, float], np.ndarray]:
+        """Project z to observations with regime-aliased offsets, constitution bias,
+        delayed cross-modal coupling, and noise.
+
+        Returns (clinical_obs_dict, z_space_raw_vector). The raw vector is passed
+        back next iteration to drive cross-modal coupling.
+        """
+
         alias_key = ALIAS_GROUPS[regime_id]
         alias_vec = ALIAS_OFFSETS[alias_key]
+
+        # Constitution contribution: stable per-subject bias on every channel.
+        # Living in cross-channel coherence rather than any single channel is the
+        # whole point — D_MATRIX has small individual entries but coherent signs
+        # across the channels of each modality.
+        constitution_offset = self.cfg.constitution_strength * (D_MATRIX @ constitution)
+
+        # Cross-modal coupling: today's per-channel offset = sum over source
+        # modalities of (coupling weight * yesterday's source modality mean).
+        coupling_offset = np.zeros(len(OBSERVATION_NAMES))
+        if np.any(prev_raw_obs):
+            mod_means_prev = np.array([
+                float(np.mean([prev_raw_obs[OBSERVATION_NAMES.index(ch)] for ch in channels]))
+                for channels in MODALITY_GROUPS.values()
+            ])
+            for m_idx, channels in enumerate(MODALITY_GROUPS.values()):
+                target_offset = self.cfg.cross_modal_strength * float(MODALITY_COUPLING[m_idx] @ mod_means_prev)
+                for ch in channels:
+                    coupling_offset[OBSERVATION_NAMES.index(ch)] = target_offset
+
         raw = (
             C_MATRIX @ z
             + self.cfg.obs_aliasing_strength * alias_vec
+            + constitution_offset
+            + coupling_offset
             + self.rng.normal(0.0, self.cfg.obs_noise_std, len(OBSERVATION_NAMES))
         )
         out: Dict[str, float] = {}
@@ -556,6 +743,27 @@ class SyntheticGRMTCMGenerator:
             val = OBS_BASELINE[name] + OBS_SCALE[name] * raw[i]
             lo, hi = OBS_RANGES[name]
             out[name] = float(np.clip(val, lo, hi))
+        return out, raw
+
+    def _sample_qualitative(self, z: np.ndarray, constitution: np.ndarray) -> Dict[str, object]:
+        """Sample ordinal categorical observations (pulse/tongue/complexion-like).
+
+        Each is driven by a linear combo of z and constitution, thresholded to
+        an ordinal level. Stored as int level plus parallel `<name>_label` string.
+        """
+
+        out: Dict[str, object] = {}
+        for qual_name in QUALITATIVE_OBS_NAMES:
+            wz, wk = QUAL_DRIVERS[qual_name]
+            score = float(
+                wz @ z
+                + wk @ constitution
+                + self.rng.normal(0.0, self.cfg.qualitative_noise_std)
+            )
+            thresholds = QUALITATIVE_THRESHOLDS[qual_name]
+            level = int(np.sum(score > thresholds))
+            out[qual_name] = level
+            out[f"{qual_name}_label"] = QUALITATIVE_LABEL_MAP[qual_name][level]
         return out
 
     # ---- outcomes -----------------------------------------------------------
@@ -825,13 +1033,24 @@ class SyntheticGRMTCMGenerator:
             "config": asdict(self.cfg),
             "latent_names": LATENT_NAMES,
             "observation_names": OBSERVATION_NAMES,
+            "qualitative_observation_names": QUALITATIVE_OBS_NAMES,
+            "qualitative_label_map": QUALITATIVE_LABEL_MAP,
+            "constitution_names": CONSTITUTION_NAMES,
+            "modality_groups": MODALITY_GROUPS,
             "event_types": EVENT_TYPES,
             "regime_names": REGIME_NAMES,
             "stuck_regime_ids": STUCK_REGIME_IDS,
             "alias_groups": ALIAS_GROUPS,
             "ground_truth_files": {
-                "subjects.csv": "Subject-level metadata: hidden_subtype, sensitivities, attractor_susceptibility, recovery_efficiency.",
-                "visits.csv": "Per-(subject, day) observations, true_regime_id, dwell_time, latent_instability, delayed_*_load, outcomes.",
+                "subjects.csv": (
+                    "Subject-level metadata: hidden_subtype, sensitivities, attractor_susceptibility, "
+                    "recovery_efficiency, constitution_thermal/energy/stability, seasonal_phase_days."
+                ),
+                "visits.csv": (
+                    "Per-(subject, day) continuous observations + qualitative ordinal observations "
+                    "(pulse_quality_like, tongue_state_like, complexion_like with parallel _label strings), "
+                    "true_regime_id, dwell_time, latent_instability, delayed_*_load, outcomes."
+                ),
                 "latent_states.csv": "Continuous latent z_t per (subject, day).",
                 "events.csv": "Stress/recovery/treatment event log per (subject, day).",
                 "true_regimes.csv": "Regime registry: id, name, prototype z, drift strength, alias group, self-loop probability.",
@@ -850,10 +1069,29 @@ class SyntheticGRMTCMGenerator:
                 ),
                 "labels": "TCM-like labels are thresholded functions of NOISY observations with practitioner bias and label noise (not direct from regimes).",
                 "ontology_mismatch": "Aliased regimes (e.g. stuck_agitated vs stressed_recoverable) can yield the same label; same regime can yield different labels via noise.",
+                "constitution_layer": (
+                    "Stable per-subject vector K in R^3 (thermal/energy/stability) sampled at subject creation, biased by hidden_subtype. "
+                    "K biases EVERY continuous observation through D_MATRIX @ K with small per-channel effects but COHERENT signs within "
+                    "a modality. Single-channel detection ratio < 1; cross-channel aggregation ratio > 2. This is the holism test: "
+                    "recover K from cross-modal coherence even though no single observation reveals it."
+                ),
+                "cross_modal_coupling": (
+                    "Each modality (vital_signs / sleep_energy / digestive / pain_mood) is influenced by yesterday's other-modality means via "
+                    "MODALITY_COUPLING (4x4, zero diagonal). Adds genuine cross-modal temporal coherence beyond shared z."
+                ),
+                "qualitative_observations": (
+                    "Three ordinal channels (pulse_quality_like 3 levels, tongue_state_like 4 levels, complexion_like 3 levels) sampled from "
+                    "linear combos of z + K + ordinal noise. Each is thresholded into integer levels with a parallel _label string column."
+                ),
+                "seasonal_rhythm": (
+                    "45-day sinusoidal modulation on inflammatory load (z[2]), per-subject phase, amplitude dampened by constitution_stability."
+                ),
             },
             "framing": (
-                "Synthetic benchmark for latent-state recovery and ontology mismatch detection. "
-                "Not a biological simulator. Not evidence for TCM or Qi."
+                "Synthetic benchmark for latent-state recovery, ontology mismatch detection, and cross-modal holism. "
+                "Not a biological simulator. Not evidence for TCM or Qi. "
+                "The constitution layer is the holism test: a stable subject pattern invisible to any single observation, "
+                "recoverable only by aggregating cross-modal coherence."
             ),
             "recommended_tasks": [
                 "Recover discrete regime c_t from observations only.",
@@ -861,6 +1099,8 @@ class SyntheticGRMTCMGenerator:
                 "Predict next_day_score / flare_next_day with subject-level dynamics, not just today's severity.",
                 "Compare TCM-like labels against true_regime to surface ontology mismatch.",
                 "Recover hidden_subtype from subject-level transition fingerprints.",
+                "Recover constitution_thermal/energy/stability from cross-modal coherence (holism task).",
+                "Predict qualitative observations (pulse/tongue/complexion-like) from continuous channels and z.",
             ],
         }
         with open(self.output_dir / "metadata.json", "w", encoding="utf-8") as f:

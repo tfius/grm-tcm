@@ -13,13 +13,16 @@ Pipeline:
   1. Load static GRM model (preprocessor, eigenbasis, regressors, optional surrogate).
   2. Apply obs_preprocessor to the new visits' observation columns.
   3. Project to GRM coordinates via one of two modes:
-     - surrogate (default): persisted Ridge X_obs -> embeddings. Faithful and fast.
-       Recovers training embeddings to high accuracy by construction.
+     - surrogate (default): persisted Ridge X_obs -> embeddings. Deterministic and fast,
+       but NOT a faithful reconstruction of the GRM coordinates. GRM coordinates depend
+       on multi-relational graph position (KNN + mutual augmentation + temporal +
+       treatment edges), which no model on X_obs alone can recover. Treat surrogate
+       outputs as a downstream proxy for the ridge/logistic heads, not as "the GRM
+       coordinates of this visit." See the surrogate_grm_coordinates docstring below.
      - nystrom: feature-only KNN + RBF extension of the spectral basis. Approximate
-       because the training graph has multi-relational edges (temporal, treatment,
-       mutual-KNN augmentation) that feature-only Nyström cannot reconstruct.
-       Available when the static model was trained with a graph_mode that includes
-       KNN (feature_only / feature_temporal / feature_temporal_treatment).
+       for the same reason (the training graph carries non-feature edges Nyström
+       cannot reconstruct). Available when the static model was trained with a
+       graph_mode that includes KNN (feature_only / feature_temporal / feature_temporal_treatment).
   4. Apply ridge/logistic heads for next_day_score / flare probability.
   5. (Optional) Apply state preprocessor + KMeans from the dynamic model, look up the
      most-recent G^(t) <= visit day, emit self-resonance / soft-self-resonance and
@@ -62,8 +65,10 @@ def parse_args() -> argparse.Namespace:
         choices=["surrogate", "nystrom"],
         default="surrogate",
         help="How to project new visits into GRM coordinates. 'surrogate' uses the persisted Ridge head "
-        "X_obs -> embeddings (default, recovers training visits exactly by construction). 'nystrom' uses "
-        "feature-only KNN + RBF extension of the spectral basis (approximate; requires graph_mode with KNN).",
+        "X_obs -> embeddings (default, deterministic; a downstream proxy for the ridge/logistic heads, "
+        "NOT a faithful reconstruction of the GRM coordinates -- see surrogate_grm_coordinates docstring). "
+        "'nystrom' uses feature-only KNN + RBF extension of the spectral basis (also approximate; requires "
+        "graph_mode with KNN).",
     )
     parser.add_argument("--n-neighbors", type=int, default=12, help="Neighbors used in Nyström extension.")
     return parser.parse_args()
@@ -244,13 +249,17 @@ def main() -> None:
 
     print(f"[load] new visits from {args.visits}")
     visits = pd.read_csv(args.visits)
-    missing_obs = [c for c in OBSERVATION_NAMES if c not in visits.columns]
+    # Feature list is recovered from the model's manifest (extra.feature_names) so
+    # the input CSV must carry whatever columns the trainer was fit on. Falls back
+    # to the 12 continuous OBSERVATION_NAMES for legacy models without the entry.
+    feature_names = static.feature_names or list(OBSERVATION_NAMES)
+    missing_obs = [c for c in feature_names if c not in visits.columns]
     if missing_obs:
-        raise ValueError(f"Input visits missing observation columns: {missing_obs}")
+        raise ValueError(f"Input visits missing feature columns: {missing_obs}")
     if "subject_id" not in visits.columns or "day" not in visits.columns:
         raise ValueError("Input visits must contain subject_id and day columns.")
 
-    X_obs = static.obs_preprocessor.transform(visits[OBSERVATION_NAMES].to_numpy(float))
+    X_obs = static.obs_preprocessor.transform(visits[feature_names].to_numpy(float))
 
     if args.projection == "surrogate":
         print(f"[step] Projecting {len(visits)} new visits via the Ridge embedding surrogate")

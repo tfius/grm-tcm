@@ -52,6 +52,7 @@ class StaticGRMModel:
     procrustes_R: Optional[np.ndarray] = None
     visit_index: Optional[pd.DataFrame] = None
     split_indices: Optional[Dict[str, Any]] = None
+    feature_names: Optional[List[str]] = None
 
 
 @dataclass
@@ -108,6 +109,10 @@ def load_static_model(model_dir: Path) -> StaticGRMModel:
     visit_index = pd.read_parquet(model_dir / "visit_index.parquet") if (model_dir / "visit_index.parquet").exists() else None
     split = json.load(open(model_dir / "split_indices.json")) if (model_dir / "split_indices.json").exists() else None
 
+    feature_names = (manifest.get("extra") or {}).get("feature_names")
+    if feature_names is not None:
+        feature_names = list(feature_names)
+
     return StaticGRMModel(
         manifest=manifest,
         config=manifest["config"],
@@ -128,6 +133,7 @@ def load_static_model(model_dir: Path) -> StaticGRMModel:
         procrustes_R=procrustes_R,
         visit_index=visit_index,
         split_indices=split,
+        feature_names=feature_names,
     )
 
 

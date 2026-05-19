@@ -115,3 +115,25 @@ def test_out_of_sample_latent_recovery_present(inductive_surrogate_dir: Path):
     assert "in_sample_train" in rec
     assert "out_of_sample_test" in rec
     assert np.isfinite(rec["out_of_sample_test"]["mean_abs_aligned_correlation"])
+
+
+def test_constitution_recovery_reports_subject_graph(inductive_surrogate_dir: Path):
+    m = json.load(open(inductive_surrogate_dir / "inductive_eval_metrics.json"))
+    const = m.get("constitution_recovery", {})
+    if not const:
+        pytest.skip("synthetic subjects.csv does not include constitution targets")
+    assert "subject_graph_grm_ridge" in const
+    assert "subject_graph_grm_ridge" in const["mean_r2"]
+    assert np.isfinite(const["mean_r2"]["subject_graph_grm_ridge"])
+
+
+def test_pang_style_controls_reported(inductive_surrogate_dir: Path):
+    m = json.load(open(inductive_surrogate_dir / "inductive_eval_metrics.json"))
+    assert "smooth_rbf_kernel_ridge" in m["regression"]
+    assert "smooth_rbf_kernel_ridge" in m["classification"]
+    assert np.isfinite(m["regression"]["smooth_rbf_kernel_ridge"]["r2"])
+    assert "parsimony" in m
+    assert "grm_structural_hyperparameters" in m["parsimony"]
+    concentration = m.get("spectral_signal_concentration", {})
+    assert "next_day_score" in concentration
+    assert "modes_for_75pct_signal" in concentration["next_day_score"]

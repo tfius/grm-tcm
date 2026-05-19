@@ -33,6 +33,7 @@ from scipy.sparse.linalg import eigsh
 from sklearn.base import BaseEstimator
 from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
 from sklearn.impute import SimpleImputer
+from sklearn.kernel_ridge import KernelRidge
 from sklearn.linear_model import LogisticRegression, Ridge
 from sklearn.metrics import accuracy_score, mean_absolute_error, mean_squared_error, r2_score, roc_auc_score
 from sklearn.model_selection import GroupShuffleSplit, KFold
@@ -88,6 +89,19 @@ OBSERVATION_NAMES = [
     "appetite", "bowel_quality", "mood_calm", "energy", "heaviness", "cold_hot",
 ]
 
+# Ordinal observations from the v2 generator (pulse / tongue / complexion-like).
+# Stored in visits.csv as integer levels; included as ordinal-as-continuous inputs
+# alongside the 12 continuous channels when present and config flag is on.
+QUALITATIVE_FEATURE_NAMES = [
+    "pulse_quality_like", "tongue_state_like", "complexion_like",
+]
+
+# Stable per-subject constitution axes (v2 generator). Used as targets for the
+# constitution-recovery evaluation, not as input features (they live in subjects.csv).
+CONSTITUTION_NAMES = [
+    "constitution_thermal", "constitution_energy", "constitution_stability",
+]
+
 LATENT_NAMES = [
     "vitality_depletion", "stress_activation", "inflammatory_load", "digestive_instability",
 ]
@@ -104,6 +118,8 @@ class GRMTrainConfig:
     temporal_edge_weight: float = 0.75
     same_subject_edge_weight: float = 0.15
     treatment_edge_weight: float = 0.20
+    subject_similarity_edge_weight: float = 0.25
+    subject_similarity_neighbors: int = 4
     graph_mode: str = "feature_temporal_treatment"
 
     n_modes: int = 8
@@ -113,6 +129,25 @@ class GRMTrainConfig:
     test_size: float = 0.25
     target_regression: str = "next_day_score"
     target_classification: str = "flare_next_day"
+    # Secondary classification target: flare ONSET (today=0 -> tomorrow=1).
+    # Persistence baseline collapses here (it predicts 0 for all flare_today=0 rows),
+    # so GRM/embedding-based heads should beat it cleanly when there is real signal.
+    target_classification_onset: str = "flare_onset"
+    # If True, the GRM heads also see the per-subject lag of the targets
+    # (score_persistence_today, flare_persistence_today) as additional features.
+    # This makes the headline "grm" head a fair deployment-style competitor
+    # against the pure-persistence baseline rather than a strawman.
+    use_lag_features: bool = True
+    # If True, include v2 qualitative ordinal channels (pulse/tongue/complexion-like)
+    # in the observation matrix when present. The wider feature set is also used
+    # by the raw-RF baseline so the comparison stays apples-to-apples.
+    include_qualitative_features: bool = True
+    # If True, run constitution-recovery evaluation in inductive AND transductive
+    # modes. Reports visit-GRM aggregates, raw subject aggregates, and a dedicated
+    # subject-level GRM diagnostic so stable constitution is not forced through a
+    # visit-only spectral geometry. Skipped silently if subjects.csv lacks
+    # constitution columns.
+    evaluate_constitution_recovery: bool = True
 
     # Strict inductive evaluation: split subjects first, fit scaler/KNN/graph/
     # eigenbasis ONLY on train subjects, then project test subjects via the
@@ -135,6 +170,7 @@ class GRMTCMTrainer:
         self.eigenvalues: Optional[np.ndarray] = None
         self.eigenvectors: Optional[np.ndarray] = None
         self.train_degrees: Optional[np.ndarray] = None
+        self.feature_names: Optional[List[str]] = None
         self.ridge_reg: Optional[BaseEstimator] = None
         self.logistic_clf: Optional[BaseEstimator] = None
         self.embedding_surrogate: Optional[BaseEstimator] = None
@@ -149,8 +185,190 @@ class GRMTCMTrainer:
         visits, latent, events = self._load_data()
         visits = self._prepare_visits(visits)
         if self.cfg.inductive:
-            return self._run_inductive(visits, latent, events)
-        return self._run_transductive(visits, latent, events)
+            metrics = self._run_inductive(visits, latent, events)
+        else:
+            metrics = self._run_transductive(visits, latent, events)
+        self._print_evaluation_summary(metrics)
+        return metrics
+
+    @staticmethod
+    def _print_evaluation_summary(metrics: Dict[str, Any]) -> None:
+        """Print a tier-labeled comparison table: GRM vs baselines, with Δ vs best baseline.
+
+        Goal: make it impossible to confuse transductive ("diagnostic") and inductive
+        ("deployable") numbers, and surface the apparent gains over the strongest baseline.
+        """
+
+        tier = metrics.get("evaluation_tier", "unspecified_tier")
+        tier_label = {
+            "transductive_diagnostic":
+                "TRANSDUCTIVE DIAGNOSTIC  (graph saw all visits during decomposition)",
+            "inductive_deployable_prediction":
+                "INDUCTIVE DEPLOYABLE  (test subjects disjoint from training)",
+        }.get(tier, f"TIER: {tier}")
+
+        reg = metrics.get("regression", {})
+        cls = metrics.get("classification", {})
+        onset = metrics.get("flare_onset_classification", {})
+
+        reg_order = [
+            "grm_ridge", "grm_plus_lag_ridge", "smooth_rbf_kernel_ridge", "raw_random_forest",
+            "naive_current_score", "persistence_yesterday_score",
+        ]
+        cls_order = [
+            "grm_logistic", "grm_logistic_calibrated", "grm_plus_lag_logistic",
+            "smooth_rbf_kernel_ridge", "raw_random_forest", "naive_current_score", "persistence_yesterday_flare",
+        ]
+        onset_order = [
+            "grm_logistic", "grm_plus_lag_logistic", "lag_only_logistic",
+            "raw_random_forest", "naive_marginal",
+        ]
+        reg_metrics = ["r2", "rmse", "mae"]
+        cls_metrics = ["roc_auc", "brier", "log_loss"]
+
+        def _fmt(v: Any) -> str:
+            if v is None or (isinstance(v, float) and (np.isnan(v) or not np.isfinite(v))):
+                return "    -"
+            try:
+                return f"{float(v):7.4f}"
+            except (TypeError, ValueError):
+                return "    -"
+
+        def _row(name: str, d: Dict[str, Any], cols: List[str]) -> str:
+            cells = [_fmt(d.get(c)) for c in cols]
+            return f"  {name:<32} " + "  ".join(cells)
+
+        def _delta_row(grm_d: Dict[str, Any], best_d: Dict[str, Any], cols: List[str], invert: List[bool]) -> str:
+            cells = []
+            for c, inv in zip(cols, invert):
+                try:
+                    g = float(grm_d.get(c)); b = float(best_d.get(c))
+                    d = (b - g) if inv else (g - b)
+                    cells.append(f"{d:+7.4f}")
+                except (TypeError, ValueError):
+                    cells.append("    -")
+            return f"  {'Δ GRM vs best baseline':<32} " + "  ".join(cells)
+
+        def _best_baseline(table: Dict[str, Any], baseline_keys: List[str], score_key: str, higher_is_better: bool) -> Dict[str, Any]:
+            cands = [(k, table[k]) for k in baseline_keys if k in table and table[k]]
+            if not cands:
+                return {}
+            scored = [(k, d, d.get(score_key)) for k, d in cands if d.get(score_key) is not None]
+            if not scored:
+                return {}
+            best = max(scored, key=lambda t: (t[2] if higher_is_better else -t[2]))
+            return best[1]
+
+        bar = "=" * 86
+        print()
+        print(bar)
+        print(f"  EVALUATION SUMMARY — {tier_label}")
+        print(bar)
+
+        if reg:
+            print(f"\n  REGRESSION (target=next_day_score)")
+            print(f"  {'predictor':<32} {'R^2':>7}  {'RMSE':>7}  {'MAE':>7}")
+            print(f"  {'-' * 32} {'-' * 7}  {'-' * 7}  {'-' * 7}")
+            for k in reg_order:
+                if k in reg and reg[k]:
+                    print(_row(k, reg[k], reg_metrics))
+            best_reg = _best_baseline(
+                reg, ["smooth_rbf_kernel_ridge", "raw_random_forest", "naive_current_score", "persistence_yesterday_score"],
+                "r2", higher_is_better=True,
+            )
+            headline_reg = reg.get("grm_plus_lag_ridge") or reg.get("grm_ridge")
+            if headline_reg and best_reg:
+                print(_delta_row(headline_reg, best_reg, reg_metrics, invert=[False, True, True]))
+
+        if cls:
+            print(f"\n  CLASSIFICATION (target=flare_next_day)")
+            print(f"  {'predictor':<32} {'AUC':>7}  {'Brier':>7}  {'LogLs':>7}")
+            print(f"  {'-' * 32} {'-' * 7}  {'-' * 7}  {'-' * 7}")
+            for k in cls_order:
+                if k in cls and cls[k]:
+                    print(_row(k, cls[k], cls_metrics))
+            best_cls = _best_baseline(
+                cls, ["smooth_rbf_kernel_ridge", "raw_random_forest", "naive_current_score", "persistence_yesterday_flare"],
+                "roc_auc", higher_is_better=True,
+            )
+            grm_for_delta = cls.get("grm_plus_lag_logistic") or cls.get("grm_logistic_calibrated") or cls.get("grm_logistic")
+            if grm_for_delta and best_cls:
+                print(_delta_row(grm_for_delta, best_cls, cls_metrics, invert=[False, True, True]))
+
+        if onset:
+            n_pos = onset.get("n_test_positive", "?")
+            n_elig = onset.get("n_test_eligible", "?")
+            marginal = onset.get("train_marginal")
+            marginal_str = f"{float(marginal):.3f}" if marginal is not None else "?"
+            print(f"\n  CLASSIFICATION (target=flare_onset; today=0 -> tomorrow=1)")
+            print(f"  full eligible test rows: {n_elig}, positives: {n_pos}, train marginal: {marginal_str}")
+            print(f"  {'predictor':<32} {'AUC':>7}  {'Brier':>7}  {'LogLs':>7}")
+            print(f"  {'-' * 32} {'-' * 7}  {'-' * 7}  {'-' * 7}")
+            for k in onset_order:
+                if k in onset and isinstance(onset[k], dict) and onset[k]:
+                    print(_row(k, onset[k], cls_metrics))
+            best_onset = _best_baseline(
+                onset, ["lag_only_logistic", "raw_random_forest", "naive_marginal"],
+                "roc_auc", higher_is_better=True,
+            )
+            grm_for_delta = onset.get("grm_plus_lag_logistic") or onset.get("grm_logistic")
+            if grm_for_delta and best_onset:
+                print(_delta_row(grm_for_delta, best_onset, cls_metrics, invert=[False, True, True]))
+
+            hard = onset.get("hard_subset_flare_today_0", {}) or {}
+            if hard and hard.get("n_test_eligible", 0) > 0:
+                n_hard = hard.get("n_test_eligible", "?")
+                n_hard_pos = hard.get("n_test_positive", "?")
+                print(f"\n  HARD SUBSET (flare_today=0 only; the genuinely-predictive task)")
+                print(f"  hard subset rows: {n_hard}, positives: {n_hard_pos}")
+                print(f"  {'predictor':<32} {'AUC':>7}  {'Brier':>7}  {'LogLs':>7}")
+                print(f"  {'-' * 32} {'-' * 7}  {'-' * 7}  {'-' * 7}")
+                for k in onset_order:
+                    if k in hard and isinstance(hard[k], dict) and hard[k]:
+                        print(_row(k, hard[k], cls_metrics))
+                best_hard = _best_baseline(
+                    hard, ["lag_only_logistic", "raw_random_forest", "naive_marginal"],
+                    "roc_auc", higher_is_better=True,
+                )
+                grm_hard = hard.get("grm_plus_lag_logistic") or hard.get("grm_logistic")
+                if grm_hard and best_hard:
+                    print(_delta_row(grm_hard, best_hard, cls_metrics, invert=[False, True, True]))
+
+        const = metrics.get("constitution_recovery", {})
+        if const and const.get("axes"):
+            axes = const["axes"]
+            print(f"\n  CONSTITUTION RECOVERY (per-subject aggregates -> stable constitution axes)")
+            print(f"  train subjects: {const.get('n_train_subjects', '?')}, test subjects: {const.get('n_test_subjects', '?')}")
+            head = "  {:<32} ".format("predictor") + "  ".join(f"{a.replace('constitution_',''):>10}" for a in axes) + "    mean"
+            print(head)
+            print("  " + "-" * 32 + " " + "  ".join("-" * 10 for _ in axes) + "  ------")
+            for k, label in [
+                ("grm_aggregate_ridge", "visit_grm_aggregate_ridge"),
+                ("subject_graph_grm_ridge", "subject_graph_grm_ridge"),
+                ("raw_aggregate_ridge", "raw_aggregate_ridge"),
+            ]:
+                row_metrics = const.get(k, {})
+                if not row_metrics:
+                    continue
+                cells = []
+                for a in axes:
+                    r2 = row_metrics.get(a, {}).get("r2")
+                    cells.append(f"{r2:10.4f}" if r2 is not None else f"{'-':>10}")
+                mean_r2 = const.get("mean_r2", {}).get(k)
+                mean_s = f"{mean_r2:6.4f}" if mean_r2 is not None else "    -"
+                print(f"  {label:<32} " + "  ".join(cells) + f"  {mean_s}")
+            grm_mean = const.get("mean_r2", {}).get("grm_aggregate_ridge")
+            raw_mean = const.get("mean_r2", {}).get("raw_aggregate_ridge")
+            if grm_mean is not None and raw_mean is not None:
+                delta = grm_mean - raw_mean
+                print(f"  {'Δ GRM vs raw aggregate (mean R²)':<32} " + "  ".join(" " * 10 for _ in axes) + f"  {delta:+6.4f}")
+
+        note = metrics.get("tier_note") or metrics.get("interpretation_guardrail")
+        if note:
+            print()
+            print(f"  NOTE: {note}")
+        print(bar)
+        print()
 
     def _run_transductive(self, visits, latent, events) -> Dict:
         self._visit_index = visits[["visit_id", "subject_id", "day"]].copy()
@@ -241,7 +459,7 @@ class GRMTCMTrainer:
         self.flare_temperature = self._fit_flare_temperature(train_embeddings, y_cls_train, self.train_idx)
 
         # 3. Project test observations.
-        X_test_raw = test_visits[OBSERVATION_NAMES].to_numpy(float)
+        X_test_raw = test_visits[self.feature_names].to_numpy(float)
         X_test = self.obs_preprocessor.transform(X_test_raw)
 
         if self.cfg.projection == "surrogate":
@@ -286,7 +504,8 @@ class GRMTCMTrainer:
 
         # Raw-observation baseline: fit RF on train_raw, predict on test_raw. Both rows
         # come through the SAME preprocessor (fit on train) to keep the inductive contract.
-        raw_cols = OBSERVATION_NAMES + ["global_dysregulation_score"]
+        # Uses the same feature set the GRM head sees so the comparison is fair.
+        raw_cols = self.feature_names + ["global_dysregulation_score"]
         raw_pipe = Pipeline([("imputer", SimpleImputer(strategy="median")), ("scaler", StandardScaler())])
         train_raw = raw_pipe.fit_transform(train_visits[raw_cols].to_numpy(float))
         test_raw = raw_pipe.transform(test_visits[raw_cols].to_numpy(float))
@@ -304,6 +523,10 @@ class GRMTCMTrainer:
             prob_raw_cls = np.full(len(test_visits), 0.5)
             pred_raw_cls = np.zeros(len(test_visits), dtype=int)
 
+        pred_smooth_reg, prob_smooth_cls = self._fit_smooth_rbf_baseline(
+            train_raw, y_reg_train, y_cls_train, test_raw
+        )
+
         # Naive baseline: just use the current dysregulation score.
         pred_naive_reg = test_visits["global_dysregulation_score"].to_numpy(float)
         pred_naive_reg = np.nan_to_num(pred_naive_reg, nan=float(np.nanmedian(y_reg_train)))
@@ -311,6 +534,42 @@ class GRMTCMTrainer:
         pred_naive_cls = (pred_naive_reg >= naive_threshold).astype(int)
         prob_naive_cls = np.clip(
             pred_naive_reg / max(float(np.nanmax(y_reg_train)), 1e-9), 0, 1
+        )
+
+        persistence = self._persistence_baseline(
+            test_visits, train_visits,
+            self.cfg.target_classification, self.cfg.target_regression,
+        )
+
+        # GRM + lag head — fair deployment-style competitor against persistence.
+        fill_score = float(np.nanmedian(y_reg_train))
+        fill_flare = float(np.nanmean(y_cls_train))
+        X_train_grm_lag = self._augment_with_lag(train_embeddings, train_visits, fill_score, fill_flare)
+        X_test_grm_lag = self._augment_with_lag(test_embeddings, test_visits, fill_score, fill_flare)
+        ridge_grm_lag = Ridge(alpha=1.0).fit(X_train_grm_lag, y_reg_train)
+        pred_grm_lag_reg = ridge_grm_lag.predict(X_test_grm_lag)
+        if len(np.unique(y_cls_train)) >= 2:
+            log_grm_lag = LogisticRegression(max_iter=2000, class_weight="balanced").fit(X_train_grm_lag, y_cls_train)
+            prob_grm_lag_cls = log_grm_lag.predict_proba(X_test_grm_lag)[:, 1]
+            pred_grm_lag_cls = (prob_grm_lag_cls >= 0.5).astype(int)
+        else:
+            prob_grm_lag_cls = np.full(len(test_visits), 0.5)
+            pred_grm_lag_cls = np.zeros(len(test_visits), dtype=int)
+
+        # Flare-onset secondary target. Eligible rows = where flare_today is known.
+        y_onset_train_raw = train_visits[self.cfg.target_classification_onset].astype(float).to_numpy()
+        y_onset_test_raw = test_visits[self.cfg.target_classification_onset].astype(float).to_numpy()
+        tr_onset_valid = ~np.isnan(y_onset_train_raw)
+        te_onset_valid = ~np.isnan(y_onset_test_raw)
+        y_onset_train = np.where(tr_onset_valid, np.nan_to_num(y_onset_train_raw, nan=0.0), 0).astype(int)
+        y_onset_test = np.where(te_onset_valid, np.nan_to_num(y_onset_test_raw, nan=0.0), 0).astype(int)
+        flare_today_test_arr = test_visits["flare_persistence_today"].astype(float).to_numpy()[te_onset_valid]
+        onset_block = self._fit_and_score_onset(
+            y_onset_train[tr_onset_valid], y_onset_test[te_onset_valid],
+            train_embeddings[tr_onset_valid], test_embeddings[te_onset_valid],
+            X_train_grm_lag[tr_onset_valid], X_test_grm_lag[te_onset_valid],
+            train_raw[tr_onset_valid], test_raw[te_onset_valid],
+            flare_today_test_arr,
         )
 
         # 5. Out-of-sample latent recovery: fit Procrustes on train, apply to test.
@@ -321,6 +580,7 @@ class GRMTCMTrainer:
         metrics: Dict[str, Any] = {
             "manifest": "model/manifest.json",
             "evaluation_mode": "inductive",
+            "evaluation_tier": "inductive_deployable_prediction",
             "projection": self.cfg.projection,
             "n_train_subjects": int(len(train_subjects)),
             "n_test_subjects": int(len(test_subjects)),
@@ -328,8 +588,11 @@ class GRMTCMTrainer:
             "n_test_visits": int(len(test_visits)),
             "regression": {
                 "grm_ridge": self._reg_metrics(y_reg_test, pred_grm_reg),
+                "grm_plus_lag_ridge": self._reg_metrics(y_reg_test, pred_grm_lag_reg),
+                "smooth_rbf_kernel_ridge": self._reg_metrics(y_reg_test, pred_smooth_reg),
                 "raw_random_forest": self._reg_metrics(y_reg_test, pred_raw_reg),
                 "naive_current_score": self._reg_metrics(y_reg_test, pred_naive_reg),
+                "persistence_yesterday_score": self._reg_metrics(y_reg_test, persistence["score_pred"]),
             },
             "classification": {
                 "grm_logistic": self._cls_metrics(y_cls_test, pred_grm_cls, prob_grm_cls),
@@ -337,9 +600,22 @@ class GRMTCMTrainer:
                     self._cls_metrics(y_cls_test, pred_grm_cls_cal, prob_grm_cls_cal)
                     if prob_grm_cls_cal is not None else {}
                 ),
+                "grm_plus_lag_logistic": self._cls_metrics(y_cls_test, pred_grm_lag_cls, prob_grm_lag_cls),
+                "smooth_rbf_kernel_ridge": self._cls_metrics(
+                    y_cls_test, (prob_smooth_cls >= 0.5).astype(int), prob_smooth_cls
+                ),
                 "raw_random_forest": self._cls_metrics(y_cls_test, pred_raw_cls, prob_raw_cls),
                 "naive_current_score": self._cls_metrics(y_cls_test, pred_naive_cls, prob_naive_cls),
+                "persistence_yesterday_flare": self._cls_metrics(
+                    y_cls_test, persistence["flare_pred"], persistence["flare_prob"]
+                ),
             },
+            "flare_onset_classification": onset_block,
+            "constitution_recovery": self._evaluate_constitution_recovery(
+                train_visits, train_embeddings, test_visits, test_embeddings,
+            ),
+            "spectral_signal_concentration": self._spectral_signal_concentration(test_visits, test_embeddings),
+            "parsimony": self._parsimony_summary(),
             "flare_temperature": float(self.flare_temperature) if self.flare_temperature is not None else None,
             "latent_recovery": latent_recovery,
             "interpretation_guardrail": (
@@ -370,6 +646,10 @@ class GRMTCMTrainer:
         pred_df["pred_raw_flare_prob"] = prob_raw_cls
         pred_df["pred_naive_next_score"] = pred_naive_reg
         pred_df["pred_naive_flare_prob"] = prob_naive_cls
+        pred_df["pred_persistence_next_score"] = persistence["score_pred"]
+        pred_df["pred_persistence_flare_prob"] = persistence["flare_prob"]
+        pred_df["pred_grm_plus_lag_next_score"] = pred_grm_lag_reg
+        pred_df["pred_grm_plus_lag_flare_prob"] = prob_grm_lag_cls
 
         feature_modes_df = self._feature_mode_correlations(train_visits, train_embeddings, feature_names)
 
@@ -454,6 +734,9 @@ class GRMTCMTrainer:
         visits = pd.read_csv(visits_path)
         latent = pd.read_csv(self.input_dir / "latent_states.csv") if (self.input_dir / "latent_states.csv").exists() else None
         events = pd.read_csv(self.input_dir / "events.csv") if (self.input_dir / "events.csv").exists() else None
+        # Subjects.csv is optional — only the constitution-recovery evaluation needs it.
+        subjects_path = self.input_dir / "subjects.csv"
+        self.subjects: Optional[pd.DataFrame] = pd.read_csv(subjects_path) if subjects_path.exists() else None
         return visits, latent, events
 
     def _prepare_visits(self, visits: pd.DataFrame) -> pd.DataFrame:
@@ -463,16 +746,48 @@ class GRMTCMTrainer:
                 raise ValueError(f"Missing target column: {col}")
         df = df.dropna(subset=[self.cfg.target_regression, self.cfg.target_classification]).reset_index(drop=True)
         df["visit_id"] = np.arange(len(df))
+        # Persistence-baseline column: yesterday's flare label (= today's flare).
+        # Constructed AFTER the NaN drop so consecutive remaining rows define "yesterday".
+        # NaN for the first visit per subject — callers fall back to train marginal.
+        df["flare_persistence_today"] = df.groupby("subject_id")[self.cfg.target_classification].shift(1)
+        df["score_persistence_today"] = df.groupby("subject_id")[self.cfg.target_regression].shift(1)
+
+        # Flare ONSET = (today=0, tomorrow=1). Derived from the primary flare target
+        # and its per-subject lag. NA for the first visit per subject (no "today" known).
+        flare_today = df["flare_persistence_today"]
+        flare_tomorrow = df[self.cfg.target_classification].astype(float)
+        onset = ((flare_tomorrow == 1.0) & (flare_today == 0.0)).astype(int)
+        df[self.cfg.target_classification_onset] = pd.array(
+            np.where(flare_today.isna(), pd.NA, onset.to_numpy()),
+            dtype="Int64",
+        )
         return df
 
+    def _active_feature_names(self, visits: pd.DataFrame) -> List[str]:
+        """Return the feature columns the trainer will actually use.
+
+        Always the 12 continuous OBSERVATION_NAMES. Additionally includes the v2
+        qualitative ordinal channels when `include_qualitative_features` is on
+        AND those columns are present in visits.csv (so v1 data still works).
+        """
+
+        feats = list(OBSERVATION_NAMES)
+        if self.cfg.include_qualitative_features:
+            for q in QUALITATIVE_FEATURE_NAMES:
+                if q in visits.columns:
+                    feats.append(q)
+        return feats
+
     def _make_observation_matrix(self, visits: pd.DataFrame) -> Tuple[np.ndarray, List[str]]:
-        missing = [c for c in OBSERVATION_NAMES if c not in visits.columns]
+        feature_names = self._active_feature_names(visits)
+        missing = [c for c in feature_names if c not in visits.columns]
         if missing:
             raise ValueError(f"Missing observation columns: {missing}")
         pipe = Pipeline([("imputer", SimpleImputer(strategy="median")), ("scaler", StandardScaler())])
-        X = pipe.fit_transform(visits[OBSERVATION_NAMES].to_numpy(dtype=float))
+        X = pipe.fit_transform(visits[feature_names].to_numpy(dtype=float))
         self.obs_preprocessor = pipe
-        return X, OBSERVATION_NAMES
+        self.feature_names = feature_names
+        return X, feature_names
 
     def _build_visit_graph(self, visits: pd.DataFrame, X: np.ndarray, events: Optional[pd.DataFrame]) -> sparse.csr_matrix:
         valid_modes = {
@@ -480,6 +795,7 @@ class GRMTCMTrainer:
             "temporal_only",
             "feature_temporal",
             "feature_temporal_treatment",
+            "feature_temporal_treatment_subject",
             "random_graph",
         }
         if self.cfg.graph_mode not in valid_modes:
@@ -494,7 +810,13 @@ class GRMTCMTrainer:
         indices: Optional[np.ndarray] = None
 
         # KNN graph on observation similarity.
-        if self.cfg.graph_mode in {"feature_only", "feature_temporal", "feature_temporal_treatment"}:
+        feature_graph_modes = {
+            "feature_only",
+            "feature_temporal",
+            "feature_temporal_treatment",
+            "feature_temporal_treatment_subject",
+        }
+        if self.cfg.graph_mode in feature_graph_modes:
             nn = NearestNeighbors(n_neighbors=min(self.cfg.n_neighbors + 1, n), metric="euclidean")
             nn.fit(X)
             distances, indices = nn.kneighbors(X)
@@ -514,7 +836,13 @@ class GRMTCMTrainer:
 
         # Temporal same-subject edges.
         visit_index = {(int(r.subject_id), int(r.day)): int(r.visit_id) for r in visits.itertuples(index=False)}
-        if self.cfg.graph_mode in {"temporal_only", "feature_temporal", "feature_temporal_treatment"}:
+        temporal_graph_modes = {
+            "temporal_only",
+            "feature_temporal",
+            "feature_temporal_treatment",
+            "feature_temporal_treatment_subject",
+        }
+        if self.cfg.graph_mode in temporal_graph_modes:
             for r in visits.itertuples(index=False):
                 i = int(r.visit_id)
                 nxt = (int(r.subject_id), int(r.day) + 1)
@@ -538,7 +866,7 @@ class GRMTCMTrainer:
 
         # Optional treatment-similarity edges among feature-near treatment visits.
         if (
-            self.cfg.graph_mode == "feature_temporal_treatment"
+            self.cfg.graph_mode in {"feature_temporal_treatment", "feature_temporal_treatment_subject"}
             and indices is not None
             and events is not None
             and not events.empty
@@ -558,10 +886,79 @@ class GRMTCMTrainer:
                             cols += [j, i]
                             vals += [self.cfg.treatment_edge_weight, self.cfg.treatment_edge_weight]
 
+        # Cross-subject constitution edges. These are deliberately separate from
+        # visit KNN edges: subject means define who is constitutionally similar,
+        # then same-day visits between similar subjects are weakly tied. This gives
+        # the spectral geometry a route to represent durable subject structure
+        # without leaking subject IDs as features.
+        if self.cfg.graph_mode == "feature_temporal_treatment_subject":
+            subj_rows, subj_cols, subj_vals = self._subject_similarity_edges(visits, X)
+            rows.extend(subj_rows)
+            cols.extend(subj_cols)
+            vals.extend(subj_vals)
+
         W = sparse.coo_matrix((vals, (rows, cols)), shape=(n, n)).tocsr()
         W.setdiag(0.0)
         W.eliminate_zeros()
         return W.maximum(W.T)
+
+    def _subject_similarity_edges(self, visits: pd.DataFrame, X: np.ndarray) -> Tuple[List[int], List[int], List[float]]:
+        """Build weak same-day edges between constitutionally similar subjects.
+
+        Subject similarity is estimated from each subject's mean standardized
+        observation vector. Edges then connect visits at the same day between
+        neighboring subjects, preserving longitudinal phase while making stable
+        subject-level similarity visible to the visit graph.
+        """
+
+        subjects = np.array(sorted(int(s) for s in visits["subject_id"].unique()))
+        if len(subjects) < 2:
+            return [], [], []
+
+        subj_to_pos = {sid: pos for pos, sid in enumerate(subjects)}
+        subj_means = np.zeros((len(subjects), X.shape[1]), dtype=float)
+        for sid, group in visits.groupby("subject_id"):
+            subj_means[subj_to_pos[int(sid)]] = X[group.index.to_numpy()].mean(axis=0)
+
+        n_neighbors = min(max(int(self.cfg.subject_similarity_neighbors), 1) + 1, len(subjects))
+        nn = NearestNeighbors(n_neighbors=n_neighbors, metric="euclidean").fit(subj_means)
+        distances, indices = nn.kneighbors(subj_means)
+        nonzero = distances[:, 1:].ravel()
+        nonzero = nonzero[nonzero > 0]
+        sigma = float(np.median(nonzero) if len(nonzero) else 1.0)
+        sigma = max(sigma, 1e-9)
+
+        by_key = {
+            (int(row.subject_id), int(row.day)): int(row.visit_id)
+            for row in visits[["visit_id", "subject_id", "day"]].itertuples(index=False)
+        }
+        days_by_subject = {
+            int(sid): set(int(day) for day in group["day"].to_numpy(int))
+            for sid, group in visits.groupby("subject_id")
+        }
+
+        rows: List[int] = []
+        cols: List[int] = []
+        vals: List[float] = []
+        scale = float(self.cfg.subject_similarity_edge_weight)
+        if scale <= 0.0:
+            return rows, cols, vals
+
+        for a_pos, sid_a in enumerate(subjects):
+            days_a = days_by_subject[int(sid_a)]
+            for dist, b_pos in zip(distances[a_pos, 1:], indices[a_pos, 1:]):
+                sid_b = int(subjects[int(b_pos)])
+                shared_days = days_a & days_by_subject[sid_b]
+                if not shared_days:
+                    continue
+                weight = scale * float(np.exp(-(float(dist) ** 2) / (2.0 * sigma ** 2)))
+                for day in shared_days:
+                    i = by_key[(int(sid_a), int(day))]
+                    j = by_key[(sid_b, int(day))]
+                    rows += [i, j]
+                    cols += [j, i]
+                    vals += [weight, weight]
+        return rows, cols, vals
 
     def _build_random_graph(self, n: int) -> sparse.csr_matrix:
         rng = np.random.default_rng(self.cfg.random_seed)
@@ -619,6 +1016,9 @@ class GRMTCMTrainer:
         X_raw = self._raw_baseline_matrix(visits)
         pred_grm_reg, self.ridge_reg = self._fit_reg(X_grm, y_reg, train_idx, test_idx, "ridge")
         pred_raw_reg, _ = self._fit_reg(X_raw, y_reg, train_idx, test_idx, "random_forest")
+        pred_smooth_reg, prob_smooth_cls = self._fit_smooth_rbf_baseline(
+            X_raw[train_idx], y_reg[train_idx], y_cls[train_idx], X_raw[test_idx]
+        )
         pred_naive_reg = visits.iloc[test_idx]["global_dysregulation_score"].to_numpy(float)
         pred_naive_reg = np.nan_to_num(pred_naive_reg, nan=float(np.nanmedian(y_reg[train_idx])))
 
@@ -628,16 +1028,48 @@ class GRMTCMTrainer:
         pred_naive_cls = (pred_naive_reg >= naive_threshold).astype(int)
         prob_naive_cls = np.clip(pred_naive_reg / max(float(np.nanmax(y_reg[train_idx])), 1e-9), 0, 1)
 
+        persistence = self._persistence_baseline(
+            visits.iloc[test_idx], visits.iloc[train_idx],
+            self.cfg.target_classification, self.cfg.target_regression,
+        )
+
+        # GRM + lag head: same GRM coordinates with per-subject target lags appended.
+        # This is the "fair deployment" comparison against the persistence baseline.
+        fill_score = float(np.nanmedian(y_reg[train_idx]))
+        fill_flare = float(np.nanmean(y_cls[train_idx]))
+        X_grm_lag = self._augment_with_lag(X_grm, visits, fill_score, fill_flare)
+        pred_grm_lag_reg, _ = self._fit_reg(X_grm_lag, y_reg, train_idx, test_idx, "ridge")
+        pred_grm_lag_cls, prob_grm_lag_cls, _ = self._fit_cls(X_grm_lag, y_cls, train_idx, test_idx, "logistic")
+
+        # Flare-onset secondary target (today=0 -> tomorrow=1). Eligible rows only.
+        y_onset_raw = visits[self.cfg.target_classification_onset].astype(float).to_numpy()
+        onset_valid = ~np.isnan(y_onset_raw)
+        y_onset_int = np.where(onset_valid, np.nan_to_num(y_onset_raw, nan=0.0), 0).astype(int)
+        onset_train = train_idx[onset_valid[train_idx]]
+        onset_test = test_idx[onset_valid[test_idx]]
+        flare_today_test = visits["flare_persistence_today"].astype(float).to_numpy()[onset_test]
+        onset_block = self._fit_and_score_onset(
+            y_onset_int[onset_train], y_onset_int[onset_test],
+            X_grm[onset_train], X_grm[onset_test],
+            X_grm_lag[onset_train], X_grm_lag[onset_test],
+            X_raw[onset_train], X_raw[onset_test],
+            flare_today_test,
+        )
+
         self.flare_temperature = self._fit_flare_temperature(X_grm, y_cls, train_idx)
         prob_grm_cls_calibrated = self._apply_flare_temperature(self.logistic_clf, X_grm, test_idx, self.flare_temperature)
         pred_grm_cls_calibrated = (prob_grm_cls_calibrated >= 0.5).astype(int) if prob_grm_cls_calibrated is not None else None
 
         metrics: Dict = {
             "manifest": "model/manifest.json",
+            "evaluation_tier": "transductive_diagnostic",
             "regression": {
                 "grm_ridge": self._reg_metrics(y_reg[test_idx], pred_grm_reg),
+                "grm_plus_lag_ridge": self._reg_metrics(y_reg[test_idx], pred_grm_lag_reg),
+                "smooth_rbf_kernel_ridge": self._reg_metrics(y_reg[test_idx], pred_smooth_reg),
                 "raw_random_forest": self._reg_metrics(y_reg[test_idx], pred_raw_reg),
                 "naive_current_score": self._reg_metrics(y_reg[test_idx], pred_naive_reg),
+                "persistence_yesterday_score": self._reg_metrics(y_reg[test_idx], persistence["score_pred"]),
             },
             "classification": {
                 "grm_logistic": self._cls_metrics(y_cls[test_idx], pred_grm_cls, prob_grm_cls),
@@ -645,11 +1077,30 @@ class GRMTCMTrainer:
                     self._cls_metrics(y_cls[test_idx], pred_grm_cls_calibrated, prob_grm_cls_calibrated)
                     if prob_grm_cls_calibrated is not None else {}
                 ),
+                "grm_plus_lag_logistic": self._cls_metrics(y_cls[test_idx], pred_grm_lag_cls, prob_grm_lag_cls),
+                "smooth_rbf_kernel_ridge": self._cls_metrics(
+                    y_cls[test_idx], (prob_smooth_cls >= 0.5).astype(int), prob_smooth_cls
+                ),
                 "raw_random_forest": self._cls_metrics(y_cls[test_idx], pred_raw_cls, prob_raw_cls),
                 "naive_current_score": self._cls_metrics(y_cls[test_idx], pred_naive_cls, prob_naive_cls),
+                "persistence_yesterday_flare": self._cls_metrics(
+                    y_cls[test_idx], persistence["flare_pred"], persistence["flare_prob"]
+                ),
             },
+            "flare_onset_classification": onset_block,
+            "constitution_recovery": self._evaluate_constitution_recovery(
+                visits.iloc[train_idx], embeddings[train_idx],
+                visits.iloc[test_idx], embeddings[test_idx],
+            ),
+            "spectral_signal_concentration": self._spectral_signal_concentration(visits.iloc[test_idx], embeddings[test_idx]),
+            "parsimony": self._parsimony_summary(),
             "flare_temperature": float(self.flare_temperature) if self.flare_temperature is not None else None,
             "latent_recovery": self._latent_recovery_capture(visits, embeddings, latent) if latent is not None else {},
+            "tier_note": (
+                "Transductive diagnostic: train/test split is within the same visit graph. Eigenvectors and "
+                "embeddings see ALL visits during decomposition. Held-out metrics here are upper bounds; for "
+                "honest deployable numbers run grm_tcm_train.py --inductive."
+            ),
         }
 
         pred_df = visits[["visit_id", "subject_id", "day", self.cfg.target_regression, self.cfg.target_classification]].copy()
@@ -666,11 +1117,151 @@ class GRMTCMTrainer:
             pred_df.loc[test_idx, "pred_grm_flare_prob_calibrated"] = prob_grm_cls_calibrated
         pred_df["pred_raw_flare_prob"] = np.nan
         pred_df.loc[test_idx, "pred_raw_flare_prob"] = prob_raw_cls
+        pred_df["pred_persistence_next_score"] = np.nan
+        pred_df.loc[test_idx, "pred_persistence_next_score"] = persistence["score_pred"]
+        pred_df["pred_persistence_flare_prob"] = np.nan
+        pred_df.loc[test_idx, "pred_persistence_flare_prob"] = persistence["flare_prob"]
+        pred_df["pred_grm_plus_lag_next_score"] = np.nan
+        pred_df.loc[test_idx, "pred_grm_plus_lag_next_score"] = pred_grm_lag_reg
+        pred_df["pred_grm_plus_lag_flare_prob"] = np.nan
+        pred_df.loc[test_idx, "pred_grm_plus_lag_flare_prob"] = prob_grm_lag_cls
         return metrics, pred_df
 
+    def _fit_and_score_onset(
+        self,
+        y_onset_train: np.ndarray, y_onset_test: np.ndarray,
+        X_grm_train: np.ndarray, X_grm_test: np.ndarray,
+        X_grm_lag_train: np.ndarray, X_grm_lag_test: np.ndarray,
+        X_raw_train: np.ndarray, X_raw_test: np.ndarray,
+        flare_today_test: np.ndarray,
+    ) -> Dict[str, Any]:
+        """Fit flare_onset classifiers and score on the pre-sliced eligible subset.
+
+        Returns metrics on both the full eligible set AND the hard subset
+        (flare_today == 0). The hard subset closes the inflation loophole:
+        on the full set, any classifier that uses flare_today can trivially
+        predict 0 whenever flare_today=1 (definitionally certain), inflating AUC.
+        The hard subset removes those guaranteed-zero rows so the reported AUC
+        reflects genuine onset prediction, not the trivial filter.
+
+        Baselines:
+          - grm_logistic              GRM coordinates only (no lag).
+          - grm_plus_lag_logistic     GRM + persistence lags (headline model).
+          - lag_only_logistic         Persistence lags only — isolates the trivial filter.
+          - raw_random_forest         Raw 12-obs RF (with global_dysregulation_score).
+          - naive_marginal            Constant prediction at the training class prior.
+        """
+
+        if len(np.unique(y_onset_train)) < 2 or len(y_onset_test) == 0:
+            return {}
+
+        clf_grm = LogisticRegression(max_iter=2000, class_weight="balanced").fit(X_grm_train, y_onset_train)
+        prob_grm = clf_grm.predict_proba(X_grm_test)[:, 1]
+        pred_grm = (prob_grm >= 0.5).astype(int)
+
+        clf_grm_lag = LogisticRegression(max_iter=2000, class_weight="balanced").fit(X_grm_lag_train, y_onset_train)
+        prob_grm_lag = clf_grm_lag.predict_proba(X_grm_lag_test)[:, 1]
+        pred_grm_lag = (prob_grm_lag >= 0.5).astype(int)
+
+        # Lag-only baseline: the last two columns of X_grm_lag are the persistence lags.
+        # This is the "trivial filter" baseline that bounds how much of the headline AUC
+        # comes from the flare_today==1 -> onset=0 certainty alone.
+        X_lag_only_train = X_grm_lag_train[:, -2:]
+        X_lag_only_test = X_grm_lag_test[:, -2:]
+        clf_lag_only = LogisticRegression(max_iter=2000, class_weight="balanced").fit(X_lag_only_train, y_onset_train)
+        prob_lag_only = clf_lag_only.predict_proba(X_lag_only_test)[:, 1]
+        pred_lag_only = (prob_lag_only >= 0.5).astype(int)
+
+        clf_raw = RandomForestClassifier(
+            n_estimators=100, min_samples_leaf=4, random_state=42, n_jobs=-1, class_weight="balanced",
+        ).fit(X_raw_train, y_onset_train)
+        prob_raw = clf_raw.predict_proba(X_raw_test)[:, 1]
+        pred_raw = (prob_raw >= 0.5).astype(int)
+
+        onset_marginal = float(np.mean(y_onset_train))
+        prob_naive = np.full(len(y_onset_test), onset_marginal)
+        pred_naive = (prob_naive >= 0.5).astype(int)
+
+        def _block(mask: np.ndarray) -> Dict[str, Any]:
+            yt = y_onset_test[mask]
+            block: Dict[str, Any] = {
+                "n_test_eligible": int(mask.sum()),
+                "n_test_positive": int(yt.sum()),
+            }
+            if len(np.unique(yt)) < 2 or mask.sum() == 0:
+                return block
+            block["grm_logistic"] = self._cls_metrics(yt, pred_grm[mask], prob_grm[mask])
+            block["grm_plus_lag_logistic"] = self._cls_metrics(yt, pred_grm_lag[mask], prob_grm_lag[mask])
+            block["lag_only_logistic"] = self._cls_metrics(yt, pred_lag_only[mask], prob_lag_only[mask])
+            block["raw_random_forest"] = self._cls_metrics(yt, pred_raw[mask], prob_raw[mask])
+            block["naive_marginal"] = self._cls_metrics(yt, pred_naive[mask], prob_naive[mask])
+            return block
+
+        full_mask = np.ones(len(y_onset_test), dtype=bool)
+        hard_mask = (flare_today_test == 0)
+
+        out = _block(full_mask)
+        out["train_marginal"] = onset_marginal
+        out["hard_subset_flare_today_0"] = _block(hard_mask)
+        out["hard_subset_flare_today_0"]["note"] = (
+            "AUC restricted to rows where flare_today=0. Removes the trivial filter "
+            "(flare_today=1 -> onset=0 certainty) so the metric reflects real onset prediction."
+        )
+        return out
+
     @staticmethod
-    def _raw_baseline_matrix(visits: pd.DataFrame) -> np.ndarray:
-        cols = OBSERVATION_NAMES + ["global_dysregulation_score"]
+    def _augment_with_lag(
+        X_grm: np.ndarray, visits: pd.DataFrame,
+        fill_score: float, fill_flare: float,
+    ) -> np.ndarray:
+        """Concatenate per-subject target lags onto the GRM embedding matrix.
+
+        Yields the feature matrix used by the "GRM + lag" head. The lag columns are
+        the same persistence signals fed to the persistence baseline, so the head
+        AT WORST recovers persistence performance, and at best improves on it.
+        First-visit-per-subject NaNs are filled with the supplied train marginals
+        (not test marginals — caller's responsibility).
+        """
+
+        lag_s = visits["score_persistence_today"].astype(float).to_numpy()
+        lag_s = np.where(np.isnan(lag_s), fill_score, lag_s)
+        lag_f = visits["flare_persistence_today"].astype(float).to_numpy()
+        lag_f = np.where(np.isnan(lag_f), fill_flare, lag_f)
+        return np.column_stack([X_grm, lag_s.reshape(-1, 1), lag_f.reshape(-1, 1)])
+
+    @staticmethod
+    def _persistence_baseline(
+        eval_visits: pd.DataFrame,
+        train_visits: pd.DataFrame,
+        target_classification: str,
+        target_regression: str,
+    ) -> Dict[str, np.ndarray]:
+        """Per-subject persistence baselines: yesterday's label predicts today's label.
+
+        Returns dict with keys:
+          - 'flare_pred', 'flare_prob': binary persistence for `target_classification`.
+            First-visit fallback is the train-set marginal flare rate.
+          - 'score_pred': regression persistence for `target_regression`.
+            First-visit fallback is the train-set median.
+        """
+
+        train_flare_rate = float(np.nanmean(train_visits[target_classification].astype(float).to_numpy()))
+        train_score_median = float(np.nanmedian(train_visits[target_regression].astype(float).to_numpy()))
+
+        flare_prob = eval_visits["flare_persistence_today"].astype(float).to_numpy()
+        flare_prob = np.where(np.isnan(flare_prob), train_flare_rate, flare_prob)
+        flare_pred = (flare_prob >= 0.5).astype(int)
+
+        score_pred = eval_visits["score_persistence_today"].astype(float).to_numpy()
+        score_pred = np.where(np.isnan(score_pred), train_score_median, score_pred)
+        return {
+            "flare_pred": flare_pred,
+            "flare_prob": flare_prob,
+            "score_pred": score_pred,
+        }
+
+    def _raw_baseline_matrix(self, visits: pd.DataFrame) -> np.ndarray:
+        cols = (self.feature_names or list(OBSERVATION_NAMES)) + ["global_dysregulation_score"]
         pipe = Pipeline([("imputer", SimpleImputer(strategy="median")), ("scaler", StandardScaler())])
         return pipe.fit_transform(visits[cols].to_numpy(float))
 
@@ -684,6 +1275,40 @@ class GRMTCMTrainer:
             raise ValueError(model)
         reg.fit(X[train_idx], y[train_idx])
         return reg.predict(X[test_idx]), reg
+
+    @staticmethod
+    def _fit_smooth_rbf_baseline(
+        X_train: np.ndarray,
+        y_reg_train: np.ndarray,
+        y_cls_train: np.ndarray,
+        X_test: np.ndarray,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Observation-only smooth distance-kernel baseline.
+
+        This is the Pang-EDR analogue for visits: a stripped-down RBF kernel over
+        observed visit features, with no temporal edges, treatment edges, graph
+        eigenmodes, or subject similarity. If this matches GRM, the load-bearing
+        property is probably distance-smoothness rather than the full GRM machinery.
+        """
+
+        if len(X_train) < 2:
+            return np.zeros(len(X_test), dtype=float), np.full(len(X_test), 0.5, dtype=float)
+        nn = NearestNeighbors(n_neighbors=min(2, len(X_train)), metric="euclidean").fit(X_train)
+        distances, _ = nn.kneighbors(X_train)
+        nonzero = distances[:, 1:].ravel()
+        nonzero = nonzero[nonzero > 0]
+        sigma = float(np.median(nonzero) if len(nonzero) else 1.0)
+        gamma = 1.0 / (2.0 * max(sigma, 1e-9) ** 2)
+
+        reg = KernelRidge(alpha=1.0, kernel="rbf", gamma=gamma).fit(X_train, y_reg_train)
+        pred_reg = np.asarray(reg.predict(X_test), dtype=float)
+
+        if len(np.unique(y_cls_train)) < 2:
+            prob_cls = np.full(len(X_test), float(y_cls_train[0]) if len(y_cls_train) else 0.5)
+        else:
+            cls = KernelRidge(alpha=1.0, kernel="rbf", gamma=gamma).fit(X_train, y_cls_train.astype(float))
+            prob_cls = np.clip(np.asarray(cls.predict(X_test), dtype=float), 0.0, 1.0)
+        return pred_reg, prob_cls
 
     @staticmethod
     def _fit_cls(X: np.ndarray, y: np.ndarray, train_idx: np.ndarray, test_idx: np.ndarray, model: str) -> Tuple[np.ndarray, np.ndarray, Optional[BaseEstimator]]:
@@ -761,6 +1386,248 @@ class GRMTCMTrainer:
         out["log_loss"] = float(-np.mean(np.where(y_true == 1, np.log(y_prob_safe), np.log(1.0 - y_prob_safe))))
         out["brier"] = float(np.mean((y_prob_safe - y_true) ** 2))
         return out
+
+    def _evaluate_constitution_recovery(
+        self,
+        train_visits: pd.DataFrame, train_embeddings: np.ndarray,
+        test_visits: pd.DataFrame, test_embeddings: np.ndarray,
+    ) -> Dict[str, Any]:
+        """Constitution-recovery evaluation: predict per-subject constitution axes
+        from per-subject mean of GRM embeddings vs per-subject mean of raw features.
+
+        Held-out by subject: train Ridge on TRAIN subjects' aggregates, score on
+        TEST subjects' aggregates. The claim under test: does GRM aggregation
+        recover the stable cross-modal constitution layer better than naive
+        per-subject averaging of the same input features?
+
+        Skipped when subjects.csv is missing constitution columns. Returns {} in
+        that case so callers can no-op.
+        """
+
+        if not self.cfg.evaluate_constitution_recovery or self.subjects is None:
+            return {}
+        const_cols = [c for c in CONSTITUTION_NAMES if c in self.subjects.columns]
+        if not const_cols:
+            return {}
+
+        # Per-subject aggregates: mean of features and mean of GRM coordinates.
+        # Mean is the simplest aggregation and the natural fit for a *stable*
+        # subject-level target. (Variance or first-eigenmode aggregates are
+        # natural follow-ups for nonstationary targets — not needed here.)
+        feature_cols = self.feature_names or list(OBSERVATION_NAMES)
+
+        def _aggregate(visits: pd.DataFrame, embeddings: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+            # Align embeddings with visits by row order; both are sorted by subject_id, day.
+            sub_ids = visits["subject_id"].to_numpy(int)
+            unique_subs = np.array(sorted(np.unique(sub_ids)))
+            emb_means = np.zeros((len(unique_subs), embeddings.shape[1]))
+            raw_means = np.zeros((len(unique_subs), len(feature_cols)))
+            X_raw = visits[feature_cols].to_numpy(float)
+            X_raw = np.where(np.isnan(X_raw), np.nanmedian(X_raw, axis=0), X_raw)
+            for i, s in enumerate(unique_subs):
+                mask = sub_ids == int(s)
+                emb_means[i] = embeddings[mask].mean(axis=0)
+                raw_means[i] = X_raw[mask].mean(axis=0)
+            const_for_sub = self.subjects.set_index("subject_id").reindex(unique_subs)[const_cols].to_numpy(float)
+            return unique_subs, emb_means, raw_means, const_for_sub
+
+        tr_sub, tr_emb_mean, tr_raw_mean, tr_y = _aggregate(train_visits, train_embeddings)
+        te_sub, te_emb_mean, te_raw_mean, te_y = _aggregate(test_visits, test_embeddings)
+
+        if len(tr_sub) < 3 or len(te_sub) < 2:
+            return {}
+
+        results: Dict[str, Any] = {
+            "n_train_subjects": int(len(tr_sub)),
+            "n_test_subjects": int(len(te_sub)),
+            "axes": const_cols,
+            "note": (
+                "Per-subject mean(GRM embedding) -> constitution axes via Ridge, scored on "
+                "held-out subjects. Baselines: per-subject mean(raw features) -> constitution. "
+                "Constitution is a STABLE subject-level target; mean aggregation is the natural reduction."
+            ),
+            "grm_aggregate_ridge": {},
+            "subject_graph_grm_ridge": {},
+            "raw_aggregate_ridge": {},
+        }
+
+        def _fit_predict(X_tr: np.ndarray, X_te: np.ndarray) -> np.ndarray:
+            scaler = StandardScaler().fit(X_tr)
+            Xt = scaler.transform(X_tr)
+            Xv = scaler.transform(X_te)
+            preds = np.zeros((X_te.shape[0], len(const_cols)))
+            for j in range(len(const_cols)):
+                ridge = Ridge(alpha=1.0).fit(Xt, tr_y[:, j])
+                preds[:, j] = ridge.predict(Xv)
+            return preds
+
+        grm_pred = _fit_predict(tr_emb_mean, te_emb_mean)
+        subject_grm_train, subject_grm_test = self._subject_graph_grm_features(tr_raw_mean, te_raw_mean)
+        subject_grm_pred = _fit_predict(subject_grm_train, subject_grm_test)
+        raw_pred = _fit_predict(tr_raw_mean, te_raw_mean)
+
+        for j, axis in enumerate(const_cols):
+            results["grm_aggregate_ridge"][axis] = self._reg_metrics(te_y[:, j], grm_pred[:, j])
+            results["subject_graph_grm_ridge"][axis] = self._reg_metrics(te_y[:, j], subject_grm_pred[:, j])
+            results["raw_aggregate_ridge"][axis] = self._reg_metrics(te_y[:, j], raw_pred[:, j])
+
+        results["mean_r2"] = {
+            "grm_aggregate_ridge": float(np.mean([results["grm_aggregate_ridge"][a]["r2"] for a in const_cols])),
+            "subject_graph_grm_ridge": float(np.mean([results["subject_graph_grm_ridge"][a]["r2"] for a in const_cols])),
+            "raw_aggregate_ridge": float(np.mean([results["raw_aggregate_ridge"][a]["r2"] for a in const_cols])),
+        }
+        return results
+
+    def _subject_graph_grm_features(self, X_train: np.ndarray, X_test: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """Subject-level GRM features for stable constitution recovery.
+
+        This is the architectural counterpoint to mean(visit embeddings): first
+        collapse each subject to a stable aggregate, then build the graph over
+        subjects. Test subjects are Nyström-projected from their aggregate into
+        the train-subject graph.
+        """
+
+        X_train = np.asarray(X_train, dtype=float)
+        X_test = np.asarray(X_test, dtype=float)
+        n_train = X_train.shape[0]
+        if n_train < 4:
+            return X_train, X_test
+
+        imputer = SimpleImputer(strategy="median").fit(X_train)
+        X_tr = imputer.transform(X_train)
+        X_te = imputer.transform(X_test)
+        scaler = StandardScaler().fit(X_tr)
+        X_tr = scaler.transform(X_tr)
+        X_te = scaler.transform(X_te)
+
+        n_neighbors = min(max(int(self.cfg.subject_similarity_neighbors), 1) + 1, n_train)
+        nn = NearestNeighbors(n_neighbors=n_neighbors, metric="euclidean").fit(X_tr)
+        distances, indices = nn.kneighbors(X_tr)
+        nonzero = distances[:, 1:].ravel()
+        nonzero = nonzero[nonzero > 0]
+        sigma = float(np.median(nonzero) if len(nonzero) else 1.0)
+        sigma = max(sigma, 1e-9)
+
+        rows: List[int] = []
+        cols: List[int] = []
+        vals: List[float] = []
+        for i in range(n_train):
+            for dist, j in zip(distances[i, 1:], indices[i, 1:]):
+                weight = float(np.exp(-(float(dist) ** 2) / (2.0 * sigma ** 2)))
+                rows += [i, int(j)]
+                cols += [int(j), i]
+                vals += [weight, weight]
+        W = sparse.coo_matrix((vals, (rows, cols)), shape=(n_train, n_train)).tocsr()
+        W.setdiag(0.0)
+        W.eliminate_zeros()
+        W = W.maximum(W.T)
+
+        degrees = np.maximum(np.asarray(W.sum(axis=1)).ravel(), 1e-12)
+        D_inv_sqrt = sparse.diags(1.0 / np.sqrt(degrees))
+        L = sparse.eye(n_train, format="csr") - D_inv_sqrt @ W @ D_inv_sqrt
+        k = min(max(int(self.cfg.n_modes), 1) + 1, n_train - 2)
+        if k < 2:
+            return X_tr, X_te
+        eigenvalues, eigenvectors = eigsh(L, k=k, which="SM")
+        order = np.argsort(eigenvalues)
+        eigenvalues = eigenvalues[order][1:self.cfg.n_modes + 1]
+        eigenvectors = canonicalize_eigvec_signs(eigenvectors[:, order][:, 1:self.cfg.n_modes + 1])
+        weights = 1.0 / (1.0 + (self.cfg.rho ** 2) * eigenvalues)
+        train_features = eigenvectors * weights.reshape(1, -1)
+
+        test_features = nystrom_extend_arrays(
+            X_te,
+            nn_index=nn,
+            knn_sigma=sigma,
+            eigenvalues=eigenvalues,
+            eigenvectors=eigenvectors,
+            rho=self.cfg.rho,
+            normalized=True,
+            train_degrees=degrees,
+            n_neighbors=max(1, n_neighbors - 1),
+        )
+        return train_features, test_features
+
+    def _spectral_signal_concentration(self, visits: pd.DataFrame, embeddings: np.ndarray) -> Dict[str, Any]:
+        """Report how concentrated target/regime signal is in early GRM modes.
+
+        Pang-style analogue of "activity lives at long wavelengths": for each
+        target, compute per-mode squared association and ask how many low-index
+        modes carry 75% of the total association.
+        """
+
+        if embeddings.size == 0:
+            return {}
+
+        def _mode_signal(y: np.ndarray) -> Dict[str, Any]:
+            y = np.asarray(y, dtype=float)
+            mask = np.isfinite(y)
+            if mask.sum() < 3 or np.nanstd(y[mask]) <= 1e-12:
+                return {}
+            scores = []
+            for j in range(embeddings.shape[1]):
+                x = embeddings[:, j]
+                if np.nanstd(x[mask]) <= 1e-12:
+                    scores.append(0.0)
+                else:
+                    corr = float(np.corrcoef(x[mask], y[mask])[0, 1])
+                    scores.append(0.0 if not np.isfinite(corr) else corr * corr)
+            scores_arr = np.asarray(scores, dtype=float)
+            total = float(scores_arr.sum())
+            if total <= 1e-12:
+                return {"modes_for_75pct_signal": None, "early_4_signal_fraction": 0.0}
+            cumulative = np.cumsum(scores_arr) / total
+            modes_75 = int(np.searchsorted(cumulative, 0.75) + 1)
+            return {
+                "modes_for_75pct_signal": modes_75,
+                "early_4_signal_fraction": float(cumulative[min(3, len(cumulative) - 1)]),
+                "per_mode_signal_fraction": [float(v / total) for v in scores_arr],
+            }
+
+        out: Dict[str, Any] = {}
+        if self.cfg.target_regression in visits.columns:
+            out[self.cfg.target_regression] = _mode_signal(visits[self.cfg.target_regression].to_numpy(float))
+        if self.cfg.target_classification in visits.columns:
+            out[self.cfg.target_classification] = _mode_signal(visits[self.cfg.target_classification].astype(float).to_numpy())
+        if "true_regime_id" in visits.columns:
+            regime_scores = np.zeros(embeddings.shape[1], dtype=float)
+            regimes = visits["true_regime_id"].astype(float).to_numpy()
+            for rid in sorted(pd.Series(regimes).dropna().unique()):
+                block = _mode_signal((regimes == rid).astype(float))
+                frac = np.asarray(block.get("per_mode_signal_fraction", []), dtype=float)
+                if frac.size == embeddings.shape[1]:
+                    regime_scores += frac
+            total = float(regime_scores.sum())
+            if total > 1e-12:
+                cumulative = np.cumsum(regime_scores) / total
+                out["true_regime_id"] = {
+                    "modes_for_75pct_signal": int(np.searchsorted(cumulative, 0.75) + 1),
+                    "early_4_signal_fraction": float(cumulative[min(3, len(cumulative) - 1)]),
+                    "per_mode_signal_fraction": [float(v / total) for v in regime_scores],
+                }
+        return out
+
+    def _parsimony_summary(self) -> Dict[str, Any]:
+        """Fixed hyperparameter counts for model-family comparison."""
+
+        return {
+            "note": (
+                "Counts are configured structural knobs, not fitted coefficient counts. "
+                "They make the parsimony tradeoff explicit beside predictive metrics."
+            ),
+            "grm_structural_hyperparameters": {
+                "count": 8,
+                "items": [
+                    "n_modes", "rho", "n_neighbors", "similarity_sigma",
+                    "temporal_edge_weight", "same_subject_edge_weight",
+                    "treatment_edge_weight", "graph_mode",
+                ],
+            },
+            "grm_plus_lag_extra_hyperparameters": {"count": 1, "items": ["use_lag_features"]},
+            "smooth_rbf_kernel_ridge": {"count": 2, "items": ["rbf_sigma_median_heuristic", "ridge_alpha"]},
+            "raw_random_forest": {"count": 4, "items": ["n_estimators", "min_samples_leaf", "class_weight", "random_seed"]},
+            "persistence_yesterday": {"count": 0, "items": []},
+        }
 
     def _latent_recovery_capture(self, visits: pd.DataFrame, embeddings: np.ndarray, latent: pd.DataFrame) -> Dict[str, object]:
         merged = visits[["visit_id", "subject_id", "day"]].merge(
@@ -882,6 +1749,9 @@ class GRMTCMTrainer:
         if self._visit_index is not None:
             self._visit_index.to_parquet(model_dir / "visit_index.parquet", index=False)
 
+        manifest_extra_full = dict(manifest_extra or {})
+        if self.feature_names is not None:
+            manifest_extra_full["feature_names"] = list(self.feature_names)
         write_manifest(
             model_dir,
             config=self.cfg,
@@ -892,7 +1762,7 @@ class GRMTCMTrainer:
             ],
             schema_version=STATIC_SCHEMA_VERSION,
             random_seed=self.cfg.random_seed,
-            extra=manifest_extra,
+            extra=manifest_extra_full,
         )
 
 
@@ -908,7 +1778,8 @@ def _parse_cli() -> GRMTrainConfig:
     parser.add_argument("--random-seed", type=int, default=defaults.random_seed)
     parser.add_argument("--graph-mode", default=defaults.graph_mode,
                         choices=["feature_only", "temporal_only", "feature_temporal",
-                                 "feature_temporal_treatment", "random_graph"])
+                                 "feature_temporal_treatment", "feature_temporal_treatment_subject",
+                                 "random_graph"])
     parser.add_argument("--n-modes", type=int, default=defaults.n_modes)
     parser.add_argument("--rho", type=float, default=defaults.rho)
     parser.add_argument("--test-size", type=float, default=defaults.test_size)

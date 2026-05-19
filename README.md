@@ -91,6 +91,12 @@ uv run python grm_tcm_train.py --inductive \
 
 This splits subjects first (seed-controlled), fits scaler/NN-index/graph/eigenbasis/surrogate/heads on train subjects only, then projects test-subject visits via `--projection {surrogate, nystrom}` and scores them with the persisted heads. Results go to `inductive_eval_metrics.json` next to the standard CSVs; the persisted model in `model/` is the train-only fit and its `manifest.json` carries `extra.inductive: true` plus the held-out subject IDs for audit.
 
+The inductive metrics include three Pang-style controls:
+
+- `smooth_rbf_kernel_ridge` — an observation-only smooth distance-kernel baseline, analogous to testing whether EDR-like smoothness explains the signal without the full GRM graph.
+- `parsimony` — configured structural knob counts for GRM, GRM+lag, smooth kernel, raw RF, and persistence baselines.
+- `spectral_signal_concentration` — a compact mode-band summary such as how many early GRM modes carry 75% of the next-day-score, flare, or true-regime association.
+
 Compare against the transductive numbers in `grm_tcm_results/grm_metrics.json` to see how much of the apparent signal is graph-leak vs. real generalization.
 
 ## Tests
@@ -192,3 +198,15 @@ State sources control the discrete vocabulary used by dynamic GRM. `kmeans_obser
 Dynamic GRM now reports hard and soft self-resonance. Soft self-resonance weights each visit by RBF similarity to all state centroids, which removes the discrete stripe artifact from hard `G_ii` lookup. `subject_resonance_summary.csv` aggregates soft self-resonance per subject so it can be compared with subject-level metadata such as `hidden_subtype`.
 
 These plots are benchmark diagnostics only. They do not validate TCM, Qi, or a biological mechanism.
+
+## Subject-similarity graph mode
+
+The default static graph remains `feature_temporal_treatment`, which is the best current setting for the headline inductive prediction task. There is also an experimental architecture for the constitution question:
+
+```bash
+uv run python grm_tcm_train.py --inductive \
+    --graph-mode feature_temporal_treatment_subject \
+    --output-dir grm_tcm_results_subject_graph
+```
+
+This adds weak same-day edges between subjects whose per-subject mean observation profiles are similar. It makes stable subject-level similarity visible to the visit graph without using subject IDs as features. In current synthetic runs, this does **not** beat raw per-subject aggregation for constitution recovery, so treat it as an explicit falsification/ablation path rather than the default model.
