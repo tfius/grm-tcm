@@ -32,10 +32,29 @@ def test_artifacts_present(trained_model_dir: Path):
         "ridge_next_day.joblib",
         "logistic_flare.joblib",
         "embedding_surrogate.joblib",
+        "flare_temperature.json",
         "split_indices.json",
         "visit_index.parquet",
     ]:
         assert (trained_model_dir / name).exists(), f"Missing artifact {name}"
+
+
+def test_flare_temperature_artifact_shape(trained_model_dir: Path):
+    """flare_temperature.json must contain a positive T and the expected metadata fields."""
+
+    import json
+    payload = json.load(open(trained_model_dir / "flare_temperature.json"))
+    assert "T" in payload and payload["T"] > 0
+    assert payload.get("fit_method") == "inner_5fold_cv_on_train"
+    assert payload.get("applies_to") == "logistic_flare"
+
+
+def test_flare_temperature_loaded(trained_model_dir: Path):
+    """Loader must expose flare_temperature as a float when the artifact is present."""
+
+    model = load_static_model(trained_model_dir)
+    assert model.flare_temperature is not None
+    assert np.isfinite(model.flare_temperature) and model.flare_temperature > 0
 
 
 def test_manifest_is_static_v2(trained_model_dir: Path):

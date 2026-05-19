@@ -40,6 +40,7 @@ from grm_tcm_load import (
     load_dynamic_model,
     load_static_model,
 )
+from grm_tcm_projection import nystrom_extend_arrays, surrogate_project
 
 
 OBSERVATION_NAMES = [
@@ -76,6 +77,7 @@ def nystrom_grm_coordinates(
     """Project new visits into the persisted GRM basis via Nyström extension.
 
     Returns coordinates of shape (m, n_modes), already weighted by 1/(1 + rho^2 * lambda).
+    Thin wrapper around grm_tcm_projection.nystrom_extend_arrays.
     """
 
     if static.nn_index is None:
@@ -86,80 +88,17 @@ def nystrom_grm_coordinates(
     if static.knn_sigma is None:
         raise RuntimeError("Loaded static model is missing knn_sigma; cannot recompute RBF weights.")
 
-    psi = static.eigenvectors  # (n_train, n_modes)
-    lambdas = static.eigenvalues  # (n_modes,)
-    sigma = float(static.knn_sigma)
-    rho = float(static.rho)
-
-    # Request one extra neighbor in case the query coincides with a training row, in which
-    # case sklearn returns it at distance 0. We drop any zero-distance match because the
-    # training graph excludes self-loops (W.setdiag(0)).
-    k = min(int(n_neighbors) + 1, static.nn_index.n_samples_fit_)
-    distances, indices = static.nn_index.kneighbors(X_new_scaled, n_neighbors=k)
-    self_mask = distances <= 1e-12
-    if self_mask.any():
-        # Drop the leftmost zero-distance entry per row; keep the remaining n_neighbors.
-        keep = np.ones_like(distances, dtype=bool)
-        for i in range(distances.shape[0]):
-            zero_idx = np.where(distances[i] <= 1e-12)[0]
-            if zero_idx.size > 0:
-                keep[i, zero_idx[0]] = False
-        # Compact rows: take exactly n_neighbors entries from each row.
-        new_d = np.empty((distances.shape[0], int(n_neighbors)), dtype=distances.dtype)
-        new_i = np.empty((distances.shape[0], int(n_neighbors)), dtype=indices.dtype)
-        for i in range(distances.shape[0]):
-            mask_row = keep[i]
-            picks = np.where(mask_row)[0][: int(n_neighbors)]
-            new_d[i] = distances[i, picks]
-            new_i[i] = indices[i, picks]
-        distances, indices = new_d, new_i
-    else:
-        distances = distances[:, : int(n_neighbors)]
-        indices = indices[:, : int(n_neighbors)]
-    w = np.exp(-(distances**2) / (2.0 * sigma**2))  # (m, n_neighbors)
-
-    m = X_new_scaled.shape[0]
-    coords = np.zeros((m, psi.shape[1]), dtype=float)
-
-    if static.normalized:
-        if static.train_degrees is None:
-            raise RuntimeError(
-                "Normalized-Laplacian Nyström extension requires persisted train_degrees. "
-                "Re-run the trainer to regenerate grm_basis.npz with degrees included."
-            )
-        d_train = static.train_degrees  # (n_train,)
-        inv_sqrt_d_train = 1.0 / np.sqrt(np.maximum(d_train, 1e-12))
-        # New-point degree under feature-only edges; matches the form of the training W rows
-        # (training W is symmetric so its row sums include in/out contributions; we approximate
-        # the new-visit row by the feature-edge contribution only).
-        d_new = w.sum(axis=1)  # (m,)
-        d_new = np.maximum(d_new, 1e-12)
-        inv_sqrt_d_new = 1.0 / np.sqrt(d_new)
-        # mu_k = 1 - lambda_k is eigenvalue of normalized adjacency
-        mu = 1.0 - lambdas
-        # ψ_new[k] = (1 / mu_k) * (1 / sqrt(d_new)) * sum_i (w_i / sqrt(d_i)) * psi[i, k]
-        scaled_psi = psi * inv_sqrt_d_train.reshape(-1, 1)  # (n_train, n_modes)
-        for j in range(m):
-            row_w = w[j]
-            idx = indices[j]
-            contribution = scaled_psi[idx].T @ row_w  # (n_modes,)
-            safe_mu = np.where(np.abs(mu) > 1e-12, mu, np.sign(mu) * 1e-12 + 1e-12)
-            coords[j] = contribution * inv_sqrt_d_new[j] / safe_mu
-    else:
-        # Unnormalized: L = D - W, so L psi = lambda psi
-        # New row: d_new * psi_new - sum_i w_i psi[i] = lambda_k * psi_new
-        # => psi_new[k] = sum_i w_i psi[i,k] / (d_new - lambda_k)
-        d_new = w.sum(axis=1)
-        for j in range(m):
-            row_w = w[j]
-            idx = indices[j]
-            contribution = psi[idx].T @ row_w  # (n_modes,)
-            denom = d_new[j] - lambdas
-            denom = np.where(np.abs(denom) > 1e-9, denom, 1e-9)
-            coords[j] = contribution / denom
-
-    spectral_weights = 1.0 / (1.0 + (rho**2) * lambdas)
-    return coords * spectral_weights.reshape(1, -1)
+    return nystrom_extend_arrays(
+        X_new_scaled,
+        nn_index=static.nn_index,
+        knn_sigma=float(static.knn_sigma),
+        eigenvalues=static.eigenvalues,
+        eigenvectors=static.eigenvectors,
+        rho=float(static.rho),
+        normalized=bool(static.normalized),
+        train_degrees=static.train_degrees,
+        n_neighbors=int(n_neighbors),
+    )
 
 
 def surrogate_grm_coordinates(static: StaticGRMModel, X_new_scaled: np.ndarray) -> np.ndarray:
@@ -180,17 +119,40 @@ def surrogate_grm_coordinates(static: StaticGRMModel, X_new_scaled: np.ndarray) 
             "Loaded static model has no embedding_surrogate. The model was likely trained before "
             "static-v2 schema; retrain or use --projection nystrom."
         )
-    return np.asarray(static.embedding_surrogate.predict(X_new_scaled), dtype=float)
+    return surrogate_project(static.embedding_surrogate, X_new_scaled)
+
+
+def _sigmoid_stable(z: np.ndarray) -> np.ndarray:
+    """Numerically stable sigmoid."""
+
+    z = np.asarray(z, dtype=float)
+    out = np.empty_like(z)
+    pos = z >= 0
+    neg = ~pos
+    out[pos] = 1.0 / (1.0 + np.exp(-z[pos]))
+    ez = np.exp(z[neg])
+    out[neg] = ez / (1.0 + ez)
+    return out
 
 
 def apply_static_heads(static: StaticGRMModel, grm_coords: np.ndarray) -> Dict[str, np.ndarray]:
-    """Run the persisted ridge/logistic heads against new GRM coordinates."""
+    """Run the persisted ridge/logistic heads against new GRM coordinates.
+
+    If a fitted flare_temperature is present on the model, the calibrated flare
+    probability is also emitted as `pred_flare_prob_calibrated`. Uncalibrated is
+    kept for audit; downstream consumers should prefer the calibrated value
+    when available.
+    """
 
     out: Dict[str, np.ndarray] = {}
     if static.ridge_reg is not None:
         out["pred_next_day_score"] = static.ridge_reg.predict(grm_coords)
     if static.logistic_clf is not None:
         out["pred_flare_prob"] = static.logistic_clf.predict_proba(grm_coords)[:, 1]
+        T = static.flare_temperature
+        if T is not None and np.isfinite(T) and T > 0:
+            z = static.logistic_clf.decision_function(grm_coords)
+            out["pred_flare_prob_calibrated"] = _sigmoid_stable(z / float(T))
     return out
 
 

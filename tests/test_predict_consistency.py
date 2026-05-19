@@ -70,6 +70,13 @@ def test_predict_pipeline_end_to_end(fitted):
     assert "pred_flare_prob" in heads
     assert np.isfinite(heads["pred_next_day_score"]).all()
     assert ((heads["pred_flare_prob"] >= 0) & (heads["pred_flare_prob"] <= 1)).all()
+    # When the trainer fits flare_temperature, apply_static_heads must emit a
+    # calibrated companion probability and it must also be a valid probability.
+    if static.flare_temperature is not None:
+        assert "pred_flare_prob_calibrated" in heads
+        calibrated = heads["pred_flare_prob_calibrated"]
+        assert ((calibrated >= 0) & (calibrated <= 1)).all()
+        assert np.isfinite(calibrated).all()
     dyn_df = apply_dynamic_scores(dynamic, held.reset_index(drop=True))
     assert len(dyn_df) == len(held)
     assert {"state_id", "self_resonance", "soft_self_resonance", "top1_next_state_prob"}.issubset(dyn_df.columns)
