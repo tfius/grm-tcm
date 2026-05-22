@@ -1,16 +1,37 @@
 # GRM-TCM Synthetic Benchmark
 
-## Setup
+Graph Resonance Model experiments for longitudinal synthetic whole-body state
+data, TCM-like semantic labels, and explicit manifold-geometry controls.
 
-This project uses [uv](https://docs.astral.sh/uv/) for dependency management.
+This is a research benchmark. It does not validate TCM, Qi, or a biological
+mechanism. The project asks narrower questions:
+
+- Can graph spectral/resonance features improve future-state prediction?
+- When do GRM modes recover known synthetic latent structure?
+- Do TCM-like labels align with learned states, or do they merge/split true regimes?
+- Can a visit graph recover a known Laplace-Beltrami basis on a synthetic body-state manifold?
+
+This project was explored at [muShanghai](https://mushanghai.xyz/), a Shanghai
+builder event/program focused on AI, biotech/longevity, robotics/hardware, and
+culture.
+
+## Setup
 
 ```bash
 uv sync
 ```
 
-## Run
+Run tests:
 
-Generate the synthetic dataset, then train/evaluate the GRM model:
+```bash
+uv sync --group dev
+uv run pytest
+```
+
+## Quick Start: Regime Benchmark
+
+The default synthetic generator is the clinical/regime benchmark. It creates
+200 subjects x 120 days by default.
 
 ```bash
 uv run python grm_tcm_synthetic_generator.py
@@ -19,15 +40,7 @@ uv run python grm_tcm_diagnostics.py
 uv run python grm_tcm_dynamic_grm.py
 ```
 
-The generator default is now `200` subjects × `120` days so subset evaluations
-such as aliased pairs, hard-onset, and constitution recovery are less brittle.
-You can still override the scale explicitly:
-
-```bash
-uv run python grm_tcm_synthetic_generator.py --n-subjects 200 --n-days 120
-```
-
-It generates:
+Useful outputs:
 
 ```text
 synthetic_grm_tcm/
@@ -35,6 +48,9 @@ synthetic_grm_tcm/
   visits.csv
   latent_states.csv
   events.csv
+  true_regimes.csv
+  true_transition_matrices.csv
+  true_attractor_states.csv
   metadata.json
 
 grm_tcm_results/
@@ -42,94 +58,51 @@ grm_tcm_results/
   grm_feature_modes.csv
   grm_predictions.csv
   grm_metrics.json
+  model/
 
 grm_tcm_diagnostics/
   diagnostics_summary.json
   cluster_scores.csv
   contrarian_findings.csv
-  regime_label_mismatch.csv
-  plots/*.png
+  ontology_mismatch.csv
+  plots/
 
 grm_tcm_dynamic/
   dynamic_grm_metrics.json
-  state_source_comparison.csv
-  state_assignments.csv
   rolling_regime_scores.csv
   spectral_energy.csv
   self_resonance_scores.csv
-  subject_dynamic_scores.csv
   subject_resonance_summary.csv
-  inferred_state_true_regime_confusion.csv
   grm_transition_predictions.csv
-  subject_transition_predictions.csv
   transition_reliability.csv
+  plots/
+  model/
 ```
 
-## Manifold Geometry Benchmark
-
-The regime generator remains the clinical-state benchmark. For explicit
-geometry, use the continuous manifold generator:
+Override scale:
 
 ```bash
-uv run python grm_tcm_manifold_generator.py
-uv run python grm_tcm_train.py \
-    --input-dir synthetic_grm_tcm_manifold \
-    --output-dir grm_tcm_results_manifold
-uv run python grm_tcm_manifold_eval.py \
-    --data-dir synthetic_grm_tcm_manifold \
-    --results-dir grm_tcm_results_manifold
+uv run python grm_tcm_synthetic_generator.py --n-subjects 200 --n-days 120
 ```
 
-This writes `theta_1`, `theta_2`, torus trig coordinates, `true_lbo_mode_*`
-columns, `true_lbo_modes.csv`, and `true_lbo_eigenmodes.npz`. The evaluator
-reports how well saved GRM modes align with the analytical torus
-Laplace-Beltrami modes.
+## Static Training
 
-To run a graph-mode experiment matrix that puts prediction and geometry metrics
-in one table:
+Default static training:
 
 ```bash
-uv run python grm_tcm_experiments.py --suite manifold --generate
+uv run python grm_tcm_train.py
 ```
 
-It writes `grm_tcm_experiments/manifold_graph_mode_leaderboard.csv` with
-side-by-side predictive metrics and LBO subspace-alignment metrics for
-`feature_only`, `feature_only_diffusion`, and
-`feature_temporal_treatment`. `feature_only_diffusion` is the geometry-recovery
-training mode: observation KNN only, with density-corrected diffusion-map
-normalization controlled by `--diffusion-alpha`.
+The default graph mode is:
 
-Both the trainer and the dynamic pipeline also write a `model/` subdirectory containing the fitted preprocessor, eigenbasis, KMeans, regressors, G-matrices, and a `manifest.json` (config + git sha + input hashes + schema version). The dynamic manifest cross-references the static manifest sha, so a stale static model is rejected at load time.
-
-## Predicting on new visits
-
-After training, run `predict.py` to score new visits without retraining:
-
-```bash
-uv run python predict.py --visits NEW_VISITS.csv \
-    --static-model grm_tcm_results/model \
-    --dynamic-model grm_tcm_dynamic/model \
-    --projection surrogate \
-    --out predictions.csv
+```text
+feature_temporal_treatment
 ```
 
-Inputs must include the 12 observation columns plus `subject_id` and `day`. Outputs include `grm_mode_*` coordinates, `pred_next_day_score`, `pred_flare_prob`, and (with `--dynamic-model`) `state_id`, `self_resonance`, `soft_self_resonance`, `top1_next_state`, `top1_next_state_prob`.
+It combines observation KNN edges, same-subject temporal edges, and treatment
+context edges. This is the main prediction graph.
 
-Two projection modes are supported:
-- `--projection surrogate` (default): persisted Ridge regressor `X_obs → embeddings`. Deterministic; the recommended path for downstream prediction.
-- `--projection nystrom`: feature-only KNN extension of the spectral basis. Available when the static model used a graph_mode that includes KNN.
-
-Static `grm_mode_*` coordinates use the kernel-feature convention
-`sqrt(1 / (1 + rho^2 lambda_k)) * psi_k`, so inner products of saved
-embeddings reconstruct the truncated GRM kernel. This convention starts at
-static model schema `static-v3`; retrain older saved static models before using
-`predict.py`.
-
-Neither mode faithfully reproduces the GRM spectral embedding for new visits — those coordinates depend on multi-relational graph position (temporal + treatment + KNN edges), not on observations alone. Both modes are useful proxies for the downstream ridge/logistic heads; nothing more should be read into the `grm_mode_*` values in `predictions.csv`.
-
-## Strict inductive evaluation
-
-The default `grm_tcm_train.py` invocation is *transductive*: the visit graph and eigenbasis see every visit, then outcome metrics are reported on a within-graph train/test split — so the eigenbasis has already seen the "test" rows. To get honest held-out metrics, run:
+Strict held-out-subject evaluation:
 
 ```bash
 uv run python grm_tcm_train.py --inductive \
@@ -137,98 +110,65 @@ uv run python grm_tcm_train.py --inductive \
     --output-dir grm_tcm_results_inductive
 ```
 
-This splits subjects first (seed-controlled), fits scaler/NN-index/graph/eigenbasis/surrogate/heads on train subjects only, then projects test-subject visits via `--projection {surrogate, nystrom}` and scores them with the persisted heads. Results go to `inductive_eval_metrics.json` next to the standard CSVs; the persisted model in `model/` is the train-only fit and its `manifest.json` carries `extra.inductive: true` plus the held-out subject IDs for audit.
-
-The inductive metrics include three Pang-style controls:
-
-- `smooth_rbf_kernel_ridge` — an observation-only smooth distance-kernel baseline, analogous to testing whether EDR-like smoothness explains the signal without the full GRM graph.
-- `parsimony` — configured structural knob counts for GRM, GRM+lag, smooth kernel, raw RF, and persistence baselines.
-- `spectral_signal_concentration` — a compact mode-band summary such as how many early GRM modes carry 75% of the next-day-score, flare, or true-regime association.
-
-Compare against the transductive numbers in `grm_tcm_results/grm_metrics.json` to see how much of the apparent signal is graph-leak vs. real generalization.
-
-## Tests
+Important graph modes:
 
 ```bash
-uv sync --group dev
-uv run pytest
+# Observation KNN only.
+uv run python grm_tcm_train.py --graph-mode feature_only
+
+# Geometry-recovery mode: observation KNN with diffusion-map density correction.
+uv run python grm_tcm_train.py --graph-mode feature_only_diffusion --diffusion-alpha 1.0
+
+# Prediction default.
+uv run python grm_tcm_train.py --graph-mode feature_temporal_treatment
+
+# Experimental constitution/subject-similarity graph.
+uv run python grm_tcm_train.py --graph-mode feature_temporal_treatment_subject
 ```
 
-## Falsifiable-verdicts eval
-
-After training the static + dynamic models, run the eval pipeline to score whether the headline GRM claims survive bootstrap CIs:
-
-```bash
-uv run python grm_tcm_dynamic_eval.py \
-    --static-model-dir grm_tcm_results/model \
-    --dynamic-model-dir grm_tcm_dynamic/model
-```
-
-It writes `dynamic_eval_certificates.json` and prints a boxed summary at end-of-run, e.g.:
+Static `grm_mode_*` coordinates use the kernel-feature convention:
 
 ```text
-┌───────────────────────────────────────────┬────────┬──────────────────┬──────────┐
-│                    Test                   │   Δ    │      95% CI      │ Verdict  │
-├───────────────────────────────────────────┼────────┼──────────────────┼──────────┤
-│ T1 GRM separates aliased states (entropy) │ +0.182 │ [+0.163, +0.201] │ PASS     │
-│ T2 attractor AUC lift on aliased          │ +0.052 │ [+0.030, +0.075] │ PASS     │
-│ ...                                       │ ...    │ ...              │ ...      │
-└───────────────────────────────────────────┴────────┴──────────────────┴──────────┘
+sqrt(1 / (1 + rho^2 lambda_k)) * psi_k
 ```
 
-Row labels and order live in `grm_tcm_dynamic_eval.VERDICT_LABELS`. Verdicts present in the certificate but not in the map render under their raw key.
+so inner products of saved embeddings reconstruct the truncated GRM kernel.
+This convention starts at static model schema `static-v3`; retrain older saved
+models before using `predict.py`.
 
-To run the multi-seed difficulty/ablation sweep:
+## Static Diagnostics
+
+After static training:
 
 ```bash
-uv run python grm_tcm_experiments.py
-uv run python grm_tcm_experiments.py --state-sources kmeans_observation,kmeans_dynamic,true_regime
+uv run python grm_tcm_diagnostics.py
 ```
 
-Inspect `grm_tcm_diagnostics/diagnostics_summary.json` first for a single run, or `grm_tcm_experiments/experiment_summary.json` after a sweep.
+Useful static plots:
 
-## Plots
+- `grm_tcm_diagnostics/plots/grm_latent_correlation_heatmap.png`
+- `grm_tcm_diagnostics/plots/predicted_vs_actual_next_day_score.png`
+- `grm_tcm_diagnostics/plots/residual_histogram.png`
+- `grm_tcm_diagnostics/plots/grm_modes_scatter_hidden_subtype.png`
+- `grm_tcm_diagnostics/plots/grm_modes_scatter_true_regime.png`
+- `grm_tcm_diagnostics/plots/grm_modes_scatter_tcm_like_label.png`
+- `grm_tcm_diagnostics/plots/true_regime_distribution_by_tcm_label.png`
 
-Yes, the diagnostics scripts write plots.
+Read first:
 
-Most useful static GRM plots:
+```bash
+cat grm_tcm_diagnostics/diagnostics_summary.json
+```
 
-- `grm_tcm_diagnostics/plots/grm_latent_correlation_heatmap.png` — whether GRM modes recover the known synthetic latent variables.
-- `grm_tcm_diagnostics/plots/predicted_vs_actual_next_day_score.png` — whether outcome predictions are calibrated or just biased.
-- `grm_tcm_diagnostics/plots/residual_histogram.png` — whether prediction errors are centered or systematically skewed.
-- `grm_tcm_diagnostics/plots/grm_modes_scatter_hidden_subtype.png` — whether embeddings separate true hidden subtypes.
-- `grm_tcm_diagnostics/plots/grm_modes_scatter_true_regime.png` — whether embeddings separate the simulator's true regimes.
-- `grm_tcm_diagnostics/plots/grm_modes_scatter_tcm_like_label.png` — whether embeddings separate semantic TCM-like labels.
-- `grm_tcm_diagnostics/plots/true_regime_occupancy_by_hidden_subtype.png` — whether the generator's hidden subtype changes regime occupancy.
-- `grm_tcm_diagnostics/plots/true_regime_distribution_by_tcm_label.png` — how noisy TCM-like labels merge or split true regimes.
-- `grm_tcm_diagnostics/plots/mean_grm_modes_by_hidden_subtype.png` and `mean_grm_modes_by_tcm_like_label.png` — which modes are associated with each grouping.
+## Dynamic GRM
 
-Most useful dynamic GRM plots:
+Run dynamic state/resonance diagnostics after static training:
 
-- `grm_tcm_dynamic/plots/rolling_regime_change_score.png` — whether rolling `G^(t)` changes before flares or crashes.
-- `grm_tcm_dynamic/plots/self_resonance_vs_dysregulation.png` — whether high self-resonance `G_ii` behaves like a stuck-state / attractor score.
-- `grm_tcm_dynamic/plots/soft_self_resonance_vs_dysregulation.png` — the same attractor signal using soft visit-to-state assignment instead of hard state lookup.
-- `grm_tcm_dynamic/plots/subject_regime_change_score.png` — whether individual subject-level `G_s^(t)` changes before subject-level events.
-- `grm_tcm_dynamic/plots/subject_self_resonance_vs_dysregulation.png` — whether subject-conditioned self-resonance improves stuck-state interpretation.
-- `grm_tcm_dynamic/plots/pooled_transition_reliability.png` and `subject_transition_reliability.png` — whether GRM transition probabilities are better calibrated than Markov-only probabilities.
-- `grm_tcm_dynamic/plots/inferred_state_true_regime_confusion.png` — whether inferred state IDs separate the simulator's true regimes.
-- `grm_tcm_dynamic/plots/true_stuck_occupancy_by_hidden_subtype.png` — whether hidden subtype drives attractor occupancy as intended.
-- `grm_tcm_dynamic/plots/subject_resonance_vs_true_stuck_occupancy.png` — whether subject-level resonance tracks true stuck-regime occupancy.
-- `grm_tcm_dynamic/plots/selected_modes_over_time.png` — whether the energy-selected number of modes is stable or changes across regimes.
-- `grm_tcm_dynamic/plots/selected_modes_saturation.png` — whether selected modes are hitting the `max_modes` cap.
-- `grm_tcm_dynamic/plots/cumulative_spectral_energy.png` — whether the spectrum changes across rolling windows even when selected mode count is flat.
-- `grm_tcm_dynamic/plots/mean_cumulative_spectral_energy.png` — average energy captured by each mode rank.
-- `grm_tcm_dynamic/plots/state_source_metric_comparison.png` — whether observation states, dynamic-feature states, or oracle true-regime states explain the gap.
+```bash
+uv run python grm_tcm_dynamic_grm.py
+```
 
-The most meaningful visual comparison is:
-
-1. Check `grm_latent_correlation_heatmap.png` for latent recovery.
-2. Compare hidden-subtype vs TCM-label scatter plots to see whether GRM follows true hidden structure or semantic labels.
-3. Check `rolling_regime_change_score.png` and `self_resonance_vs_dysregulation.png` to see whether the dynamic propagator adds signal beyond static embeddings.
-
-If `selected_modes_over_time.png` is flat, inspect `selected_modes_saturation.png` and `cumulative_spectral_energy.png`. A flat selected-mode line often means the 95% energy rule is hitting `--max-modes`, not that the spectrum is truly constant.
-
-Useful dynamic GRM options:
+Useful options:
 
 ```bash
 uv run python grm_tcm_dynamic_grm.py --similarity-mode knn --state-similarity-k 3
@@ -239,22 +179,199 @@ uv run python grm_tcm_dynamic_grm.py --state-source true_regime
 uv run python grm_tcm_dynamic_grm.py --compare-state-sources
 ```
 
-The first two sharpen the state graph when the Laplacian spectrum is too flat. `--state-fit-end-day` fits state centroids only on early visits and assigns later visits into that fixed state space, which is closer to an out-of-sample diagnostic.
+State sources:
 
-State sources control the discrete vocabulary used by dynamic GRM. `kmeans_observation` tests visible observation clusters, `kmeans_dynamic` adds short trajectory features to reduce aliasing, and `true_regime` is an oracle ceiling for the synthetic benchmark. `--compare-state-sources` writes `state_source_comparison.csv` and a comparison plot.
+- `kmeans_observation` tests visible observation clusters.
+- `kmeans_dynamic` adds short trajectory features to reduce aliasing.
+- `true_regime` is an oracle ceiling for the synthetic benchmark.
 
-Dynamic GRM now reports hard and soft self-resonance. Soft self-resonance weights each visit by RBF similarity to all state centroids, which removes the discrete stripe artifact from hard `G_ii` lookup. `subject_resonance_summary.csv` aggregates soft self-resonance per subject so it can be compared with subject-level metadata such as `hidden_subtype`.
+Useful dynamic plots:
 
-These plots are benchmark diagnostics only. They do not validate TCM, Qi, or a biological mechanism.
+- `grm_tcm_dynamic/plots/rolling_regime_change_score.png`
+- `grm_tcm_dynamic/plots/self_resonance_vs_dysregulation.png`
+- `grm_tcm_dynamic/plots/soft_self_resonance_vs_dysregulation.png`
+- `grm_tcm_dynamic/plots/pooled_transition_reliability.png`
+- `grm_tcm_dynamic/plots/inferred_state_true_regime_confusion.png`
+- `grm_tcm_dynamic/plots/subject_resonance_vs_true_stuck_occupancy.png`
+- `grm_tcm_dynamic/plots/cumulative_spectral_energy.png`
+- `grm_tcm_dynamic/plots/state_source_metric_comparison.png`
 
-## Subject-similarity graph mode
+## Falsifiable Dynamic Eval
 
-The default static graph remains `feature_temporal_treatment`, which is the best current setting for the headline inductive prediction task. There is also an experimental architecture for the constitution question:
+After static + dynamic models exist:
 
 ```bash
-uv run python grm_tcm_train.py --inductive \
-    --graph-mode feature_temporal_treatment_subject \
-    --output-dir grm_tcm_results_subject_graph
+uv run python grm_tcm_dynamic_eval.py \
+    --static-model-dir grm_tcm_results/model \
+    --dynamic-model-dir grm_tcm_dynamic/model
 ```
 
-This adds weak same-day edges between subjects whose per-subject mean observation profiles are similar. It makes stable subject-level similarity visible to the visit graph without using subject IDs as features. In current synthetic runs, this does **not** beat raw per-subject aggregation for constitution recovery, so treat it as an explicit falsification/ablation path rather than the default model.
+This writes:
+
+```text
+grm_tcm_dynamic_eval/dynamic_eval_certificates.json
+grm_tcm_dynamic_eval/transition_metrics.csv
+grm_tcm_dynamic_eval/aliased_state_analysis.csv
+grm_tcm_dynamic_eval/ablation_metrics.csv
+grm_tcm_dynamic_eval/plots/
+```
+
+Run only selected scopes:
+
+```bash
+uv run python grm_tcm_dynamic_eval.py --scope transitions,aliased,ablations
+uv run python grm_tcm_dynamic_eval.py --scope plots
+```
+
+The eval uses bootstrap confidence intervals and explicit controls such as
+random embeddings, shuffled time, raw observations, and Markov baselines.
+
+## Manifold Geometry Benchmark
+
+The regime generator tests clinical-state prediction. The manifold generator
+tests whether GRM recovers a known geometry.
+
+Generate the manifold data:
+
+```bash
+uv run python grm_tcm_manifold_generator.py
+```
+
+It writes:
+
+```text
+synthetic_grm_tcm_manifold/
+  subjects.csv
+  visits.csv
+  latent_states.csv
+  events.csv
+  true_lbo_modes.csv
+  true_lbo_eigenmodes.npz
+  metadata.json
+```
+
+The synthetic ground truth is a 2D torus. The true Laplace-Beltrami modes are
+analytical Fourier/LBO modes saved as `true_lbo_mode_*` columns and in
+`true_lbo_eigenmodes.npz`.
+
+Train static GRM on manifold data:
+
+```bash
+uv run python grm_tcm_train.py \
+    --input-dir synthetic_grm_tcm_manifold \
+    --output-dir grm_tcm_results_manifold
+```
+
+Evaluate geometry recovery:
+
+```bash
+uv run python grm_tcm_manifold_eval.py \
+    --data-dir synthetic_grm_tcm_manifold \
+    --results-dir grm_tcm_results_manifold
+```
+
+The evaluator compares:
+
+- `oracle_torus_diffusion`: graph built from true torus coordinates.
+- `observation_diffusion`: graph built from observed channels only.
+- `saved_static_grm`: embeddings from `grm_tcm_train.py`.
+
+It scores eigenspaces, not only individual modes, because the torus has
+degenerate eigenvalues and eigenvectors can rotate within a true eigenspace.
+
+## Experiment Matrix
+
+Run the manifold graph-mode experiment matrix:
+
+```bash
+uv run python grm_tcm_experiments.py --suite manifold --generate
+```
+
+This trains and evaluates:
+
+```text
+feature_only
+feature_only_diffusion
+feature_temporal_treatment
+```
+
+Output:
+
+```text
+grm_tcm_experiments/manifold_graph_mode_leaderboard.csv
+```
+
+The leaderboard puts prediction and geometry metrics side by side:
+
+```text
+next_day_grm_plus_lag_r2
+flare_grm_plus_lag_auc
+constitution_grm_mean_r2
+saved_grm_lbo_mean_best_abs_corr
+saved_grm_lbo_largest_subspace_mean_cos2
+oracle_lbo_largest_subspace_mean_cos2
+observation_lbo_largest_subspace_mean_cos2
+```
+
+Interpretation:
+
+- `feature_temporal_treatment` is usually the prediction graph.
+- `feature_only_diffusion` is the geometry-recovery graph.
+- `oracle_torus_diffusion` is an upper-bound geometry control, not deployable.
+
+## Prediction on New Visits
+
+After static training, score new visits:
+
+```bash
+uv run python predict.py --visits NEW_VISITS.csv \
+    --static-model grm_tcm_results/model \
+    --dynamic-model grm_tcm_dynamic/model \
+    --projection surrogate \
+    --out predictions.csv
+```
+
+Inputs must include:
+
+```text
+subject_id
+day
+sleep_quality
+hrv
+resting_hr
+body_temp
+fatigue
+pain
+appetite
+bowel_quality
+mood_calm
+energy
+heaviness
+cold_hot
+```
+
+Projection modes:
+
+- `--projection surrogate`: persisted Ridge regressor from observations to saved embeddings.
+- `--projection nystrom`: feature-only KNN/RBF extension of the spectral basis.
+
+Neither projection perfectly reconstructs graph position for new visits when
+the training graph used temporal/treatment edges. Treat projected `grm_mode_*`
+as coordinates for the saved prediction heads, not as proof of exact graph
+placement.
+
+## Current Interpretation
+
+The benchmark now separates two claims:
+
+```text
+Prediction claim:
+  GRM features can improve future-state prediction over simple baselines.
+
+Geometry claim:
+  GRM graph modes recover a known Laplace-Beltrami basis.
+```
+
+These do not always move together. Temporal/treatment edges can help prediction
+while making the operator less like a pure manifold Laplacian. The manifold
+benchmark and experiment matrix are designed to expose that tradeoff directly.

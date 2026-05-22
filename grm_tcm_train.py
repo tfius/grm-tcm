@@ -174,6 +174,7 @@ class GRMTCMTrainer:
         self.knn_sigma: Optional[float] = None
         self.eigenvalues: Optional[np.ndarray] = None
         self.eigenvectors: Optional[np.ndarray] = None
+        self.eigenvalues_full: Optional[np.ndarray] = None
         self.train_degrees: Optional[np.ndarray] = None
         self.feature_names: Optional[List[str]] = None
         self.ridge_reg: Optional[BaseEstimator] = None
@@ -1055,10 +1056,15 @@ class GRMTCMTrainer:
         else:
             L = sparse.diags(degrees) - W
 
-        k = min(self.cfg.n_modes + 1, n - 2)
+        # Compute extra eigenvalues beyond n_modes so the diagnostic spectrum
+        # plot can show tail behavior past the retained cutoff. The extra
+        # eigenvalues are persisted but not used to construct embeddings.
+        extra_modes = 24
+        k = min(self.cfg.n_modes + extra_modes + 1, n - 2)
         eigenvalues, eigenvectors = eigsh(L, k=k, which="SM")
         order = np.argsort(eigenvalues)
         eigenvalues, eigenvectors = eigenvalues[order], eigenvectors[:, order]
+        self.eigenvalues_full = eigenvalues[1:].copy()
         return eigenvalues[1:self.cfg.n_modes + 1], eigenvectors[:, 1:self.cfg.n_modes + 1]
 
     def _make_grm_embeddings(self, eigenvalues: np.ndarray, eigenvectors: np.ndarray) -> np.ndarray:
@@ -1847,6 +1853,8 @@ class GRMTCMTrainer:
         )
         if self.train_degrees is not None:
             basis_arrays["train_degrees"] = self.train_degrees
+        if self.eigenvalues_full is not None:
+            basis_arrays["eigenvalues_full"] = self.eigenvalues_full
         np.savez_compressed(model_dir / "grm_basis.npz", **basis_arrays)
 
         if self.nn_index is not None:

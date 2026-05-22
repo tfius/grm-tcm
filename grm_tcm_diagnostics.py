@@ -637,7 +637,12 @@ def save_eigen_spectrum(results_dir: Path, plot_dir: Path) -> None:
         print(f"[skip] {basis_path}")
         return
     data = np.load(basis_path)
-    eigenvalues = data["eigenvalues"].astype(float)
+    # Prefer eigenvalues_full (computed past the cutoff) when available so the
+    # plot can show tail behavior; otherwise fall back to the retained set.
+    if "eigenvalues_full" in data.files:
+        eigenvalues = data["eigenvalues_full"].astype(float)
+    else:
+        eigenvalues = data["eigenvalues"].astype(float)
     if eigenvalues.size == 0:
         return
     n_modes = int(data["n_modes"]) if "n_modes" in data.files else len(eigenvalues)
