@@ -1,9 +1,0 @@
-finding_type,label,hidden_subtype,n_categories,n_rows,entropy,normalized_entropy,detail
-label_contains_multiple_hidden_subtypes,mixed_pattern_like,,3,3367,1.5765744249049958,0.9947077133923713,"{""0"": 954, ""1"": 1218, ""2"": 1195}"
-label_contains_multiple_hidden_subtypes,spleen_qi_deficiency_like,,3,390,1.5721747302538347,0.9919318151303246,"{""0"": 108, ""1"": 132, ""2"": 150}"
-label_contains_multiple_hidden_subtypes,yin_deficiency_like,,3,88,1.5568007830668502,0.9822319344202198,"{""0"": 22, ""1"": 36, ""2"": 30}"
-label_contains_multiple_hidden_subtypes,damp_heat_like,,3,373,1.5556965890811565,0.981535265580931,"{""0"": 102, ""1"": 111, ""2"": 160}"
-label_contains_multiple_hidden_subtypes,liver_qi_stagnation_like,,3,582,1.5441901018495852,0.9742754804274426,"{""0"": 134, ""1"": 243, ""2"": 205}"
-hidden_subtype_split_across_labels,,2,5,1740,1.4582213919138927,0.6280217699784677,"{""damp_heat_like"": 160, ""liver_qi_stagnation_like"": 205, ""mixed_pattern_like"": 1195, ""spleen_qi_deficiency_like"": 150, ""yin_deficiency_like"": 30}"
-hidden_subtype_split_across_labels,,1,5,1740,1.408118489380793,0.6064436243660256,"{""damp_heat_like"": 111, ""liver_qi_stagnation_like"": 243, ""mixed_pattern_like"": 1218, ""spleen_qi_deficiency_like"": 132, ""yin_deficiency_like"": 36}"
-hidden_subtype_split_across_labels,,0,5,1320,1.3529712693402347,0.5826930094516419,"{""damp_heat_like"": 102, ""liver_qi_stagnation_like"": 134, ""mixed_pattern_like"": 954, ""spleen_qi_deficiency_like"": 108, ""yin_deficiency_like"": 22}"

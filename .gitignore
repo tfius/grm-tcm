@@ -11,3 +11,9 @@ __pycache__/
 /grm_tcm_manifold_eval/
 /grm_tcm_experiments/
 /grm_tcm_dynamic/
+
+# Generated diagnostic / eval tables — keep PNG plots tracked, ignore data
+/grm_tcm_diagnostics/*.csv
+/grm_tcm_diagnostics/*.json
+/grm_tcm_dynamic_eval/*.csv
+/grm_tcm_dynamic_eval/*.json
