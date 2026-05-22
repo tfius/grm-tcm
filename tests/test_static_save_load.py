@@ -60,7 +60,8 @@ def test_flare_temperature_loaded(trained_model_dir: Path):
 def test_manifest_is_static_v2(trained_model_dir: Path):
     import json
     m = json.load(open(trained_model_dir / "manifest.json"))
-    assert m["schema_version"] == "static-v2"
+    assert m["schema_version"] == "static-v3"
+    assert m["extra"]["embedding_convention"] == "sqrt_grm_kernel_feature"
 
 
 def test_load_static_round_trip(trained_model_dir: Path):

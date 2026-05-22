@@ -110,7 +110,7 @@ def test_surrogate_projection_produces_finite_predictions(fitted):
 
 def test_surrogate_raises_when_absent(tmp_path):
     """Loading a (manually constructed) static-v1 model should leave surrogate=None
-    and surrogate_grm_coordinates should raise a clear error."""
+    and surrogate_grm_coordinates should reject the stale coordinate convention."""
 
     static_dir, _ = _fresh_v1_model(tmp_path)
     static = load_static_model(static_dir)
@@ -118,7 +118,7 @@ def test_surrogate_raises_when_absent(tmp_path):
     feats = static.feature_names or list(OBSERVATION_NAMES)
     X = np.zeros((3, len(feats)))
     X = static.obs_preprocessor.transform(X)
-    with pytest.raises(RuntimeError, match="embedding_surrogate"):
+    with pytest.raises(RuntimeError, match="static-v3"):
         surrogate_grm_coordinates(static, X)
 
 

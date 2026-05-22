@@ -103,7 +103,15 @@ EXPECTED_STEMS = {
     "transition_reliability",
     "subject_fingerprint_macro_f1",
     "aliased_visits_scatter",
+    "aliased_mode_pair_grid",
+    "aliased_per_mode_histograms",
+    "aliased_nn_entropy_heatmap",
+    "verdicts_forest",
     "ablation_attractor_auc",
+    # Phase 1 headline plots
+    "transductive_vs_inductive_metrics",
+    "flare_calibration_raw_vs_temperature",
+    "per_subject_performance",
 }
 
 
