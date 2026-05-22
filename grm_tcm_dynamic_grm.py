@@ -459,6 +459,9 @@ def spectral_grm(W: np.ndarray, r_s: float, cfg: DynamicGRMConfig) -> Tuple[np.n
     lambdas = eigenvalues[idx]
     psi = canonicalize_eigvec_signs(eigenvectors[:, idx])
     weights = 1.0 / (1.0 + (r_s**2) * lambdas)
+    # Entrywise: G_ij = sum_m psi_m(i) psi_m(j) / (1 + r_s^2 lambda_m).
+    # Do not compute (psi * weights) @ (psi * weights).T; that would square
+    # the GRM spectral filter.
     G = (psi * weights.reshape(1, -1)) @ psi.T
     return G, lambdas, psi, selected, cumulative_energy
 

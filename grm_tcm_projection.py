@@ -54,7 +54,9 @@ def nystrom_extend_arrays(
 ) -> np.ndarray:
     """Project new (already obs_preprocessor-transformed) rows into GRM coordinates.
 
-    Returns (m, n_modes), already weighted by 1/(1 + rho^2 * lambda_k).
+    Returns (m, n_modes), already weighted by sqrt(1/(1 + rho^2 * lambda_k)).
+    With this convention, coordinate inner products approximate the GRM kernel
+    G_ij = sum_k psi_k(i) psi_k(j) / (1 + rho^2 lambda_k).
 
     This is a feature-only Nyström approximation: it reconstructs the new visit's
     KNN+RBF row of W but cannot replay the temporal/treatment edges that the
@@ -103,7 +105,7 @@ def nystrom_extend_arrays(
             denom = np.where(np.abs(denom) > 1e-9, denom, 1e-9)
             coords[j] = contribution / denom
 
-    spectral_weights = 1.0 / (1.0 + (float(rho) ** 2) * lambdas)
+    spectral_weights = 1.0 / np.sqrt(1.0 + (float(rho) ** 2) * lambdas)
     return coords * spectral_weights.reshape(1, -1)
 
 

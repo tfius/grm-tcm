@@ -49,7 +49,7 @@ from grm_tcm_persistence import (
 from grm_tcm_projection import nystrom_extend_arrays, surrogate_project
 
 
-STATIC_SCHEMA_VERSION = "static-v2"
+STATIC_SCHEMA_VERSION = "static-v3"
 
 
 def _sigmoid(z: np.ndarray) -> np.ndarray:
@@ -156,6 +156,10 @@ class GRMTrainConfig:
     inductive: bool = False
     projection: str = "surrogate"
     n_neighbors_inductive: int = 12
+    # Where to look for the matching transductive metrics when generating the
+    # transductive-vs-inductive comparison plot in inductive mode. Default
+    # assumes the standard layout: sibling `grm_tcm_results/` dir.
+    transductive_results_dir: str = "grm_tcm_results"
 
 
 class GRMTCMTrainer:
@@ -333,6 +337,42 @@ class GRMTCMTrainer:
                 grm_hard = hard.get("grm_plus_lag_logistic") or hard.get("grm_logistic")
                 if grm_hard and best_hard:
                     print(_delta_row(grm_hard, best_hard, cls_metrics, invert=[False, True, True]))
+
+        aliased = metrics.get("aliased_subset_evaluation", {}) or {}
+        if aliased and aliased.get("n_eligible", 0) >= 10:
+            n_a = aliased.get("n_eligible")
+            print(f"\n  ALIASED-PAIR SUBSET (today's obs alias across regimes; futures diverge)")
+            print(f"  eligible test rows: {n_a}")
+            a_reg = aliased.get("regression", {})
+            if a_reg:
+                print(f"  REGRESSION (target=next_day_score, aliased subset)")
+                print(f"  {'predictor':<32} {'R^2':>7}  {'RMSE':>7}  {'MAE':>7}")
+                print(f"  {'-' * 32} {'-' * 7}  {'-' * 7}  {'-' * 7}")
+                for k in ["grm_plus_lag_ridge", "raw_random_forest", "naive_current_score", "persistence_yesterday_score"]:
+                    if k in a_reg and a_reg[k]:
+                        print(_row(k, a_reg[k], reg_metrics))
+                best_a = _best_baseline(
+                    a_reg, ["raw_random_forest", "naive_current_score", "persistence_yesterday_score"],
+                    "r2", higher_is_better=True,
+                )
+                grm_a = a_reg.get("grm_plus_lag_ridge")
+                if grm_a and best_a:
+                    print(_delta_row(grm_a, best_a, reg_metrics, invert=[False, True, True]))
+            a_cls = aliased.get("classification", {})
+            if a_cls:
+                print(f"  CLASSIFICATION (target=flare_next_day, aliased subset)")
+                print(f"  {'predictor':<32} {'AUC':>7}  {'Brier':>7}  {'LogLs':>7}")
+                print(f"  {'-' * 32} {'-' * 7}  {'-' * 7}  {'-' * 7}")
+                for k in ["grm_plus_lag_logistic", "raw_random_forest", "naive_current_score", "persistence_yesterday_flare"]:
+                    if k in a_cls and a_cls[k]:
+                        print(_row(k, a_cls[k], cls_metrics))
+                best_ac = _best_baseline(
+                    a_cls, ["raw_random_forest", "naive_current_score", "persistence_yesterday_flare"],
+                    "roc_auc", higher_is_better=True,
+                )
+                grm_ac = a_cls.get("grm_plus_lag_logistic")
+                if grm_ac and best_ac:
+                    print(_delta_row(grm_ac, best_ac, cls_metrics, invert=[False, True, True]))
 
         const = metrics.get("constitution_recovery", {})
         if const and const.get("axes"):
@@ -611,6 +651,13 @@ class GRMTCMTrainer:
                 ),
             },
             "flare_onset_classification": onset_block,
+            "aliased_subset_evaluation": self._evaluate_aliased_subset(
+                test_visits, y_reg_test, y_cls_test,
+                pred_grm_lag_reg, prob_grm_lag_cls,
+                pred_raw_reg, prob_raw_cls,
+                pred_naive_reg, prob_naive_cls,
+                persistence,
+            ),
             "constitution_recovery": self._evaluate_constitution_recovery(
                 train_visits, train_embeddings, test_visits, test_embeddings,
             ),
@@ -668,6 +715,7 @@ class GRMTCMTrainer:
             "test_subjects": sorted(test_subjects),
         }
         self._save_model(manifest_extra=manifest_extra)
+        self._write_inductive_plots(metrics, pred_df)
         return metrics
 
     def _latent_recovery_inductive(
@@ -995,7 +1043,13 @@ class GRMTCMTrainer:
         return eigenvalues[1:self.cfg.n_modes + 1], eigenvectors[:, 1:self.cfg.n_modes + 1]
 
     def _make_grm_embeddings(self, eigenvalues: np.ndarray, eigenvectors: np.ndarray) -> np.ndarray:
-        weights = 1.0 / (1.0 + (self.cfg.rho ** 2) * eigenvalues)
+        # Diffusion-map convention: emb[i, m] = sqrt(g(lambda_m)) * psi_m(i), where
+        # g(lambda) = 1 / (1 + rho^2 * lambda) is the GRM filter. Inner products of
+        # embeddings then literally reconstruct the GRM kernel:
+        #     <emb_i, emb_j> = sum_m g(lambda_m) psi_m(i) psi_m(j) = G_ij
+        # which is the propagator from grm_tcm_dynamic_grm.spectral_grm. The previous
+        # weight-without-sqrt convention double-counted g under embedding inner products.
+        weights = 1.0 / np.sqrt(1.0 + (self.cfg.rho ** 2) * eigenvalues)
         return eigenvectors * weights.reshape(1, -1)
 
     def _make_embeddings_df(self, visits: pd.DataFrame, embeddings: np.ndarray) -> pd.DataFrame:
@@ -1088,6 +1142,13 @@ class GRMTCMTrainer:
                 ),
             },
             "flare_onset_classification": onset_block,
+            "aliased_subset_evaluation": self._evaluate_aliased_subset(
+                visits.iloc[test_idx], y_reg[test_idx], y_cls[test_idx],
+                pred_grm_lag_reg, prob_grm_lag_cls,
+                pred_raw_reg, prob_raw_cls,
+                pred_naive_reg, prob_naive_cls,
+                persistence,
+            ),
             "constitution_recovery": self._evaluate_constitution_recovery(
                 visits.iloc[train_idx], embeddings[train_idx],
                 visits.iloc[test_idx], embeddings[test_idx],
@@ -1387,6 +1448,65 @@ class GRMTCMTrainer:
         out["brier"] = float(np.mean((y_prob_safe - y_true) ** 2))
         return out
 
+    def _evaluate_aliased_subset(
+        self,
+        test_visits: pd.DataFrame,
+        y_reg_test: np.ndarray, y_cls_test: np.ndarray,
+        pred_grm_lag_reg: np.ndarray, prob_grm_lag_cls: np.ndarray,
+        pred_raw_reg: np.ndarray, prob_raw_cls: np.ndarray,
+        pred_naive_reg: np.ndarray, prob_naive_cls: np.ndarray,
+        persistence: Dict[str, np.ndarray],
+    ) -> Dict[str, Any]:
+        """Score predictions on the aliased-pair subset only.
+
+        Aliased-pair rows: today's observations sit in an alias group with 2+
+        regimes (e.g., stressed_recoverable vs stuck_agitated both look "wired"),
+        but next-regime distributions diverge sharply. With constitution_dynamics
+        enabled, the divergence is subject-conditional: K determines which member
+        of the aliased pair you are in. Methods that exploit graph position
+        (regime trajectory) should hold up; pure-obs and lag-only baselines lose
+        the most ground here.
+        """
+
+        if "is_aliased_pair_row" not in test_visits.columns:
+            return {}
+        mask = (test_visits["is_aliased_pair_row"].to_numpy() == 1)
+        if mask.sum() < 10:
+            return {}
+
+        out: Dict[str, Any] = {
+            "n_eligible": int(mask.sum()),
+            "regression": {
+                "grm_plus_lag_ridge": self._reg_metrics(y_reg_test[mask], pred_grm_lag_reg[mask]),
+                "raw_random_forest": self._reg_metrics(y_reg_test[mask], pred_raw_reg[mask]),
+                "naive_current_score": self._reg_metrics(y_reg_test[mask], pred_naive_reg[mask]),
+                "persistence_yesterday_score": self._reg_metrics(y_reg_test[mask], persistence["score_pred"][mask]),
+            },
+            "note": (
+                "Aliased-pair subset (observations alias across regimes, futures diverge). "
+                "Graph-position-aware methods should beat pure-obs and lag-only here when "
+                "constitution_dynamics_strength > 0."
+            ),
+        }
+        if len(np.unique(y_cls_test[mask])) >= 2:
+            out["classification"] = {
+                "grm_plus_lag_logistic": self._cls_metrics(
+                    y_cls_test[mask], (prob_grm_lag_cls[mask] >= 0.5).astype(int), prob_grm_lag_cls[mask]
+                ),
+                "raw_random_forest": self._cls_metrics(
+                    y_cls_test[mask], (prob_raw_cls[mask] >= 0.5).astype(int), prob_raw_cls[mask]
+                ),
+                "naive_current_score": self._cls_metrics(
+                    y_cls_test[mask], (prob_naive_cls[mask] >= 0.5).astype(int), prob_naive_cls[mask]
+                ),
+                "persistence_yesterday_flare": self._cls_metrics(
+                    y_cls_test[mask],
+                    np.asarray(persistence["flare_pred"])[mask],
+                    np.asarray(persistence["flare_prob"])[mask],
+                ),
+            }
+        return out
+
     def _evaluate_constitution_recovery(
         self,
         train_visits: pd.DataFrame, train_embeddings: np.ndarray,
@@ -1532,7 +1652,9 @@ class GRMTCMTrainer:
         order = np.argsort(eigenvalues)
         eigenvalues = eigenvalues[order][1:self.cfg.n_modes + 1]
         eigenvectors = canonicalize_eigvec_signs(eigenvectors[:, order][:, 1:self.cfg.n_modes + 1])
-        weights = 1.0 / (1.0 + (self.cfg.rho ** 2) * eigenvalues)
+        # Diffusion-map convention (matches _make_grm_embeddings): sqrt-weighted
+        # so embedding inner products literally reconstruct the GRM kernel.
+        weights = 1.0 / np.sqrt(1.0 + (self.cfg.rho ** 2) * eigenvalues)
         train_features = eigenvectors * weights.reshape(1, -1)
 
         test_features = nystrom_extend_arrays(
@@ -1750,6 +1872,7 @@ class GRMTCMTrainer:
             self._visit_index.to_parquet(model_dir / "visit_index.parquet", index=False)
 
         manifest_extra_full = dict(manifest_extra or {})
+        manifest_extra_full["embedding_convention"] = "sqrt_grm_kernel_feature"
         if self.feature_names is not None:
             manifest_extra_full["feature_names"] = list(self.feature_names)
         write_manifest(
@@ -1764,6 +1887,223 @@ class GRMTCMTrainer:
             random_seed=self.cfg.random_seed,
             extra=manifest_extra_full,
         )
+
+    def _write_inductive_plots(self, metrics: Dict[str, Any], pred_df: pd.DataFrame) -> None:
+        """Write the Phase 1 headline plots for an inductive run.
+
+        Three plots are produced; each is optional and skipped (with a clear print)
+        when its prerequisite is missing:
+          - transductive_vs_inductive_metrics: needs the sibling transductive
+            grm_metrics.json. Path is read from cfg.transductive_results_dir.
+          - flare_calibration_raw_vs_temperature: needs both raw and calibrated
+            flare probabilities in pred_df.
+          - per_subject_performance: needs flare_next_day + next_day_score in pred_df.
+        """
+
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+
+        from grm_tcm_plot_captions import save_with_caption
+
+        plot_dir = self.output_dir / "plots"
+        plot_dir.mkdir(parents=True, exist_ok=True)
+
+        # ----- Plot 1: transductive vs inductive metrics -----
+        transductive_path = Path(self.cfg.transductive_results_dir) / "grm_metrics.json"
+        if transductive_path.exists():
+            with open(transductive_path, "r", encoding="utf-8") as f:
+                tmetrics = json.load(f)
+            try:
+                self._plot_transductive_vs_inductive(tmetrics, metrics, plot_dir, save_with_caption, plt)
+            except Exception as exc:  # plot_dir is recoverable; don't blow up the run
+                print(f"[plot] skipped transductive_vs_inductive_metrics: {exc}")
+        else:
+            print(
+                f"[plot] transductive metrics not found at {transductive_path}; "
+                f"skipping transductive_vs_inductive_metrics plot."
+            )
+
+        # ----- Plot 3: flare calibration raw vs temperature -----
+        has_raw = "pred_grm_flare_prob" in pred_df.columns
+        has_cal = "pred_grm_flare_prob_calibrated" in pred_df.columns
+        target_cls = self.cfg.target_classification
+        if has_raw and has_cal and target_cls in pred_df.columns:
+            try:
+                self._plot_flare_calibration(pred_df, plot_dir, save_with_caption, plt)
+            except Exception as exc:
+                print(f"[plot] skipped flare_calibration_raw_vs_temperature: {exc}")
+        else:
+            print("[plot] flare calibration columns missing; skipping calibration plot.")
+
+        # ----- Plot 4: per-subject performance -----
+        try:
+            self._plot_per_subject_performance(pred_df, plot_dir, save_with_caption, plt)
+        except Exception as exc:
+            print(f"[plot] skipped per_subject_performance: {exc}")
+
+    @staticmethod
+    def _plot_transductive_vs_inductive(
+        tmetrics: Dict[str, Any],
+        imetrics: Dict[str, Any],
+        plot_dir: Path,
+        save_with_caption,
+        plt,
+    ) -> None:
+        """Grouped bar chart: 7 metrics, paired transductive vs inductive."""
+
+        def safe_get(d: Dict[str, Any], path: List[str], default: float = float("nan")) -> float:
+            cur = d
+            for key in path:
+                if not isinstance(cur, dict) or key not in cur:
+                    return default
+                cur = cur[key]
+            try:
+                return float(cur)
+            except (TypeError, ValueError):
+                return default
+
+        metric_specs: List[Tuple[str, List[str], List[str]]] = [
+            ("R² GRM-ridge",        ["regression", "grm_ridge", "r2"],                                ["regression", "grm_ridge", "r2"]),
+            ("R² raw-RF",           ["regression", "raw_random_forest", "r2"],                        ["regression", "raw_random_forest", "r2"]),
+            ("R² naive",            ["regression", "naive_current_score", "r2"],                      ["regression", "naive_current_score", "r2"]),
+            ("AUC GRM-logistic",    ["classification", "grm_logistic", "roc_auc"],                    ["classification", "grm_logistic", "roc_auc"]),
+            ("AUC raw-RF",          ["classification", "raw_random_forest", "roc_auc"],               ["classification", "raw_random_forest", "roc_auc"]),
+            ("AUC naive",           ["classification", "naive_current_score", "roc_auc"],             ["classification", "naive_current_score", "roc_auc"]),
+            ("Latent recovery",     ["latent_recovery", "mean_abs_aligned_correlation"],              ["latent_recovery", "out_of_sample_test", "mean_abs_aligned_correlation"]),
+        ]
+
+        labels = [m[0] for m in metric_specs]
+        t_vals = np.array([safe_get(tmetrics, m[1]) for m in metric_specs], dtype=float)
+        i_vals = np.array([safe_get(imetrics, m[2]) for m in metric_specs], dtype=float)
+
+        x = np.arange(len(labels))
+        width = 0.38
+        fig, ax = plt.subplots(figsize=(12, 5))
+        ax.bar(x - width / 2, t_vals, width, label="transductive", color="#4C78A8")
+        ax.bar(x + width / 2, i_vals, width, label="inductive", color="#F58518")
+        ax.axhline(0.0, color="black", linewidth=0.8, linestyle="--")
+        for xi, t, i in zip(x, t_vals, i_vals):
+            if np.isfinite(t) and np.isfinite(i):
+                delta = i - t
+                top = max(t, i, 0.0)
+                ax.text(xi, top + 0.02, f"Δ={delta:+.3f}", ha="center", va="bottom", fontsize=8)
+        ax.set_xticks(x)
+        ax.set_xticklabels(labels, rotation=15, ha="right", fontsize=9)
+        ax.set_ylabel("Metric value")
+        ax.set_title("Transductive vs strict inductive evaluation (same dataset, seed-controlled)")
+        ax.legend(loc="best", fontsize=9)
+        ax.grid(axis="y", linestyle=":", alpha=0.5)
+        fig.tight_layout()
+        save_with_caption(fig, plot_dir / "transductive_vs_inductive_metrics.png", dpi=160)
+
+    @staticmethod
+    def _plot_flare_calibration(
+        pred_df: pd.DataFrame, plot_dir: Path, save_with_caption, plt, n_bins: int = 10
+    ) -> None:
+        """Two reliability diagrams: raw vs temperature-calibrated flare probability."""
+
+        y_true = pred_df["flare_next_day"].astype(int).to_numpy()
+        raw = pred_df["pred_grm_flare_prob"].astype(float).to_numpy()
+        cal = pred_df["pred_grm_flare_prob_calibrated"].astype(float).to_numpy()
+        mask = np.isfinite(raw) & np.isfinite(cal) & np.isfinite(y_true)
+        y_true = y_true[mask]
+        raw = np.clip(raw[mask], 0.0, 1.0)
+        cal = np.clip(cal[mask], 0.0, 1.0)
+        if y_true.size < 20:
+            raise RuntimeError("not enough finite predictions for reliability diagram")
+
+        def _reliability(probs: np.ndarray) -> Tuple[List[float], List[float], List[int], float]:
+            bins = np.linspace(0.0, 1.0, n_bins + 1)
+            mean_p, emp, ns = [], [], []
+            ece = 0.0
+            for lo, hi in zip(bins[:-1], bins[1:]):
+                m = (probs >= lo) & (probs < hi if hi < 1.0 else probs <= hi)
+                if not m.any():
+                    continue
+                mp = float(probs[m].mean())
+                ep = float(y_true[m].mean())
+                n = int(m.sum())
+                mean_p.append(mp); emp.append(ep); ns.append(n)
+                ece += (n / len(probs)) * abs(ep - mp)
+            return mean_p, emp, ns, float(ece)
+
+        raw_mp, raw_ep, raw_n, raw_ece = _reliability(raw)
+        cal_mp, cal_ep, cal_n, cal_ece = _reliability(cal)
+
+        fig, axes = plt.subplots(1, 2, figsize=(11, 5))
+        for ax, mp, ep, ns, ece, title in [
+            (axes[0], raw_mp, raw_ep, raw_n, raw_ece, "Raw flare prob"),
+            (axes[1], cal_mp, cal_ep, cal_n, cal_ece, "Temperature-calibrated"),
+        ]:
+            ax.plot([0, 1], [0, 1], linestyle="--", linewidth=1, color="gray")
+            ax.plot(mp, ep, marker="o", linewidth=1.2, color="#4C78A8")
+            for mpx, epx, nx in zip(mp, ep, ns):
+                ax.annotate(str(nx), (mpx, epx), fontsize=7, alpha=0.7, ha="center", va="bottom")
+            ax.set_xlabel("Mean predicted prob")
+            ax.set_ylabel("Empirical accuracy")
+            ax.set_xlim(-0.02, 1.02)
+            ax.set_ylim(-0.02, 1.02)
+            ax.set_title(f"{title}  (ECE={ece:.3f})")
+            ax.grid(True, linestyle=":", alpha=0.4)
+        fig.suptitle("Flare-next-day reliability on inductive test set")
+        fig.tight_layout()
+        save_with_caption(fig, plot_dir / "flare_calibration_raw_vs_temperature.png", dpi=160)
+
+    @staticmethod
+    def _plot_per_subject_performance(
+        pred_df: pd.DataFrame, plot_dir: Path, save_with_caption, plt, min_visits: int = 5
+    ) -> None:
+        """Box + strip plot of per-subject next-day R² and per-subject flare AUC."""
+
+        from sklearn.metrics import r2_score, roc_auc_score
+
+        per_subject_r2: List[float] = []
+        per_subject_auc: List[float] = []
+        for sid, group in pred_df.groupby("subject_id"):
+            if len(group) < min_visits:
+                continue
+            y_reg = group["next_day_score"].to_numpy(float)
+            p_reg = group.get("pred_grm_next_score")
+            if p_reg is not None and np.isfinite(p_reg).all() and np.isfinite(y_reg).all():
+                try:
+                    per_subject_r2.append(float(r2_score(y_reg, p_reg.to_numpy(float))))
+                except ValueError:
+                    pass
+            y_cls = group["flare_next_day"].astype(int).to_numpy()
+            p_cls = group.get("pred_grm_flare_prob")
+            if p_cls is not None and len(np.unique(y_cls)) > 1 and np.isfinite(p_cls).all():
+                try:
+                    per_subject_auc.append(float(roc_auc_score(y_cls, p_cls.to_numpy(float))))
+                except ValueError:
+                    pass
+
+        if not per_subject_r2 and not per_subject_auc:
+            raise RuntimeError("no subjects with sufficient visits for per-subject metrics")
+
+        fig, axes = plt.subplots(1, 2, figsize=(11, 5))
+        for ax, vals, title, ylim in [
+            (axes[0], per_subject_r2, f"Per-subject R² next-day  (n={len(per_subject_r2)})", None),
+            (axes[1], per_subject_auc, f"Per-subject flare AUC  (n={len(per_subject_auc)})", (0.0, 1.0)),
+        ]:
+            if not vals:
+                ax.text(0.5, 0.5, "no eligible subjects", ha="center", va="center", transform=ax.transAxes)
+                ax.set_axis_off()
+                continue
+            ax.boxplot(vals, vert=True, widths=0.5, showmeans=True, meanline=True)
+            jitter = np.random.default_rng(42).uniform(-0.08, 0.08, size=len(vals))
+            ax.scatter(1 + jitter, vals, s=12, alpha=0.5, color="#4C78A8")
+            ax.set_title(title, fontsize=10)
+            ax.set_xticks([1])
+            ax.set_xticklabels([""])
+            if ylim is not None:
+                ax.set_ylim(*ylim)
+                ax.axhline(0.5, color="gray", linestyle="--", linewidth=0.8)
+            ax.grid(axis="y", linestyle=":", alpha=0.4)
+        fig.suptitle("Per-subject performance heterogeneity (inductive test set, min_visits={})".format(min_visits))
+        fig.tight_layout()
+        save_with_caption(fig, plot_dir / "per_subject_performance.png", dpi=160)
 
 
 def _parse_cli() -> GRMTrainConfig:

@@ -227,7 +227,9 @@ def build_setup(cfg: DynamicEvalConfig) -> EvalSetup:
     visits["next_state_id"] = visits.groupby("subject_id")["state_id"].shift(-1)
     visits["next_true_regime_id"] = visits.groupby("subject_id")["true_regime_id"].shift(-1)
 
-    embeddings = static.eigenvectors * (1.0 / (1.0 + (static.rho ** 2) * static.eigenvalues)).reshape(1, -1)
+    embeddings = static.eigenvectors * (
+        1.0 / np.sqrt(1.0 + (static.rho ** 2) * static.eigenvalues)
+    ).reshape(1, -1)
     embedding_visit_index = static.visit_index.copy() if static.visit_index is not None else pd.DataFrame(
         {"visit_id": np.arange(embeddings.shape[0])}
     )
@@ -1275,33 +1277,161 @@ def generate_plots(setup: EvalSetup, results: Dict[str, Any]) -> None:
             ax.tick_params(axis="x", rotation=30)
             _save(fig, plot_dir / "subject_fingerprint_macro_f1.png")
 
-    # Aliased-state scatter (raw PCA vs first 2 GRM modes, aliased subset).
+    # Aliased-state visualization suite (uses the FULL GRM embedding, not just modes 1-2).
     if "aliased" in results and "aliased_mask" in results["aliased"]:
+        from sklearn.decomposition import PCA
+        from sklearn.manifold import TSNE
+
         aliased = results["aliased"]["aliased_mask"]
         visits = setup.visits
         embed_df = setup.embedding_visit_index[["subject_id", "day"]].copy()
-        for j in range(setup.embeddings.shape[1]):
+        n_modes = setup.embeddings.shape[1]
+        for j in range(n_modes):
             embed_df[f"m{j}"] = setup.embeddings[:, j]
         v = visits[["subject_id", "day", "true_regime_id"]].merge(embed_df, on=["subject_id", "day"], how="left")
         obs = SimpleImputer(strategy="median").fit_transform(visits[OBSERVATION_NAMES])
         obs = StandardScaler().fit_transform(obs)
-        from sklearn.decomposition import PCA
-
-        pca = PCA(n_components=2).fit_transform(obs)
         regimes = v["true_regime_id"].fillna(-1).astype(int).to_numpy()
-        fig, axes = plt.subplots(1, 2, figsize=(12, 5.5))
-        for ax, X, title in [
-            (axes[0], pca, "Raw observations (PCA-2)"),
-            (axes[1], v[["m0", "m1"]].to_numpy(float), "GRM modes 1-2"),
-        ]:
-            mask_known = aliased & (regimes >= 0) & np.all(np.isfinite(X), axis=1)
-            for r in np.unique(regimes[mask_known]):
-                m = mask_known & (regimes == r)
-                ax.scatter(X[m, 0], X[m, 1], s=10, alpha=0.55, label=f"r{int(r)}")
-            ax.set_title(title)
-            ax.legend(fontsize=7, loc="best", markerscale=1.2)
-        fig.suptitle("Aliased visits: observation PCA vs GRM modes, by true_regime")
-        _save(fig, plot_dir / "aliased_visits_scatter.png")
+        mode_cols = [f"m{j}" for j in range(n_modes)]
+        grm_full = v[mode_cols].to_numpy(float)
+        valid_grm = np.all(np.isfinite(grm_full), axis=1)
+        mask_known = aliased & (regimes >= 0) & valid_grm
+        idx_known = np.where(mask_known)[0]
+
+        # (1) Headline: obs PCA-2 vs t-SNE on the FULL 8D GRM embedding, aliased subset only.
+        if len(idx_known) >= 30:
+            obs_pca = PCA(n_components=2).fit_transform(obs[idx_known])
+            perplexity = min(30.0, max(5.0, len(idx_known) / 10.0))
+            tsne = TSNE(
+                n_components=2,
+                perplexity=perplexity,
+                random_state=setup.cfg.seed,
+                init="pca",
+                learning_rate="auto",
+            ).fit_transform(grm_full[idx_known])
+            regimes_known = regimes[idx_known]
+            fig, axes = plt.subplots(1, 2, figsize=(12, 5.5))
+            for ax, X, title in [
+                (axes[0], obs_pca, "Raw observations (PCA-2)"),
+                (axes[1], tsne, f"GRM {n_modes}D embedding (t-SNE-2)"),
+            ]:
+                for r in np.unique(regimes_known):
+                    sub = regimes_known == r
+                    ax.scatter(X[sub, 0], X[sub, 1], s=10, alpha=0.55, label=f"r{int(r)}")
+                ax.set_title(title)
+                ax.legend(fontsize=7, loc="best", markerscale=1.2)
+            fig.suptitle("Aliased visits: observation PCA vs GRM t-SNE, by true_regime")
+            _save(fig, plot_dir / "aliased_visits_scatter.png")
+
+        # (2) Pairwise mode grid (upper-triangle) over first up-to-4 GRM modes.
+        n_grid = min(4, n_modes)
+        if len(idx_known) >= 10 and n_grid >= 2:
+            fig, axes = plt.subplots(n_grid, n_grid, figsize=(2.5 * n_grid, 2.5 * n_grid), squeeze=False)
+            uniq = np.unique(regimes[idx_known])
+            for i in range(n_grid):
+                for j in range(n_grid):
+                    ax = axes[i, j]
+                    if i >= j:
+                        ax.set_axis_off()
+                        continue
+                    xs = grm_full[idx_known, j]
+                    ys = grm_full[idx_known, i]
+                    rs = regimes[idx_known]
+                    for r in uniq:
+                        sub = rs == r
+                        ax.scatter(xs[sub], ys[sub], s=6, alpha=0.55, label=f"r{int(r)}" if (i == 0 and j == 1) else None)
+                    ax.tick_params(labelsize=6)
+                    ax.set_xlabel(f"m{j}", fontsize=8)
+                    ax.set_ylabel(f"m{i}", fontsize=8)
+            handles, labels = axes[0, 1].get_legend_handles_labels()
+            if handles:
+                fig.legend(handles, labels, loc="lower left", fontsize=7, markerscale=1.4, frameon=False)
+            fig.suptitle(f"Aliased visits: pairwise GRM mode scatter (first {n_grid} modes), by true_regime")
+            _save(fig, plot_dir / "aliased_mode_pair_grid.png")
+
+        # (3) Per-mode regime histograms — which modes carry the disentangling signal.
+        if len(idx_known) >= 10 and n_modes >= 1:
+            uniq = np.unique(regimes[idx_known])
+            ncol = min(4, n_modes)
+            nrow = int(np.ceil(n_modes / ncol))
+            fig, axes = plt.subplots(nrow, ncol, figsize=(3.2 * ncol, 2.4 * nrow), squeeze=False)
+            for j in range(n_modes):
+                ax = axes[j // ncol, j % ncol]
+                col = grm_full[idx_known, j]
+                if col.size == 0:
+                    ax.set_axis_off()
+                    continue
+                lo, hi = float(np.nanmin(col)), float(np.nanmax(col))
+                if lo == hi:
+                    ax.set_axis_off()
+                    continue
+                bins = np.linspace(lo, hi, 30)
+                for r in uniq:
+                    sub = col[regimes[idx_known] == r]
+                    if sub.size:
+                        ax.hist(sub, bins=bins, histtype="step", linewidth=1.0, alpha=0.85, label=f"r{int(r)}")
+                ax.set_title(f"m{j}", fontsize=9)
+                ax.tick_params(labelsize=6)
+            for j in range(n_modes, nrow * ncol):
+                axes[j // ncol, j % ncol].set_axis_off()
+            handles, labels = axes[0, 0].get_legend_handles_labels()
+            if handles:
+                fig.legend(handles, labels, loc="lower right", fontsize=7, frameon=False)
+            fig.suptitle("Aliased visits: per-mode regime histograms")
+            _save(fig, plot_dir / "aliased_per_mode_histograms.png")
+
+        # (4) NN-entropy spatial map: same obs-PCA positions, colored by GRM-NN vs obs-NN regime entropy.
+        if len(idx_known) >= 30:
+            from sklearn.neighbors import NearestNeighbors as _NN
+
+            k = max(5, int(setup.cfg.aliased_k_nn))
+            # Fit NN only over rows that have BOTH a known regime AND a finite GRM embedding.
+            fit_mask = (regimes >= 0) & valid_grm
+            obs_for_nn = obs[fit_mask]
+            grm_for_nn = grm_full[fit_mask]
+            reg_for_nn = regimes[fit_mask]
+            # Skip if either fit set is degenerate.
+            if obs_for_nn.shape[0] > k and grm_for_nn.shape[0] > k:
+                # Map idx_known into the fit-set index space.
+                full_to_valid = -np.ones(len(regimes), dtype=int)
+                full_to_valid[fit_mask] = np.arange(fit_mask.sum())
+                query_valid = full_to_valid[idx_known]
+                assert (query_valid >= 0).all()
+                nn_obs = _NN(n_neighbors=k + 1).fit(obs_for_nn)
+                nn_grm = _NN(n_neighbors=k + 1).fit(grm_for_nn)
+                _, obs_idx = nn_obs.kneighbors(obs_for_nn[query_valid])
+                _, grm_idx = nn_grm.kneighbors(grm_for_nn[query_valid])
+                obs_idx = obs_idx[:, 1:]
+                grm_idx = grm_idx[:, 1:]
+
+                def _row_entropy(idx_matrix: np.ndarray) -> np.ndarray:
+                    out = np.empty(idx_matrix.shape[0], dtype=float)
+                    for row in range(idx_matrix.shape[0]):
+                        labels, counts = np.unique(reg_for_nn[idx_matrix[row]], return_counts=True)
+                        p = counts.astype(float) / counts.sum()
+                        out[row] = float(-(p * np.log2(np.maximum(p, 1e-12))).sum())
+                    return out
+
+                obs_entropy = _row_entropy(obs_idx)
+                grm_entropy = _row_entropy(grm_idx)
+
+                # 2-panel scatter on the same obs-PCA coordinates so spatial comparison is direct.
+                obs_pca_known = PCA(n_components=2).fit_transform(obs[idx_known])
+                vmax = float(max(obs_entropy.max(), grm_entropy.max(), 1e-9))
+                fig, axes = plt.subplots(1, 2, figsize=(12, 5.0))
+                for ax, ent, title in [
+                    (axes[0], obs_entropy, "obs-NN regime entropy"),
+                    (axes[1], grm_entropy, "GRM-NN regime entropy"),
+                ]:
+                    sc = ax.scatter(obs_pca_known[:, 0], obs_pca_known[:, 1], c=ent, s=12, alpha=0.85, vmin=0.0, vmax=vmax)
+                    ax.set_title(title)
+                    ax.set_xlabel("obs PCA-1")
+                    ax.set_ylabel("obs PCA-2")
+                    fig.colorbar(sc, ax=ax, fraction=0.04, pad=0.04)
+                fig.suptitle(
+                    f"Aliased visits: regime-NN entropy (k={k}); lower = sharper regime concentration"
+                )
+                _save(fig, plot_dir / "aliased_nn_entropy_heatmap.png")
 
     # Ablation bar chart.
     if "ablations" in results and isinstance(results["ablations"], dict) and "df" in results["ablations"]:
@@ -1565,6 +1695,76 @@ def render_verdicts_table(verdicts: Dict[str, Any], label_map: Dict[str, str] = 
     return "\n".join(out)
 
 
+def generate_verdicts_forest_plot(cert: Dict[str, Any], plot_dir: Path) -> None:
+    """Forest-plot companion to the boxed verdicts table.
+
+    Reads cert['verdicts'] (mapping raw_key -> {magnitude, ci_low, ci_high, passes}),
+    renders rows in VERDICT_LABELS order, point + CI whiskers, color-coded
+    PASS/FAIL/MARGINAL. Dashed x=0 is the null. Saves verdicts_forest.png.
+    """
+
+    from grm_tcm_plot_captions import save_with_caption
+
+    verdicts = cert.get("verdicts", {})
+    if not isinstance(verdicts, dict) or not verdicts:
+        return
+    plot_dir = Path(plot_dir)
+    plot_dir.mkdir(parents=True, exist_ok=True)
+
+    ordered_keys = [k for k in VERDICT_LABELS if k in verdicts]
+    extra_keys = [k for k in verdicts if k not in VERDICT_LABELS]
+    keys = ordered_keys + extra_keys
+
+    rows = []
+    for k in keys:
+        v = verdicts[k]
+        if not isinstance(v, dict):
+            continue
+        mag = v.get("magnitude")
+        lo = v.get("ci_low")
+        hi = v.get("ci_high")
+        if mag is None or not (np.isfinite(float(mag))):
+            continue
+        rows.append((VERDICT_LABELS.get(k, k), float(mag), lo, hi, v.get("passes")))
+    if not rows:
+        return
+
+    color_map = {True: "#2CA02C", False: "#D62728", None: "#7F7F7F"}  # green / red / gray
+    labels = [r[0] for r in rows]
+    mags = np.array([r[1] for r in rows], dtype=float)
+    los = np.array([float(r[2]) if r[2] is not None else np.nan for r in rows], dtype=float)
+    his = np.array([float(r[3]) if r[3] is not None else np.nan for r in rows], dtype=float)
+    passes = [r[4] for r in rows]
+
+    y = np.arange(len(rows))[::-1]  # top-to-bottom = first to last
+    fig, ax = plt.subplots(figsize=(10, max(4.0, 0.55 * len(rows) + 1.5)))
+    ax.axvline(0.0, color="black", linewidth=1.0, linestyle="--", alpha=0.6)
+    for yi, mag, lo, hi, p in zip(y, mags, los, his, passes):
+        color = color_map[p]
+        if np.isfinite(lo) and np.isfinite(hi):
+            ax.plot([lo, hi], [yi, yi], color=color, linewidth=2.2, alpha=0.85)
+            ax.plot([lo, lo], [yi - 0.18, yi + 0.18], color=color, linewidth=1.5)
+            ax.plot([hi, hi], [yi - 0.18, yi + 0.18], color=color, linewidth=1.5)
+        ax.plot(mag, yi, "o", color=color, markersize=8)
+        # value annotation at right edge
+        x_text = (hi if np.isfinite(hi) else mag) + 0.005
+        ax.text(x_text, yi, f"Δ={mag:+.3f}", va="center", fontsize=8, color="#333333")
+    ax.set_yticks(y)
+    ax.set_yticklabels(labels, fontsize=9)
+    ax.set_xlabel("Δ (effect size)")
+    ax.set_title("Falsifiable-verdicts forest plot (95% bootstrap CIs)")
+    # legend swatches
+    handles = [
+        plt.Line2D([0], [0], marker="o", color=color_map[True], label="PASS", linestyle="-", markersize=8),
+        plt.Line2D([0], [0], marker="o", color=color_map[None], label="MARGINAL", linestyle="-", markersize=8),
+        plt.Line2D([0], [0], marker="o", color=color_map[False], label="FAIL", linestyle="-", markersize=8),
+    ]
+    ax.legend(handles=handles, loc="lower right", fontsize=8, frameon=False)
+    ax.grid(axis="x", linestyle=":", alpha=0.4)
+    fig.tight_layout()
+    save_with_caption(fig, plot_dir / "verdicts_forest.png", dpi=160)
+
+
 def print_summary(cert: Dict[str, Any], setup: EvalSetup) -> None:
     """Print headline verdicts at the end of the run."""
     print()
@@ -1618,6 +1818,11 @@ def main() -> None:
         generate_plots(setup, results)
 
     cert = write_certificate(setup, results)
+    if "plots" in scope:
+        try:
+            generate_verdicts_forest_plot(cert, setup.cfg.output_dir / "plots")
+        except Exception as exc:
+            print(f"[plot] skipped verdicts_forest: {exc}")
     print_summary(cert, setup)
 
 

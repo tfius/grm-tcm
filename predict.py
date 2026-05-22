@@ -81,10 +81,13 @@ def nystrom_grm_coordinates(
 ) -> np.ndarray:
     """Project new visits into the persisted GRM basis via Nyström extension.
 
-    Returns coordinates of shape (m, n_modes), already weighted by 1/(1 + rho^2 * lambda).
+    Returns coordinates of shape (m, n_modes), already weighted by
+    sqrt(1/(1 + rho^2 * lambda)) so coordinate inner products approximate the
+    truncated GRM kernel.
     Thin wrapper around grm_tcm_projection.nystrom_extend_arrays.
     """
 
+    _require_static_v3(static)
     if static.nn_index is None:
         raise RuntimeError(
             "Loaded static model has no KNN index. Nyström extension requires graph_mode "
@@ -119,12 +122,22 @@ def surrogate_grm_coordinates(static: StaticGRMModel, X_new_scaled: np.ndarray) 
     visit.' See CLAUDE.md for the full caveat.
     """
 
+    _require_static_v3(static)
     if static.embedding_surrogate is None:
         raise RuntimeError(
             "Loaded static model has no embedding_surrogate. The model was likely trained before "
-            "static-v2 schema; retrain or use --projection nystrom."
+            "static-v2 schema; retrain or use --projection nystrom with a static-v3 model."
         )
     return surrogate_project(static.embedding_surrogate, X_new_scaled)
+
+
+def _require_static_v3(static: StaticGRMModel) -> None:
+    schema = str(static.manifest.get("schema_version", ""))
+    if schema != "static-v3":
+        raise RuntimeError(
+            f"Loaded static model uses {schema!r}. Static embeddings changed to the sqrt-weight "
+            "GRM kernel feature convention in static-v3; retrain the static model before prediction."
+        )
 
 
 def _sigmoid_stable(z: np.ndarray) -> np.ndarray:

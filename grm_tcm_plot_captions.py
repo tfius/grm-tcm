@@ -169,9 +169,45 @@ CAPTIONS: dict[str, str] = {
         "bars are fold std."
     ),
     "aliased_visits_scatter": (
-        "Two-panel comparison on observation-aliased visits only: raw-observation PCA (left) vs first two "
-        "GRM modes (right), colored by true_regime. If the right panel separates regimes that the left "
-        "blurs, GRM is disambiguating under aliasing."
+        "Two-panel comparison on observation-aliased visits only: raw-observation PCA-2 (left) vs t-SNE "
+        "of the FULL multi-mode GRM embedding (right), colored by true_regime. If the right panel "
+        "separates regimes that the left blurs, GRM is disambiguating under aliasing using information "
+        "spread across all modes — not just modes 1–2."
+    ),
+    "aliased_mode_pair_grid": (
+        "Upper-triangle pairwise scatter of the first few GRM modes on the aliased subset, colored by "
+        "true_regime. Locates which mode pair (if any) carries discriminative signal — the rest of the "
+        "spectrum may be doing the heavy lifting."
+    ),
+    "aliased_per_mode_histograms": (
+        "Per-mode regime-conditional histograms over aliased visits. Modes whose regime distributions "
+        "are visibly displaced are the ones that disentangle states under observation aliasing; modes "
+        "with fully overlapping histograms are not contributing to T1 entropy lift."
+    ),
+    "aliased_nn_entropy_heatmap": (
+        "Same obs-PCA layout in both panels; color = regime-NN entropy under observation-NN (left) vs "
+        "GRM-embedding-NN (right). Bluer = sharper regime concentration. Spatial regions where the right "
+        "panel is bluer than the left are where GRM is winning the T1 disambiguation."
+    ),
+    "transductive_vs_inductive_metrics": (
+        "Side-by-side comparison of headline metrics under transductive (in-graph train/test) vs strict "
+        "inductive (subject-disjoint) evaluation on the same dataset. Inductive bars below transductive "
+        "bars on the GRM-side metrics measure the graph-leak premium being squeezed out by honest holding."
+    ),
+    "verdicts_forest": (
+        "Forest plot companion to the boxed verdicts table. Each row is one falsifiable claim; the dot is "
+        "the point estimate Δ and whiskers are the bootstrap 95% CI. PASS = CI strictly positive, FAIL = "
+        "CI strictly negative, MARGINAL = CI crosses zero. Dashed line at zero is the null."
+    ),
+    "flare_calibration_raw_vs_temperature": (
+        "Reliability diagram on the inductive test set: raw GRM-logistic flare probability (left) vs "
+        "temperature-calibrated probability (right). Right curve hugging the diagonal more tightly than "
+        "left = the persisted temperature is earning its keep. ECE reported in each subtitle."
+    ),
+    "per_subject_performance": (
+        "Per-subject heterogeneity on the inductive test set: box + strip of subject-level next-day R² "
+        "(left) and flare AUC (right). Tight box = uniform performance; long whiskers / outliers = "
+        "averaging successes with disasters. Subjects need ≥5 test visits to be included."
     ),
     "ablation_attractor_auc": (
         "Attractor-AUC on aliased visits across embedding ablations (full GRM, time-shuffled, random, raw "

@@ -348,17 +348,19 @@ For each synthetic dataset, evaluate:
 
 ## My recommendation
 
-Start with:
+Current recommended synthetic scale:
 
-- **100 subjects**
-- **90 time steps each**
+- **200 subjects**
+- **120 time steps each**
 - **4 latent dimensions**
 - **10–15 observed variables**
 - **3 intervention types**
 - **1 flare outcome**
 - **1 crude TCM-like label layer**
 
-That is enough to tell whether this is worth pursuing.
+This is the generator default because subset-heavy evaluation (`aliased_pair`,
+hard-onset, constitution recovery) splits the data thinner than the original
+80 × 60 prototype.
 
 Initial implementation:
 
@@ -407,30 +409,70 @@ Implemented ablations:
 - random graph control
 - permuted label control
 
-## Current Diagnostic Answers
+## Current Diagnostic Answers (post-v2 generator)
 
-Current single-run diagnostics answer the four core questions this way:
+Updated after: per-subject persistence baselines added, lag-augmented GRM head (`grm_plus_lag_*`), flare-onset secondary target with hard-subset deconfounding, v2 holism layer in the generator, and per-subject constitution-recovery evaluation. All numbers below are from the strict **inductive** path unless noted.
 
 1. **Did GRM recover the hidden latent state?**
 
-   Partially. The trainer reports mean absolute aligned latent correlation around `0.406`, and diagnostics find a best absolute GRM-mode/latent correlation around `0.682`. That is real synthetic latent recovery, but not strong enough to claim the current spectral embedding fully recovers the hidden state.
+   Partially, on synthetic. Mean abs aligned latent correlation hovers around `0.45` in-sample and `~0.40` out-of-sample (Procrustes rotation, latent_recovery in inductive eval). Strong on `stress_activation` and `inflammatory_load`, weaker on `vitality_depletion` and `digestive_instability`. Real recovery on a known generator, not a clean "we got the latents" claim.
 
-2. **Did GRM predict outcome better than naive baselines?**
+2. **Did GRM predict outcome better than naive baselines? (Honest deployable comparison)**
 
-   No for next-day score regression. Current R2 values are roughly:
-   - GRM ridge: `0.170`
-   - raw random forest: `0.974`
-   - naive current score: `0.973`
+   Mixed, but clearly positive on the regression task.
+   - **`next_day_score` R²**: GRM+lag `0.47`, persistence `0.35`, raw-RF `0.32`, naive `0.17`. **Δ over best baseline: +0.13 R²**.
+   - **`flare_next_day` AUC**: GRM+lag `0.60`, naive `0.56`, raw-RF `0.56`, persistence `0.52`. Δ +0.04 AUC.
+   - **`flare_onset` (hard subset, `flare_today=0` only)**: GRM `0.55`, GRM+lag `0.58`, lag-only `0.58`. Δ vs lag ≈ 0 — GRM and lag are substitutes here, both capture the same regime-trajectory signal.
 
-   GRM flare prediction is high in this synthetic run, with ROC-AUC around `1.000`, but the raw and naive baselines are also near-ceiling. This means the outcome is currently too easy for short-horizon baselines.
+   GRM standalone (no lag features) is a weak head; GRM+lag is the deployment-style competitor and beats the strongest baseline on regression.
 
 3. **Did GRM discover label mismatch / hidden subtypes?**
 
-   Yes, as a diagnostics target. The current diagnostics produce `8` contrarian findings and ontology-mismatch tables showing TCM-like labels mixing hidden subtypes and hidden subtypes splitting across labels. This is synthetic mismatch detection, not validation of TCM categories.
+   Yes, on synthetic. Diagnostics still produce contrarian-pattern and ontology-mismatch tables. `tcm_like_label` mixes `hidden_subtype` and aliased regimes mix `tcm_like_label`. Synthetic mismatch detection only — no claim about TCM validity.
 
-4. **Did GRM clusters align more with true latent structure than with naive TCM-like labels?**
+4. **Did GRM recover the v2 constitution layer better than per-subject raw averaging?**
 
-   No in the current single run. Cluster alignment with `hidden_subtype` is near zero (`ARI` about `0.00`, `NMI` about `0.006` at best), while alignment with `tcm_like_label` is higher (`NMI` about `0.281` at best). That suggests the current embedding clusters track observed semantic/label structure more than the generator's hidden subtype IDs.
+   No. Per-subject mean of raw features beats per-subject mean of GRM embeddings by **−0.25 R²** on average across constitution axes (raw `0.86` vs GRM `0.61` mean R²). GRM's spectral graph compresses by regime/dynamics similarity, which discards constitution-orthogonal information. Stable subject identity is *not* what graph-Laplacian eigenmodes recover from this graph construction.
+
+## v2 holism layer (synthetic enrichment)
+
+The generator was enriched to test whether a "holistic" cross-modal pattern is recoverable. Three layers added on top of the existing 7-regime switching state-space:
+
+- **Constitution** — a 3-dim continuous stable per-subject vector (`thermal/energy/stability`) sampled at subject creation, biased by `hidden_subtype`. Projects onto every continuous observation via `D_MATRIX` with small per-channel entries but **coherent signs within each modality**, so the signal lives in cross-channel coherence.
+- **Cross-modal coupling** — each modality (`vital_signs`, `sleep_energy`, `digestive`, `pain_mood`) is influenced by yesterday's other-modality means via a 4×4 coupling matrix. Empirically `corr(yest sleep_energy mean, today HRV) ≈ +0.46`.
+- **Qualitative ordinal observations** — three TCM-inspired channels (`pulse_quality_like` 3 levels, `tongue_state_like` 4 levels, `complexion_like` 3 levels) sampled from `z + constitution` with ordinal thresholds. Each has a parallel `_label` string column.
+- **Seasonal rhythm** — 45-day sinusoid on inflammatory load, per-subject phase, amplitude dampened by `constitution_stability`.
+
+All four are scaled by difficulty preset (`easy/medium/hard/chaotic`).
+
+## Honest findings (what v2 + the new baselines actually showed)
+
+- **The persistence baseline was the previously-hidden winner.** Adding `score_persistence_today` and `flare_persistence_today` as input features to a comparison set raised the strongest non-GRM baseline by a lot. Once we did that, the old "GRM beats naive current score" claim shrank — but GRM+lag is now a fair deployment-style competitor that still beats persistence by +0.13 R² on regression.
+- **Flare-onset inflation was real.** The headline 0.75 AUC on `flare_onset` collapsed to ~0.58 on the `flare_today=0` hard subset; that AUC drop was the `flare_today=1 -> onset=0` definitional certainty filter, not real onset prediction. GRM matches lag on the hard subset.
+- **Constitution recovery is a clean negative for GRM.** Mean-of-raw beats mean-of-embedding by −0.25 R². GRM's graph captures *dynamics*, not *identity*. To make GRM useful for stable subject patterns, either the graph needs subject-similarity edges or the aggregator needs to escape regime-similarity compression — that's an architectural change, not a feature-engineering one.
+- **Including qualitative channels as trainer inputs was a marginal gain.** `flare_next_day` AUC moved by +0.001 and `next_day_score` was unchanged. The qualitative signal duplicates what's already in continuous channels + lag for these targets.
+
+## Synthetic-generator improvement directions (next iteration)
+
+What we've measured tells us *where the current generator under-tests GRM* and where it over-rewards trivial baselines. The Pang et al. 2023 Nature paper (`article/s41586-023-06098-1.pdf`, "Geometric constraints on human brain function") is a useful pointer here: they show that **geometric eigenmodes** of the cortical surface beat **connectome graph eigenmodes** for explaining brain dynamics. GRM-TCM is in the connectome-camp by construction — visit-similarity + temporal + treatment edges. That motivates several generator changes:
+
+1. **Make constitution affect *dynamics*, not just observations.** Currently `K` biases the obs projection. If `K` also modulated transition probabilities (e.g., high `thermal` raises P(enter inflammatory) and lowers self-transition in `digestive_instable`), the constitution signal would live in graph position, which GRM can in principle capture. This directly addresses the "raw mean beats GRM" finding by making graph-position-aware methods relevant.
+
+2. **Continuous-manifold body-state generator (Pang-style).** Add a generator variant where body-state trajectories live on a low-dim continuous manifold (e.g., 2D-3D), and observations are superpositions of **long-wavelength eigenmodes** of a Laplace-Beltrami-like operator on that manifold. Then evaluate whether GRM's discrete graph-Laplacian eigenmodes approximate the continuous LBO eigenmodes. This is the *direct* analogue of the Pang geometry-vs-connectivity test on a body-state substrate.
+
+3. **Aliased-future targets.** Design pairs of regimes that produce nearly identical day-`t` observations but diverge sharply at `t+1`. This breaks the lag baseline (today's obs aliases) and forces methods to rely on graph-position information that aliased obs can't provide. Concretely: a flag in regime metadata `aliased_pair_id` and a deterministic next-regime divergence rule. Evaluate `next_day_score` on the `aliased_pair_id != none` subset.
+
+4. **Counterfactual intervention pairs.** Same subject, same starting state, two simulated futures with different treatment outcomes. Lets us evaluate **intervention-response prediction** as a target (mentioned in PHASE 1 but not yet measured). GRM's graph-position should help when raw obs at `t` don't predict the divergence.
+
+5. **Multi-scale temporal coupling.** Slow constitutional drift (60-90 day timescale) + fast regime switching (1-7 day) + within-day variation. Current generator is single-scale (daily). This tests multi-timescale modeling, which is part of the next-step list and an obvious place where simple AR(1) baselines should fail and a spectral method should help.
+
+6. **Cross-subject shared environmental drivers.** Currently subjects are independent draws. A shared environmental signal (seasonal weather, regional stress pulse) with subject-specific phase lags would force methods to disentangle individual vs population trajectories. The graph wouldn't see this directly unless we add cross-subject edges.
+
+7. **Bigger and longer.** The generator default is now 200 subjects × 120 days because 80 × 60 was tight for subset evaluation. Use 300 × 180 for final stress runs if the aliased-pair, hard-onset, or constitution-recovery confidence intervals remain wide.
+
+8. **Subject-trajectory diversity constraints.** Currently subjects can drift anywhere; in real biology, individual trajectories have stable basins. Adding a "constitutional basin" to each subject (z stays near `K`-determined attractor) would make subject identity more visible to graph methods.
+
+Priority for the next pass: **(1) constitution-dynamics coupling** is the highest-leverage single change because it directly addresses the GRM-loses-on-constitution finding. **(3) aliased-future targets** is the most rigorous test of whether GRM beats lag. **(2) continuous manifold** is the most ambitious and the most aligned with the Pang reference.
 
 ## Dynamic GRM Port
 

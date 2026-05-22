@@ -19,6 +19,14 @@ uv run python grm_tcm_diagnostics.py
 uv run python grm_tcm_dynamic_grm.py
 ```
 
+The generator default is now `200` subjects × `120` days so subset evaluations
+such as aliased pairs, hard-onset, and constitution recovery are less brittle.
+You can still override the scale explicitly:
+
+```bash
+uv run python grm_tcm_synthetic_generator.py --n-subjects 200 --n-days 120
+```
+
 It generates:
 
 ```text
@@ -57,6 +65,26 @@ grm_tcm_dynamic/
   transition_reliability.csv
 ```
 
+## Manifold Geometry Benchmark
+
+The regime generator remains the clinical-state benchmark. For explicit
+geometry, use the continuous manifold generator:
+
+```bash
+uv run python grm_tcm_manifold_generator.py
+uv run python grm_tcm_train.py \
+    --input-dir synthetic_grm_tcm_manifold \
+    --output-dir grm_tcm_results_manifold
+uv run python grm_tcm_manifold_eval.py \
+    --data-dir synthetic_grm_tcm_manifold \
+    --results-dir grm_tcm_results_manifold
+```
+
+This writes `theta_1`, `theta_2`, torus trig coordinates, `true_lbo_mode_*`
+columns, `true_lbo_modes.csv`, and `true_lbo_eigenmodes.npz`. The evaluator
+reports how well saved GRM modes align with the analytical torus
+Laplace-Beltrami modes.
+
 Both the trainer and the dynamic pipeline also write a `model/` subdirectory containing the fitted preprocessor, eigenbasis, KMeans, regressors, G-matrices, and a `manifest.json` (config + git sha + input hashes + schema version). The dynamic manifest cross-references the static manifest sha, so a stale static model is rejected at load time.
 
 ## Predicting on new visits
@@ -76,6 +104,12 @@ Inputs must include the 12 observation columns plus `subject_id` and `day`. Outp
 Two projection modes are supported:
 - `--projection surrogate` (default): persisted Ridge regressor `X_obs → embeddings`. Deterministic; the recommended path for downstream prediction.
 - `--projection nystrom`: feature-only KNN extension of the spectral basis. Available when the static model used a graph_mode that includes KNN.
+
+Static `grm_mode_*` coordinates use the kernel-feature convention
+`sqrt(1 / (1 + rho^2 lambda_k)) * psi_k`, so inner products of saved
+embeddings reconstruct the truncated GRM kernel. This convention starts at
+static model schema `static-v3`; retrain older saved static models before using
+`predict.py`.
 
 Neither mode faithfully reproduces the GRM spectral embedding for new visits — those coordinates depend on multi-relational graph position (temporal + treatment + KNN edges), not on observations alone. Both modes are useful proxies for the downstream ridge/logistic heads; nothing more should be read into the `grm_mode_*` values in `predictions.csv`.
 

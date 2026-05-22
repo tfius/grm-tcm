@@ -119,8 +119,9 @@ ALIAS_OFFSETS: Dict[str, np.ndarray] = {
 # ---------------------------------------------------------------------------
 
 # Stable subject-level constitution axes. Distinct from `hidden_subtype` (which
-# is a discrete dynamics fingerprint); constitution is a *continuous* observation
-# pattern that biases every channel without affecting the regime transition matrix.
+# is a discrete dynamics fingerprint); constitution is a continuous subject
+# fingerprint that biases observations and, in v3, also modulates regime-entry
+# logits through E_MATRIX.
 CONSTITUTION_NAMES: List[str] = [
     "constitution_thermal",    # cold <-> hot tendency
     "constitution_energy",     # depleted <-> exuberant baseline
@@ -135,6 +136,41 @@ CONSTITUTION_SUBTYPE_BIAS: Dict[int, np.ndarray] = {
     0: np.array([-0.30, -0.40, +0.10]),  # digestive responder: cooler, depleted
     1: np.array([+0.40, +0.30, -0.40]),  # stress responder: warmer, exuberant, chaotic
     2: np.array([+0.50, -0.20, -0.10]),  # inflammatory responder: hot, mildly depleted
+}
+
+# Constitution -> regime-entry logit additive bias. Each axis pushes the next-day
+# regime distribution toward semantically-matching destinations: thermal toward
+# inflammatory/stuck_agitated, energy toward balanced/recovery and away from
+# stuck_depleted, stability toward balanced/recovery and away from stuck_agitated.
+# Applied additively to the destination logit vector (independent of current regime),
+# alongside the existing event-driven push.
+#
+# This is the v3 improvement #1: constitution now lives in DYNAMICS as well as
+# observations. Without it, constitution is recoverable by simple per-subject
+# averaging of observations — GRM has nothing structural to add. With it, the
+# constitution signal is also encoded in regime trajectories (graph position),
+# which spectral methods can exploit.
+#                              thermal  energy stability
+E_MATRIX = np.array([
+    [ 0.00, +0.30, +0.40],   # 0 balanced (energy + stability favor it)
+    [+0.15, +0.10, -0.30],   # 1 stressed_recoverable (low stability + heat)
+    [+0.50, +0.10, -0.10],   # 2 inflammatory (heat-driven)
+    [-0.40, -0.05, -0.10],   # 3 digestive_instable (cold-damp)
+    [-0.20, -0.45, -0.15],   # 4 stuck_depleted (low energy + cold)
+    [+0.30, -0.15, -0.45],   # 5 stuck_agitated (heat + chaos)
+    [+0.10, +0.45, +0.40],   # 6 recovery (energy + stability)
+])
+
+# Aliased-future pairs (v3 improvement #2). These are the deliberately hard
+# same-observation / different-future pairs. We do not mark every regime that
+# shares a visual alias group; only the pairs where one member is a sticky
+# attractor and the other is a recoverable/transient lookalike. This keeps the
+# aliased subset focused instead of swallowing most of the dataset.
+ALIAS_PAIR_REGIMES: Dict[int, Optional[str]] = {
+    1: "wired_stress_vs_stuck",  # stressed_recoverable
+    5: "wired_stress_vs_stuck",  # stuck_agitated
+    3: "heavy_digestive_vs_stuck",  # digestive_instable
+    4: "heavy_digestive_vs_stuck",  # stuck_depleted
 }
 
 # Constitution -> continuous-observation projection. Each constitution axis biases
@@ -235,6 +271,8 @@ class DifficultyProfile:
     cross_modal_strength: float        # scales prev-day-modality coupling
     seasonal_strength: float           # amplitude of subject-specific 45-day wave
     qualitative_noise_std: float       # ordinal-sampling noise
+    # v3 improvement #1: constitution-driven regime transition bias.
+    constitution_dynamics_strength: float
 
 
 DIFFICULTY_PRESETS: Dict[str, DifficultyProfile] = {
@@ -247,6 +285,7 @@ DIFFICULTY_PRESETS: Dict[str, DifficultyProfile] = {
         subject_bias_strength=1.40, missing_rate_severe_multiplier=2.0,
         constitution_strength=0.45, cross_modal_strength=0.25,
         seasonal_strength=0.15, qualitative_noise_std=0.30,
+        constitution_dynamics_strength=0.50,
     ),
     "medium": DifficultyProfile(
         latent_noise_std=0.18, obs_noise_std=0.45, missing_rate=0.03,
@@ -257,6 +296,7 @@ DIFFICULTY_PRESETS: Dict[str, DifficultyProfile] = {
         subject_bias_strength=1.00, missing_rate_severe_multiplier=2.5,
         constitution_strength=0.35, cross_modal_strength=0.20,
         seasonal_strength=0.12, qualitative_noise_std=0.45,
+        constitution_dynamics_strength=0.40,
     ),
     "hard": DifficultyProfile(
         latent_noise_std=0.28, obs_noise_std=0.70, missing_rate=0.08,
@@ -267,6 +307,7 @@ DIFFICULTY_PRESETS: Dict[str, DifficultyProfile] = {
         subject_bias_strength=0.60, missing_rate_severe_multiplier=3.5,
         constitution_strength=0.22, cross_modal_strength=0.15,
         seasonal_strength=0.08, qualitative_noise_std=0.65,
+        constitution_dynamics_strength=0.30,
     ),
     "chaotic": DifficultyProfile(
         latent_noise_std=0.40, obs_noise_std=0.95, missing_rate=0.15,
@@ -277,6 +318,7 @@ DIFFICULTY_PRESETS: Dict[str, DifficultyProfile] = {
         subject_bias_strength=0.30, missing_rate_severe_multiplier=5.0,
         constitution_strength=0.12, cross_modal_strength=0.10,
         seasonal_strength=0.05, qualitative_noise_std=0.90,
+        constitution_dynamics_strength=0.20,
     ),
 }
 
@@ -289,8 +331,8 @@ class GeneratorConfig:
     difficulty preset in __post_init__ only when the user didn't pass a value.
     """
 
-    n_subjects: int = 80
-    n_days: int = 60
+    n_subjects: int = 200
+    n_days: int = 120
     latent_dim: int = 4
     random_seed: int = 42
     output_dir: str = "synthetic_grm_tcm"
@@ -315,6 +357,7 @@ class GeneratorConfig:
     cross_modal_strength: Optional[float] = None
     seasonal_strength: Optional[float] = None
     qualitative_noise_std: Optional[float] = None
+    constitution_dynamics_strength: Optional[float] = None
 
     load_decay: float = 0.65
     flare_threshold_logit: float = 2.2
@@ -599,8 +642,14 @@ class SyntheticGRMTCMGenerator:
                 event_logits = (
                     EVENT_REGIME_PUSH["stress"] * (stress_today + 0.55 * delayed_stress) * float(subj.sensitivity_stress)
                     + EVENT_REGIME_PUSH["recovery"] * (recovery_today + 0.55 * delayed_recovery) * recov_eff
-                    + TREATMENT_PUSH_BY_SUBTYPE[subtype] * (treatment_today + 0.55 * delayed_treatment) * float(subj.sensitivity_treatment)
+                    + TREATMENT_PUSH_BY_SUBTYPE[subtype]
+                    * (treatment_today + self.cfg.delayed_treatment_effect * delayed_treatment)
+                    * float(subj.sensitivity_treatment)
                 )
+                # v3 #1: constitution-conditioned regime bias. Independent of current
+                # regime; modulates which destinations are favored. Lives in dynamics
+                # (graph position), not just observations.
+                event_logits = event_logits + self.cfg.constitution_dynamics_strength * (E_MATRIX @ constitution)
                 if c in STUCK_REGIME_IDS:
                     event_logits[c] += susc * 0.35
                     event_logits[6] -= (1.0 - recov_eff) * 0.3
@@ -652,6 +701,7 @@ class SyntheticGRMTCMGenerator:
                 delayed_recovery = self.cfg.load_decay * delayed_recovery + recovery_today
                 delayed_treatment = self.cfg.load_decay * delayed_treatment + treatment_today
 
+                aliased_group = ALIAS_PAIR_REGIMES.get(c_next)
                 visit_rows.append({
                     "subject_id": sid,
                     "day": day,
@@ -664,6 +714,11 @@ class SyntheticGRMTCMGenerator:
                     "delayed_treatment_load": float(delayed_treatment),
                     "delayed_recovery_load": float(delayed_recovery),
                     "subject_transition_bias_id": sid,
+                    # v3 #2: aliased-future eligibility. Today's obs cluster with another
+                    # regime's obs in the same alias group, but next-regime distributions
+                    # diverge. Downstream eval scores this subset separately.
+                    "aliased_pair_id": aliased_group if aliased_group is not None else "",
+                    "is_aliased_pair_row": int(aliased_group is not None),
                     **obs,
                     **qual,
                 })
@@ -1000,6 +1055,7 @@ class SyntheticGRMTCMGenerator:
                 "prototype_d": float(REGIME_PROTOTYPES[rid, 3]),
                 "drift_strength": float(REGIME_DRIFT_STRENGTH[rid]),
                 "alias_group": ALIAS_GROUPS[rid],
+                "aliased_pair_id": ALIAS_PAIR_REGIMES.get(rid) or "",
                 "base_self_loop": float(self.transition_matrix[rid, rid]),
             })
         pd.DataFrame(regime_rows).to_csv(self.output_dir / "true_regimes.csv", index=False)
@@ -1041,6 +1097,7 @@ class SyntheticGRMTCMGenerator:
             "regime_names": REGIME_NAMES,
             "stuck_regime_ids": STUCK_REGIME_IDS,
             "alias_groups": ALIAS_GROUPS,
+            "alias_pair_regimes": {str(k): v for k, v in ALIAS_PAIR_REGIMES.items()},
             "ground_truth_files": {
                 "subjects.csv": (
                     "Subject-level metadata: hidden_subtype, sensitivities, attractor_susceptibility, "
@@ -1049,12 +1106,16 @@ class SyntheticGRMTCMGenerator:
                 "visits.csv": (
                     "Per-(subject, day) continuous observations + qualitative ordinal observations "
                     "(pulse_quality_like, tongue_state_like, complexion_like with parallel _label strings), "
-                    "true_regime_id, dwell_time, latent_instability, delayed_*_load, outcomes."
+                    "true_regime_id, dwell_time, latent_instability, delayed_*_load, aliased_pair_id, outcomes."
                 ),
                 "latent_states.csv": "Continuous latent z_t per (subject, day).",
                 "events.csv": "Stress/recovery/treatment event log per (subject, day).",
-                "true_regimes.csv": "Regime registry: id, name, prototype z, drift strength, alias group, self-loop probability.",
-                "true_transition_matrices.csv": "Base 7x7 transition matrix and per-subject additive logit bias matrices.",
+                "true_regimes.csv": "Regime registry: id, name, prototype z, drift strength, alias group, aliased_pair_id, self-loop probability.",
+                "true_transition_matrices.csv": (
+                    "Static transition components only: base 7x7 transition matrix and per-subject additive logit bias matrices. "
+                    "Actual simulated transition logits also include event pushes, delayed treatment/recovery/stress loads, "
+                    "constitution dynamics via E_MATRIX @ constitution, and stuck-state susceptibility."
+                ),
                 "true_attractor_states.csv": "Per-subject occupancy fraction and longest dwell in stuck regimes.",
             },
             "design_notes": {
@@ -1063,6 +1124,11 @@ class SyntheticGRMTCMGenerator:
                 "stuck_attractors": "stuck_depleted (4) and stuck_agitated (5) have high self-transition probability scaled by sticky_strength.",
                 "delayed_effects": "Stress/treatment/recovery loads decay exponentially (load_decay) and modulate regime transitions and flare risk.",
                 "observation_aliasing": "Regimes are grouped (calm/wired/hot/heavy) and share an observation offset, so different regimes can produce similar x_t.",
+                "aliased_future_subset": (
+                    "visits.csv marks aliased_pair_id only for deliberately hard lookalike pairs: "
+                    "stressed_recoverable vs stuck_agitated and digestive_instable vs stuck_depleted. "
+                    "This subset is intended for hard future-prediction evaluation, not broad alias-group bookkeeping."
+                ),
                 "outcomes": (
                     "next_day_score and flare_next_day depend on c_{t+1}, dwell_time_{t+1}, latent_instability, and delayed loads, "
                     "with a small linear-in-observations component. Today's global_dysregulation_score alone is a weak predictor."
@@ -1072,8 +1138,8 @@ class SyntheticGRMTCMGenerator:
                 "constitution_layer": (
                     "Stable per-subject vector K in R^3 (thermal/energy/stability) sampled at subject creation, biased by hidden_subtype. "
                     "K biases EVERY continuous observation through D_MATRIX @ K with small per-channel effects but COHERENT signs within "
-                    "a modality. Single-channel detection ratio < 1; cross-channel aggregation ratio > 2. This is the holism test: "
-                    "recover K from cross-modal coherence even though no single observation reveals it."
+                    "a modality, and also modulates regime-entry logits through constitution_dynamics_strength * (E_MATRIX @ K). "
+                    "This is the holism test: recover K from cross-modal coherence and trajectory structure even though no single observation reveals it."
                 ),
                 "cross_modal_coupling": (
                     "Each modality (vital_signs / sleep_energy / digestive / pain_mood) is influenced by yesterday's other-modality means via "
@@ -1128,8 +1194,8 @@ def parse_args() -> GeneratorConfig:
     parser.add_argument("--output-dir", default="synthetic_grm_tcm")
     parser.add_argument("--difficulty", default="medium", choices=sorted(DIFFICULTY_PRESETS))
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--n-subjects", type=int, default=80)
-    parser.add_argument("--n-days", type=int, default=60)
+    parser.add_argument("--n-subjects", type=int, default=GeneratorConfig.n_subjects)
+    parser.add_argument("--n-days", type=int, default=GeneratorConfig.n_days)
     args = parser.parse_args()
     return GeneratorConfig(
         n_subjects=args.n_subjects,

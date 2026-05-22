@@ -25,7 +25,7 @@ from grm_tcm_persistence import (
 )
 
 
-STATIC_SCHEMA_VERSIONS = ["static-v1", "static-v2"]
+STATIC_SCHEMA_VERSIONS = ["static-v1", "static-v2", "static-v3"]
 DYNAMIC_SCHEMA_VERSIONS = ["dynamic-v1"]
 
 
