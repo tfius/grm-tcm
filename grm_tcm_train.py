@@ -148,6 +148,12 @@ class GRMTrainConfig:
     # concatenated into a single feature vector). Set to 1 to disable (snapshot only).
     # Respects subject boundaries; early visits padded with NaN then median-imputed.
     delay_embedding_k: int = 3
+    # Horizon sweep: evaluate smoothed-delta regression at multiple prediction
+    # horizons. Persistence predicts Δ=0, so any positive R² is genuine signal.
+    # Computed inline from global_dysregulation_score; additive diagnostic that
+    # does not affect the standard h=1 evaluation.
+    horizon_sweep: Tuple[int, ...] = (1, 3, 7)
+    horizon_smooth_window: int = 3
     # If True, run constitution-recovery evaluation in inductive AND transductive
     # modes. Reports visit-GRM aggregates, raw subject aggregates, and a dedicated
     # subject-level GRM diagnostic so stable constitution is not forced through a
@@ -416,6 +422,24 @@ class GRMTCMTrainer:
             if grm_mean is not None and raw_mean is not None:
                 delta = grm_mean - raw_mean
                 print(f"  {'Δ GRM vs raw aggregate (mean R²)':<32} " + "  ".join(" " * 10 for _ in axes) + f"  {delta:+6.4f}")
+
+        hsweep = metrics.get("horizon_sweep", {})
+        horizons = hsweep.get("horizons", [])
+        if horizons:
+            sw = hsweep.get("smooth_window", "?")
+            print(f"\n  HORIZON SWEEP (smoothed-delta R², MA window={sw}; persistence=Δ0)")
+            model_keys = ["persistence_zero", "grm_ridge", "pca_ridge", "takens_ridge"]
+            header = f"  {'model':<24}" + "".join(f"  {'h=' + str(h):>8}" for h in horizons)
+            print(header)
+            print(f"  {'-' * 24}" + "".join(f"  {'-' * 8}" for _ in horizons))
+            for mk in model_keys:
+                cells = []
+                for h in horizons:
+                    hdata = hsweep.get(f"h{h}", {})
+                    entry = hdata.get(mk, {})
+                    r2 = entry.get("r2")
+                    cells.append(f"{r2:8.4f}" if r2 is not None else "       -")
+                print(f"  {mk:<24}" + "  ".join(cells))
 
         note = metrics.get("tier_note") or metrics.get("interpretation_guardrail")
         if note:
@@ -742,6 +766,16 @@ class GRMTCMTrainer:
                 train_visits, train_embeddings, test_visits, test_embeddings,
             ),
             "spectral_signal_concentration": self._spectral_signal_concentration(test_visits, test_embeddings),
+            "horizon_sweep": self._evaluate_horizon_sweep(
+                pd.concat([train_visits, test_visits], ignore_index=True),
+                {
+                    "grm": np.vstack([train_embeddings, test_embeddings]),
+                    "pca": np.vstack([pca_train, pca_test]),
+                    "takens": np.vstack([takens_train, takens_test]),
+                },
+                np.arange(len(train_visits)),
+                np.arange(len(train_visits), len(train_visits) + len(test_visits)),
+            ),
             "parsimony": self._parsimony_summary(),
             "flare_temperature": float(self.flare_temperature) if self.flare_temperature is not None else None,
             "latent_recovery": latent_recovery,
@@ -1299,6 +1333,9 @@ class GRMTCMTrainer:
                 visits.iloc[test_idx], embeddings[test_idx],
             ),
             "spectral_signal_concentration": self._spectral_signal_concentration(visits.iloc[test_idx], embeddings[test_idx]),
+            "horizon_sweep": self._evaluate_horizon_sweep(
+                visits, {"grm": X_grm, "pca": X_pca, "takens": X_takens}, train_idx, test_idx,
+            ),
             "parsimony": self._parsimony_summary(),
             "flare_temperature": float(self.flare_temperature) if self.flare_temperature is not None else None,
             "latent_recovery": self._latent_recovery_capture(visits, embeddings, latent) if latent is not None else {},
@@ -1964,6 +2001,81 @@ class GRMTCMTrainer:
                     "per_mode_signal_fraction": [float(v / total) for v in regime_scores],
                 }
         return out
+
+    def _evaluate_horizon_sweep(
+        self,
+        visits: pd.DataFrame,
+        embeddings_dict: Dict[str, np.ndarray],
+        train_idx: np.ndarray,
+        test_idx: np.ndarray,
+    ) -> Dict[str, Any]:
+        """Evaluate smoothed-delta regression at multiple prediction horizons.
+
+        For each horizon h, computes:
+          target = MA(score, w)_{t+h} - MA(score, w)_t
+        where w = horizon_smooth_window.  Persistence predicts Δ=0, so any
+        positive R² is genuine signal.  Returns a compact table for the summary.
+
+        embeddings_dict maps name → feature matrix (all rows, indexed by train/test).
+        """
+
+        score_col = "global_dysregulation_score"
+        if score_col not in visits.columns:
+            return {}
+        w = self.cfg.horizon_smooth_window
+        subject_ids = visits["subject_id"].to_numpy(int)
+        raw_score = visits[score_col].to_numpy(float)
+
+        # Pre-compute per-subject smoothed score (trailing MA).
+        smoothed = np.full_like(raw_score, np.nan)
+        for sid in np.unique(subject_ids):
+            mask = subject_ids == sid
+            s = raw_score[mask]
+            cs = np.nancumsum(s)
+            n_vals = np.arange(1, len(s) + 1, dtype=float)
+            n_vals = np.minimum(n_vals, float(w))
+            padded = np.concatenate([[0.0], cs])
+            start = np.maximum(np.arange(len(s)) - w + 1, 0).astype(int)
+            sums = padded[np.arange(1, len(s) + 1)] - padded[start]
+            smoothed[mask] = sums / n_vals
+
+        results: Dict[str, Any] = {"horizons": list(self.cfg.horizon_sweep), "smooth_window": w}
+
+        for h in self.cfg.horizon_sweep:
+            # Compute target: smoothed_{t+h} - smoothed_t, per subject.
+            target = np.full(len(visits), np.nan, dtype=float)
+            for sid in np.unique(subject_ids):
+                mask = subject_ids == sid
+                idxs = np.where(mask)[0]
+                sm = smoothed[mask]
+                for local_i, global_i in enumerate(idxs):
+                    if local_i + h < len(sm) and np.isfinite(sm[local_i]) and np.isfinite(sm[local_i + h]):
+                        target[global_i] = sm[local_i + h] - sm[local_i]
+
+            valid = np.isfinite(target)
+            tr = np.intersect1d(train_idx, np.where(valid)[0])
+            te = np.intersect1d(test_idx, np.where(valid)[0])
+            if len(tr) < 10 or len(te) < 10:
+                results[f"h{h}"] = {"note": "insufficient valid rows", "n_train": len(tr), "n_test": len(te)}
+                continue
+
+            y_tr, y_te = target[tr], target[te]
+            horizon_metrics: Dict[str, Any] = {"n_train": len(tr), "n_test": len(te)}
+
+            # Persistence baseline: predict Δ=0.
+            pred_zero = np.zeros_like(y_te)
+            horizon_metrics["persistence_zero"] = {"r2": float(r2_score(y_te, pred_zero)),
+                                                    "rmse": float(np.sqrt(mean_squared_error(y_te, pred_zero)))}
+
+            for name, X in embeddings_dict.items():
+                ridge = Ridge(alpha=1.0).fit(X[tr], y_tr)
+                pred = ridge.predict(X[te])
+                horizon_metrics[f"{name}_ridge"] = {"r2": float(r2_score(y_te, pred)),
+                                                     "rmse": float(np.sqrt(mean_squared_error(y_te, pred)))}
+
+            results[f"h{h}"] = horizon_metrics
+
+        return results
 
     def _parsimony_summary(self) -> Dict[str, Any]:
         """Fixed hyperparameter counts for model-family comparison."""
