@@ -4,7 +4,10 @@ __pycache__/
 *.py[cod]
 
 /synthetic_grm_tcm/
+/synthetic_grm_tcm_manifold/
 /grm_tcm_results/
 /grm_tcm_results_inductive/
+/grm_tcm_results_manifold/
+/grm_tcm_manifold_eval/
 /grm_tcm_experiments/
 /grm_tcm_dynamic/
