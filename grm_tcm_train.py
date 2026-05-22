@@ -31,6 +31,7 @@ from scipy.linalg import orthogonal_procrustes
 from scipy.optimize import minimize_scalar
 from scipy.sparse.linalg import eigsh
 from sklearn.base import BaseEstimator
+from sklearn.decomposition import PCA
 from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
 from sklearn.impute import SimpleImputer
 from sklearn.kernel_ridge import KernelRidge
@@ -218,15 +219,19 @@ class GRMTCMTrainer:
         onset = metrics.get("flare_onset_classification", {})
 
         reg_order = [
-            "grm_ridge", "grm_plus_lag_ridge", "smooth_rbf_kernel_ridge", "raw_random_forest",
+            "grm_ridge", "grm_plus_lag_ridge", "pca_ridge", "pca_plus_lag_ridge",
+            "smooth_rbf_kernel_ridge", "raw_random_forest",
             "naive_current_score", "persistence_yesterday_score",
         ]
         cls_order = [
             "grm_logistic", "grm_logistic_calibrated", "grm_plus_lag_logistic",
+            "pca_logistic", "pca_plus_lag_logistic",
             "smooth_rbf_kernel_ridge", "raw_random_forest", "naive_current_score", "persistence_yesterday_flare",
         ]
         onset_order = [
-            "grm_logistic", "grm_plus_lag_logistic", "lag_only_logistic",
+            "grm_logistic", "grm_plus_lag_logistic",
+            "pca_logistic", "pca_plus_lag_logistic",
+            "lag_only_logistic",
             "raw_random_forest", "naive_marginal",
         ]
         reg_metrics = ["r2", "rmse", "mae"]
@@ -279,7 +284,7 @@ class GRMTCMTrainer:
                 if k in reg and reg[k]:
                     print(_row(k, reg[k], reg_metrics))
             best_reg = _best_baseline(
-                reg, ["smooth_rbf_kernel_ridge", "raw_random_forest", "naive_current_score", "persistence_yesterday_score"],
+                reg, ["pca_ridge", "pca_plus_lag_ridge", "smooth_rbf_kernel_ridge", "raw_random_forest", "naive_current_score", "persistence_yesterday_score"],
                 "r2", higher_is_better=True,
             )
             headline_reg = reg.get("grm_plus_lag_ridge") or reg.get("grm_ridge")
@@ -294,7 +299,7 @@ class GRMTCMTrainer:
                 if k in cls and cls[k]:
                     print(_row(k, cls[k], cls_metrics))
             best_cls = _best_baseline(
-                cls, ["smooth_rbf_kernel_ridge", "raw_random_forest", "naive_current_score", "persistence_yesterday_flare"],
+                cls, ["pca_logistic", "pca_plus_lag_logistic", "smooth_rbf_kernel_ridge", "raw_random_forest", "naive_current_score", "persistence_yesterday_flare"],
                 "roc_auc", higher_is_better=True,
             )
             grm_for_delta = cls.get("grm_plus_lag_logistic") or cls.get("grm_logistic_calibrated") or cls.get("grm_logistic")
@@ -314,7 +319,7 @@ class GRMTCMTrainer:
                 if k in onset and isinstance(onset[k], dict) and onset[k]:
                     print(_row(k, onset[k], cls_metrics))
             best_onset = _best_baseline(
-                onset, ["lag_only_logistic", "raw_random_forest", "naive_marginal"],
+                onset, ["pca_logistic", "pca_plus_lag_logistic", "lag_only_logistic", "raw_random_forest", "naive_marginal"],
                 "roc_auc", higher_is_better=True,
             )
             grm_for_delta = onset.get("grm_plus_lag_logistic") or onset.get("grm_logistic")
@@ -333,7 +338,7 @@ class GRMTCMTrainer:
                     if k in hard and isinstance(hard[k], dict) and hard[k]:
                         print(_row(k, hard[k], cls_metrics))
                 best_hard = _best_baseline(
-                    hard, ["lag_only_logistic", "raw_random_forest", "naive_marginal"],
+                    hard, ["pca_logistic", "pca_plus_lag_logistic", "lag_only_logistic", "raw_random_forest", "naive_marginal"],
                     "roc_auc", higher_is_better=True,
                 )
                 grm_hard = hard.get("grm_plus_lag_logistic") or hard.get("grm_logistic")
@@ -350,11 +355,11 @@ class GRMTCMTrainer:
                 print(f"  REGRESSION (target=next_day_score, aliased subset)")
                 print(f"  {'predictor':<32} {'R^2':>7}  {'RMSE':>7}  {'MAE':>7}")
                 print(f"  {'-' * 32} {'-' * 7}  {'-' * 7}  {'-' * 7}")
-                for k in ["grm_plus_lag_ridge", "raw_random_forest", "naive_current_score", "persistence_yesterday_score"]:
+                for k in ["grm_plus_lag_ridge", "pca_plus_lag_ridge", "raw_random_forest", "naive_current_score", "persistence_yesterday_score"]:
                     if k in a_reg and a_reg[k]:
                         print(_row(k, a_reg[k], reg_metrics))
                 best_a = _best_baseline(
-                    a_reg, ["raw_random_forest", "naive_current_score", "persistence_yesterday_score"],
+                    a_reg, ["pca_plus_lag_ridge", "raw_random_forest", "naive_current_score", "persistence_yesterday_score"],
                     "r2", higher_is_better=True,
                 )
                 grm_a = a_reg.get("grm_plus_lag_ridge")
@@ -365,11 +370,11 @@ class GRMTCMTrainer:
                 print(f"  CLASSIFICATION (target=flare_next_day, aliased subset)")
                 print(f"  {'predictor':<32} {'AUC':>7}  {'Brier':>7}  {'LogLs':>7}")
                 print(f"  {'-' * 32} {'-' * 7}  {'-' * 7}  {'-' * 7}")
-                for k in ["grm_plus_lag_logistic", "raw_random_forest", "naive_current_score", "persistence_yesterday_flare"]:
+                for k in ["grm_plus_lag_logistic", "pca_plus_lag_logistic", "raw_random_forest", "naive_current_score", "persistence_yesterday_flare"]:
                     if k in a_cls and a_cls[k]:
                         print(_row(k, a_cls[k], cls_metrics))
                 best_ac = _best_baseline(
-                    a_cls, ["raw_random_forest", "naive_current_score", "persistence_yesterday_flare"],
+                    a_cls, ["pca_plus_lag_logistic", "raw_random_forest", "naive_current_score", "persistence_yesterday_flare"],
                     "roc_auc", higher_is_better=True,
                 )
                 grm_ac = a_cls.get("grm_plus_lag_logistic")
@@ -598,6 +603,32 @@ class GRMTCMTrainer:
             prob_grm_lag_cls = np.full(len(test_visits), 0.5)
             pred_grm_lag_cls = np.zeros(len(test_visits), dtype=int)
 
+        # PCA baseline: linear projection into same dimensionality as GRM modes.
+        # Fit on train_raw only; transform both train and test.
+        pca = PCA(n_components=self.cfg.n_modes, random_state=self.cfg.random_seed)
+        pca_train = pca.fit_transform(train_raw)
+        pca_test = pca.transform(test_raw)
+        pca_ridge = Ridge(alpha=1.0).fit(pca_train, y_reg_train)
+        pred_pca_reg = pca_ridge.predict(pca_test)
+        if len(np.unique(y_cls_train)) >= 2:
+            pca_log = LogisticRegression(max_iter=2000, class_weight="balanced").fit(pca_train, y_cls_train)
+            prob_pca_cls = pca_log.predict_proba(pca_test)[:, 1]
+            pred_pca_cls = (prob_pca_cls >= 0.5).astype(int)
+        else:
+            prob_pca_cls = np.full(len(test_visits), 0.5)
+            pred_pca_cls = np.zeros(len(test_visits), dtype=int)
+        X_train_pca_lag = self._augment_with_lag(pca_train, train_visits, fill_score, fill_flare)
+        X_test_pca_lag = self._augment_with_lag(pca_test, test_visits, fill_score, fill_flare)
+        pca_lag_ridge = Ridge(alpha=1.0).fit(X_train_pca_lag, y_reg_train)
+        pred_pca_lag_reg = pca_lag_ridge.predict(X_test_pca_lag)
+        if len(np.unique(y_cls_train)) >= 2:
+            pca_lag_log = LogisticRegression(max_iter=2000, class_weight="balanced").fit(X_train_pca_lag, y_cls_train)
+            prob_pca_lag_cls = pca_lag_log.predict_proba(X_test_pca_lag)[:, 1]
+            pred_pca_lag_cls = (prob_pca_lag_cls >= 0.5).astype(int)
+        else:
+            prob_pca_lag_cls = np.full(len(test_visits), 0.5)
+            pred_pca_lag_cls = np.zeros(len(test_visits), dtype=int)
+
         # Flare-onset secondary target. Eligible rows = where flare_today is known.
         y_onset_train_raw = train_visits[self.cfg.target_classification_onset].astype(float).to_numpy()
         y_onset_test_raw = test_visits[self.cfg.target_classification_onset].astype(float).to_numpy()
@@ -612,6 +643,8 @@ class GRMTCMTrainer:
             X_train_grm_lag[tr_onset_valid], X_test_grm_lag[te_onset_valid],
             train_raw[tr_onset_valid], test_raw[te_onset_valid],
             flare_today_test_arr,
+            X_pca_train=pca_train[tr_onset_valid], X_pca_test=pca_test[te_onset_valid],
+            X_pca_lag_train=X_train_pca_lag[tr_onset_valid], X_pca_lag_test=X_test_pca_lag[te_onset_valid],
         )
 
         # 5. Out-of-sample latent recovery: fit Procrustes on train, apply to test.
@@ -631,6 +664,8 @@ class GRMTCMTrainer:
             "regression": {
                 "grm_ridge": self._reg_metrics(y_reg_test, pred_grm_reg),
                 "grm_plus_lag_ridge": self._reg_metrics(y_reg_test, pred_grm_lag_reg),
+                "pca_ridge": self._reg_metrics(y_reg_test, pred_pca_reg),
+                "pca_plus_lag_ridge": self._reg_metrics(y_reg_test, pred_pca_lag_reg),
                 "smooth_rbf_kernel_ridge": self._reg_metrics(y_reg_test, pred_smooth_reg),
                 "raw_random_forest": self._reg_metrics(y_reg_test, pred_raw_reg),
                 "naive_current_score": self._reg_metrics(y_reg_test, pred_naive_reg),
@@ -643,6 +678,8 @@ class GRMTCMTrainer:
                     if prob_grm_cls_cal is not None else {}
                 ),
                 "grm_plus_lag_logistic": self._cls_metrics(y_cls_test, pred_grm_lag_cls, prob_grm_lag_cls),
+                "pca_logistic": self._cls_metrics(y_cls_test, pred_pca_cls, prob_pca_cls),
+                "pca_plus_lag_logistic": self._cls_metrics(y_cls_test, pred_pca_lag_cls, prob_pca_lag_cls),
                 "smooth_rbf_kernel_ridge": self._cls_metrics(
                     y_cls_test, (prob_smooth_cls >= 0.5).astype(int), prob_smooth_cls
                 ),
@@ -659,6 +696,8 @@ class GRMTCMTrainer:
                 pred_raw_reg, prob_raw_cls,
                 pred_naive_reg, prob_naive_cls,
                 persistence,
+                pred_pca_lag_reg=pred_pca_lag_reg,
+                prob_pca_lag_cls=prob_pca_lag_cls,
             ),
             "constitution_recovery": self._evaluate_constitution_recovery(
                 train_visits, train_embeddings, test_visits, test_embeddings,
@@ -1112,6 +1151,16 @@ class GRMTCMTrainer:
             self.cfg.target_classification, self.cfg.target_regression,
         )
 
+        # PCA baseline: linear projection of raw observations into the same
+        # dimensionality as GRM modes. Fit on train only to respect the split.
+        # This is the Pang-EDR analogue: if PCA matches GRM, the load-bearing
+        # signal is linear variance, not graph topology.
+        pca = PCA(n_components=self.cfg.n_modes, random_state=self.cfg.random_seed)
+        pca.fit(X_raw[train_idx])
+        X_pca = pca.transform(X_raw)
+        pred_pca_reg, _ = self._fit_reg(X_pca, y_reg, train_idx, test_idx, "ridge")
+        pred_pca_cls, prob_pca_cls, _ = self._fit_cls(X_pca, y_cls, train_idx, test_idx, "logistic")
+
         # GRM + lag head: same GRM coordinates with per-subject target lags appended.
         # This is the "fair deployment" comparison against the persistence baseline.
         fill_score = float(np.nanmedian(y_reg[train_idx]))
@@ -1119,6 +1168,11 @@ class GRMTCMTrainer:
         X_grm_lag = self._augment_with_lag(X_grm, visits, fill_score, fill_flare)
         pred_grm_lag_reg, _ = self._fit_reg(X_grm_lag, y_reg, train_idx, test_idx, "ridge")
         pred_grm_lag_cls, prob_grm_lag_cls, _ = self._fit_cls(X_grm_lag, y_cls, train_idx, test_idx, "logistic")
+
+        # PCA + lag head: same lag augmentation applied to PCA embeddings.
+        X_pca_lag = self._augment_with_lag(X_pca, visits, fill_score, fill_flare)
+        pred_pca_lag_reg, _ = self._fit_reg(X_pca_lag, y_reg, train_idx, test_idx, "ridge")
+        pred_pca_lag_cls, prob_pca_lag_cls, _ = self._fit_cls(X_pca_lag, y_cls, train_idx, test_idx, "logistic")
 
         # Flare-onset secondary target (today=0 -> tomorrow=1). Eligible rows only.
         y_onset_raw = visits[self.cfg.target_classification_onset].astype(float).to_numpy()
@@ -1133,6 +1187,8 @@ class GRMTCMTrainer:
             X_grm_lag[onset_train], X_grm_lag[onset_test],
             X_raw[onset_train], X_raw[onset_test],
             flare_today_test,
+            X_pca_train=X_pca[onset_train], X_pca_test=X_pca[onset_test],
+            X_pca_lag_train=X_pca_lag[onset_train], X_pca_lag_test=X_pca_lag[onset_test],
         )
 
         self.flare_temperature = self._fit_flare_temperature(X_grm, y_cls, train_idx)
@@ -1145,6 +1201,8 @@ class GRMTCMTrainer:
             "regression": {
                 "grm_ridge": self._reg_metrics(y_reg[test_idx], pred_grm_reg),
                 "grm_plus_lag_ridge": self._reg_metrics(y_reg[test_idx], pred_grm_lag_reg),
+                "pca_ridge": self._reg_metrics(y_reg[test_idx], pred_pca_reg),
+                "pca_plus_lag_ridge": self._reg_metrics(y_reg[test_idx], pred_pca_lag_reg),
                 "smooth_rbf_kernel_ridge": self._reg_metrics(y_reg[test_idx], pred_smooth_reg),
                 "raw_random_forest": self._reg_metrics(y_reg[test_idx], pred_raw_reg),
                 "naive_current_score": self._reg_metrics(y_reg[test_idx], pred_naive_reg),
@@ -1157,6 +1215,8 @@ class GRMTCMTrainer:
                     if prob_grm_cls_calibrated is not None else {}
                 ),
                 "grm_plus_lag_logistic": self._cls_metrics(y_cls[test_idx], pred_grm_lag_cls, prob_grm_lag_cls),
+                "pca_logistic": self._cls_metrics(y_cls[test_idx], pred_pca_cls, prob_pca_cls),
+                "pca_plus_lag_logistic": self._cls_metrics(y_cls[test_idx], pred_pca_lag_cls, prob_pca_lag_cls),
                 "smooth_rbf_kernel_ridge": self._cls_metrics(
                     y_cls[test_idx], (prob_smooth_cls >= 0.5).astype(int), prob_smooth_cls
                 ),
@@ -1173,6 +1233,8 @@ class GRMTCMTrainer:
                 pred_raw_reg, prob_raw_cls,
                 pred_naive_reg, prob_naive_cls,
                 persistence,
+                pred_pca_lag_reg=pred_pca_lag_reg,
+                prob_pca_lag_cls=prob_pca_lag_cls,
             ),
             "constitution_recovery": self._evaluate_constitution_recovery(
                 visits.iloc[train_idx], embeddings[train_idx],
@@ -1220,6 +1282,11 @@ class GRMTCMTrainer:
         X_grm_lag_train: np.ndarray, X_grm_lag_test: np.ndarray,
         X_raw_train: np.ndarray, X_raw_test: np.ndarray,
         flare_today_test: np.ndarray,
+        *,
+        X_pca_train: Optional[np.ndarray] = None,
+        X_pca_test: Optional[np.ndarray] = None,
+        X_pca_lag_train: Optional[np.ndarray] = None,
+        X_pca_lag_test: Optional[np.ndarray] = None,
     ) -> Dict[str, Any]:
         """Fit flare_onset classifiers and score on the pre-sliced eligible subset.
 
@@ -1233,6 +1300,8 @@ class GRMTCMTrainer:
         Baselines:
           - grm_logistic              GRM coordinates only (no lag).
           - grm_plus_lag_logistic     GRM + persistence lags (headline model).
+          - pca_logistic              PCA coordinates only (no lag).
+          - pca_plus_lag_logistic     PCA + persistence lags.
           - lag_only_logistic         Persistence lags only — isolates the trivial filter.
           - raw_random_forest         Raw 12-obs RF (with global_dysregulation_score).
           - naive_marginal            Constant prediction at the training class prior.
@@ -1248,6 +1317,20 @@ class GRMTCMTrainer:
         clf_grm_lag = LogisticRegression(max_iter=2000, class_weight="balanced").fit(X_grm_lag_train, y_onset_train)
         prob_grm_lag = clf_grm_lag.predict_proba(X_grm_lag_test)[:, 1]
         pred_grm_lag = (prob_grm_lag >= 0.5).astype(int)
+
+        # PCA baselines (when provided).
+        prob_pca: Optional[np.ndarray] = None
+        pred_pca: Optional[np.ndarray] = None
+        prob_pca_lag: Optional[np.ndarray] = None
+        pred_pca_lag: Optional[np.ndarray] = None
+        if X_pca_train is not None and X_pca_test is not None:
+            clf_pca = LogisticRegression(max_iter=2000, class_weight="balanced").fit(X_pca_train, y_onset_train)
+            prob_pca = clf_pca.predict_proba(X_pca_test)[:, 1]
+            pred_pca = (prob_pca >= 0.5).astype(int)
+        if X_pca_lag_train is not None and X_pca_lag_test is not None:
+            clf_pca_lag = LogisticRegression(max_iter=2000, class_weight="balanced").fit(X_pca_lag_train, y_onset_train)
+            prob_pca_lag = clf_pca_lag.predict_proba(X_pca_lag_test)[:, 1]
+            pred_pca_lag = (prob_pca_lag >= 0.5).astype(int)
 
         # Lag-only baseline: the last two columns of X_grm_lag are the persistence lags.
         # This is the "trivial filter" baseline that bounds how much of the headline AUC
@@ -1278,6 +1361,10 @@ class GRMTCMTrainer:
                 return block
             block["grm_logistic"] = self._cls_metrics(yt, pred_grm[mask], prob_grm[mask])
             block["grm_plus_lag_logistic"] = self._cls_metrics(yt, pred_grm_lag[mask], prob_grm_lag[mask])
+            if pred_pca is not None:
+                block["pca_logistic"] = self._cls_metrics(yt, pred_pca[mask], prob_pca[mask])
+            if pred_pca_lag is not None:
+                block["pca_plus_lag_logistic"] = self._cls_metrics(yt, pred_pca_lag[mask], prob_pca_lag[mask])
             block["lag_only_logistic"] = self._cls_metrics(yt, pred_lag_only[mask], prob_lag_only[mask])
             block["raw_random_forest"] = self._cls_metrics(yt, pred_raw[mask], prob_raw[mask])
             block["naive_marginal"] = self._cls_metrics(yt, pred_naive[mask], prob_naive[mask])
@@ -1481,6 +1568,9 @@ class GRMTCMTrainer:
         pred_raw_reg: np.ndarray, prob_raw_cls: np.ndarray,
         pred_naive_reg: np.ndarray, prob_naive_cls: np.ndarray,
         persistence: Dict[str, np.ndarray],
+        *,
+        pred_pca_lag_reg: Optional[np.ndarray] = None,
+        prob_pca_lag_cls: Optional[np.ndarray] = None,
     ) -> Dict[str, Any]:
         """Score predictions on the aliased-pair subset only.
 
@@ -1513,6 +1603,8 @@ class GRMTCMTrainer:
                 "constitution_dynamics_strength > 0."
             ),
         }
+        if pred_pca_lag_reg is not None:
+            out["regression"]["pca_plus_lag_ridge"] = self._reg_metrics(y_reg_test[mask], pred_pca_lag_reg[mask])
         if len(np.unique(y_cls_test[mask])) >= 2:
             out["classification"] = {
                 "grm_plus_lag_logistic": self._cls_metrics(
@@ -1530,6 +1622,10 @@ class GRMTCMTrainer:
                     np.asarray(persistence["flare_prob"])[mask],
                 ),
             }
+            if prob_pca_lag_cls is not None:
+                out["classification"]["pca_plus_lag_logistic"] = self._cls_metrics(
+                    y_cls_test[mask], (prob_pca_lag_cls[mask] >= 0.5).astype(int), prob_pca_lag_cls[mask]
+                )
         return out
 
     def _evaluate_constitution_recovery(
