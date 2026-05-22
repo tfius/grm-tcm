@@ -586,7 +586,87 @@ def save_regime_plots(df: pd.DataFrame, plot_dir: Path) -> None:
         save_heatmap(counts, plot_dir / "true_regime_distribution_by_tcm_label.png", "True Regime Distribution by TCM-Like Label", "true_regime", "tcm_like_label")
 
 
-def generate_plots(df: pd.DataFrame, corr_df: pd.DataFrame, modes: List[str], output_dir: Path) -> None:
+def save_manifold_scatter_3d(df: pd.DataFrame, plot_dir: Path) -> None:
+    """3D scatter of the first three GRM modes, colored by true_regime and hidden_subtype."""
+
+    needed = ["grm_mode_1", "grm_mode_2", "grm_mode_3"]
+    if not set(needed).issubset(df.columns):
+        return
+    label_cols = [c for c in ("true_regime", "hidden_subtype") if c in df.columns]
+    if not label_cols:
+        return
+    plot_df = df[needed + label_cols].dropna(subset=needed)
+    if plot_df.empty:
+        return
+
+    fig = plt.figure(figsize=(12, 5))
+    for i, label_col in enumerate(label_cols, start=1):
+        subdf = plot_df.dropna(subset=[label_col])
+        if subdf.empty:
+            continue
+        codes, uniques = pd.factorize(subdf[label_col].astype(str))
+        ax = fig.add_subplot(1, len(label_cols), i, projection="3d")
+        scatter = ax.scatter(
+            subdf["grm_mode_1"],
+            subdf["grm_mode_2"],
+            subdf["grm_mode_3"],
+            c=codes,
+            s=6,
+            alpha=0.55,
+        )
+        ax.set_xlabel("grm_mode_1")
+        ax.set_ylabel("grm_mode_2")
+        ax.set_zlabel("grm_mode_3")
+        ax.set_title(f"Modes 1-3 by {label_col}")
+        handles, _ = scatter.legend_elements()
+        labels = [str(x) for x in uniques[: len(handles)]]
+        if handles:
+            ax.legend(handles, labels, title=label_col, loc="best", fontsize="x-small")
+
+    fig.tight_layout()
+    path = plot_dir / "manifold_scatter_3d.png"
+    save_with_caption(fig, path, dpi=160)
+    print(f"[plot] {path}")
+
+
+def save_eigen_spectrum(results_dir: Path, plot_dir: Path) -> None:
+    """Plot graph-Laplacian eigenvalues with the n_modes cutoff annotated."""
+
+    basis_path = results_dir / "model" / "grm_basis.npz"
+    if not basis_path.exists():
+        print(f"[skip] {basis_path}")
+        return
+    data = np.load(basis_path)
+    eigenvalues = data["eigenvalues"].astype(float)
+    if eigenvalues.size == 0:
+        return
+    n_modes = int(data["n_modes"]) if "n_modes" in data.files else len(eigenvalues)
+    idx = np.arange(1, len(eigenvalues) + 1)
+
+    fig, (ax_lin, ax_log) = plt.subplots(1, 2, figsize=(11, 4))
+    ax_lin.plot(idx, eigenvalues, marker="o", markersize=3, linewidth=1)
+    ax_lin.axvline(n_modes, linestyle="--", linewidth=1)
+    ax_lin.set_title("Eigenvalues (linear)")
+    ax_lin.set_xlabel("Mode index")
+    ax_lin.set_ylabel("lambda_k")
+
+    positive = eigenvalues[eigenvalues > 0]
+    floor = float(positive.min()) if positive.size else 1e-8
+    clipped = np.clip(eigenvalues, floor, None)
+    ax_log.semilogy(idx, clipped, marker="o", markersize=3, linewidth=1)
+    ax_log.axvline(n_modes, linestyle="--", linewidth=1)
+    ax_log.set_title("Eigenvalues (log)")
+    ax_log.set_xlabel("Mode index")
+    ax_log.set_ylabel("lambda_k (log)")
+
+    fig.suptitle(f"Graph Laplacian spectrum (n_modes cutoff = {n_modes})")
+    fig.tight_layout()
+    path = plot_dir / "graph_eigen_spectrum.png"
+    save_with_caption(fig, path, dpi=160)
+    print(f"[plot] {path}")
+
+
+def generate_plots(df: pd.DataFrame, corr_df: pd.DataFrame, modes: List[str], output_dir: Path, results_dir: Path) -> None:
     """Generate all required matplotlib plots."""
 
     plot_dir = output_dir / "plots"
@@ -606,6 +686,8 @@ def generate_plots(df: pd.DataFrame, corr_df: pd.DataFrame, modes: List[str], ou
     save_group_mean_modes(df, modes, "true_regime", plot_dir / "mean_grm_modes_by_true_regime.png")
     save_group_mean_modes(df, modes, "tcm_like_label", plot_dir / "mean_grm_modes_by_tcm_like_label.png")
     save_regime_plots(df, plot_dir)
+    save_manifold_scatter_3d(df, plot_dir)
+    save_eigen_spectrum(results_dir, plot_dir)
 
 
 def make_summary(
@@ -716,7 +798,7 @@ def run(cfg: DiagnosticsConfig) -> None:
         save_table(output_dir / "source_grm_feature_modes.csv", feature_modes)
 
     print("[step] Generating plots")
-    generate_plots(df, corr_df, modes, output_dir)
+    generate_plots(df, corr_df, modes, output_dir, results_dir)
 
     summary = make_summary(cfg, df, metrics, corr_df, grouped_df, findings_df, cluster_scores)
     summary_path = output_dir / "diagnostics_summary.json"

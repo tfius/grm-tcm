@@ -86,6 +86,18 @@ CAPTIONS: dict[str, str] = {
         "Mass spread across columns reveals where naive labels merge multiple true regimes — the "
         "ontology-mismatch signal."
     ),
+    "manifold_scatter_3d": (
+        "First three GRM modes per visit, 3D scatter. Left panel colored by true_regime, right by "
+        "hidden_subtype. Visible clustering in either panel means the spectral coordinates align with "
+        "that axis; structure that appears in one panel but not the other localizes where the naive "
+        "ontology disagrees with the real generative axis."
+    ),
+    "graph_eigen_spectrum": (
+        "Laplacian eigenvalue spectrum (lambda_k vs mode index), linear (left) and log (right). The "
+        "dashed line marks the n_modes cutoff retained as the GRM basis. A pronounced gap before the "
+        "cutoff is a strong intrinsic-dimensionality signal; a smooth tail suggests the cutoff is "
+        "imposing rank rather than discovering it."
+    ),
     # --- grm_tcm_dynamic_grm.py ---
     "state_source_metric_comparison": (
         "Headline dynamic metrics under three state vocabularies: kmeans_observation (default), "

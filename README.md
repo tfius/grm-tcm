@@ -85,6 +85,20 @@ columns, `true_lbo_modes.csv`, and `true_lbo_eigenmodes.npz`. The evaluator
 reports how well saved GRM modes align with the analytical torus
 Laplace-Beltrami modes.
 
+To run a graph-mode experiment matrix that puts prediction and geometry metrics
+in one table:
+
+```bash
+uv run python grm_tcm_experiments.py --suite manifold --generate
+```
+
+It writes `grm_tcm_experiments/manifold_graph_mode_leaderboard.csv` with
+side-by-side predictive metrics and LBO subspace-alignment metrics for
+`feature_only`, `feature_only_diffusion`, and
+`feature_temporal_treatment`. `feature_only_diffusion` is the geometry-recovery
+training mode: observation KNN only, with density-corrected diffusion-map
+normalization controlled by `--diffusion-alpha`.
+
 Both the trainer and the dynamic pipeline also write a `model/` subdirectory containing the fitted preprocessor, eigenbasis, KMeans, regressors, G-matrices, and a `manifest.json` (config + git sha + input hashes + schema version). The dynamic manifest cross-references the static manifest sha, so a stale static model is rejected at load time.
 
 ## Predicting on new visits

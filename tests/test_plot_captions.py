@@ -82,6 +82,8 @@ EXPECTED_STEMS = {
     "mean_grm_modes_by_tcm_like_label",
     "true_regime_occupancy_by_hidden_subtype",
     "true_regime_distribution_by_tcm_label",
+    "manifold_scatter_3d",
+    "graph_eigen_spectrum",
     # grm_tcm_dynamic_grm.py
     "state_source_metric_comparison",
     "rolling_regime_change_score",

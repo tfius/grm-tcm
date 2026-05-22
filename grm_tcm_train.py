@@ -115,6 +115,7 @@ class GRMTrainConfig:
 
     n_neighbors: int = 12
     similarity_sigma: Optional[float] = None
+    diffusion_alpha: float = 1.0
     temporal_edge_weight: float = 0.75
     same_subject_edge_weight: float = 0.15
     treatment_edge_weight: float = 0.20
@@ -840,6 +841,7 @@ class GRMTCMTrainer:
     def _build_visit_graph(self, visits: pd.DataFrame, X: np.ndarray, events: Optional[pd.DataFrame]) -> sparse.csr_matrix:
         valid_modes = {
             "feature_only",
+            "feature_only_diffusion",
             "temporal_only",
             "feature_temporal",
             "feature_temporal_treatment",
@@ -860,6 +862,7 @@ class GRMTCMTrainer:
         # KNN graph on observation similarity.
         feature_graph_modes = {
             "feature_only",
+            "feature_only_diffusion",
             "feature_temporal",
             "feature_temporal_treatment",
             "feature_temporal_treatment_subject",
@@ -948,7 +951,23 @@ class GRMTCMTrainer:
         W = sparse.coo_matrix((vals, (rows, cols)), shape=(n, n)).tocsr()
         W.setdiag(0.0)
         W.eliminate_zeros()
-        return W.maximum(W.T)
+        W = W.maximum(W.T)
+
+        if self.cfg.graph_mode == "feature_only_diffusion":
+            # Density-corrected diffusion-map normalization. This graph mode is
+            # meant for geometry recovery: alpha=1 reduces sampling-density bias
+            # so the graph Laplacian better approximates the Laplace-Beltrami
+            # operator instead of the density-weighted diffusion operator.
+            alpha = float(self.cfg.diffusion_alpha)
+            if alpha != 0.0:
+                q = np.maximum(np.asarray(W.sum(axis=1)).ravel(), 1e-12)
+                Q = sparse.diags(q ** (-alpha))
+                W = Q @ W @ Q
+                W.setdiag(0.0)
+                W.eliminate_zeros()
+                W = W.maximum(W.T)
+
+        return W
 
     def _subject_similarity_edges(self, visits: pd.DataFrame, X: np.ndarray) -> Tuple[List[int], List[int], List[float]]:
         """Build weak same-day edges between constitutionally similar subjects.
@@ -1738,10 +1757,10 @@ class GRMTCMTrainer:
                 "They make the parsimony tradeoff explicit beside predictive metrics."
             ),
             "grm_structural_hyperparameters": {
-                "count": 8,
+                "count": 9,
                 "items": [
                     "n_modes", "rho", "n_neighbors", "similarity_sigma",
-                    "temporal_edge_weight", "same_subject_edge_weight",
+                    "diffusion_alpha", "temporal_edge_weight", "same_subject_edge_weight",
                     "treatment_edge_weight", "graph_mode",
                 ],
             },
@@ -2117,11 +2136,12 @@ def _parse_cli() -> GRMTrainConfig:
     parser.add_argument("--output-dir", default=defaults.output_dir)
     parser.add_argument("--random-seed", type=int, default=defaults.random_seed)
     parser.add_argument("--graph-mode", default=defaults.graph_mode,
-                        choices=["feature_only", "temporal_only", "feature_temporal",
+                        choices=["feature_only", "feature_only_diffusion", "temporal_only", "feature_temporal",
                                  "feature_temporal_treatment", "feature_temporal_treatment_subject",
                                  "random_graph"])
     parser.add_argument("--n-modes", type=int, default=defaults.n_modes)
     parser.add_argument("--rho", type=float, default=defaults.rho)
+    parser.add_argument("--diffusion-alpha", type=float, default=defaults.diffusion_alpha)
     parser.add_argument("--test-size", type=float, default=defaults.test_size)
     parser.add_argument("--inductive", action="store_true",
                         help="Strict inductive eval: split subjects first, fit on train only, "
@@ -2137,6 +2157,7 @@ def _parse_cli() -> GRMTrainConfig:
         graph_mode=args.graph_mode,
         n_modes=args.n_modes,
         rho=args.rho,
+        diffusion_alpha=args.diffusion_alpha,
         test_size=args.test_size,
         inductive=args.inductive,
         projection=args.projection,
