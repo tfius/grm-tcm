@@ -485,6 +485,43 @@ class GRMTCMTrainer:
                     if acc is not None:
                         print(f"  {mk:<32} {acc:9.4f}")
 
+        tx = metrics.get("treatment_response", {})
+        if tx and tx.get("n_treatment_visits"):
+            n_tx = tx["n_treatment_visits"]
+            print(f"\n  TREATMENT RESPONSE STRATIFICATION (clean treatment windows, n={n_tx})")
+            emb_names = [k for k in tx if isinstance(tx[k], dict) and any(
+                kk.startswith("delta_") or kk == "regime_change" for kk in tx[k]
+            )]
+            if emb_names:
+                # Show eta² per embedding per horizon.
+                h_keys = sorted(set(
+                    k for name in emb_names for k in tx[name] if k.startswith("delta_")
+                ))
+                header = f"  {'embedding':<24}" + "".join(f"  {'η²_' + k.replace('delta_',''):>8}" for k in h_keys) + f"  {'η²_regime':>9}"
+                print(header)
+                print(f"  {'-' * 24}" + "".join(f"  {'-' * 8}" for _ in h_keys) + f"  {'-' * 9}")
+                for name in ["grm", "pca", "takens", "multiscale", "multiscale+grm"]:
+                    if name not in emb_names:
+                        continue
+                    cells = []
+                    for hk in h_keys:
+                        entry = tx[name].get(hk, {})
+                        eta2 = entry.get("eta2")
+                        p = entry.get("p")
+                        s = f"{eta2:8.4f}" if eta2 is not None else "       -"
+                        if p is not None and p < 0.05:
+                            s = s.rstrip() + "*"
+                            s = f"{s:>8}"
+                        cells.append(s)
+                    rc = tx[name].get("regime_change", {})
+                    rc_eta = rc.get("eta2")
+                    rc_s = f"{rc_eta:9.4f}" if rc_eta is not None else "        -"
+                    if rc.get("p") is not None and rc["p"] < 0.05:
+                        rc_s = rc_s.rstrip() + "*"
+                        rc_s = f"{rc_s:>9}"
+                    print(f"  {name:<24}" + "  ".join(cells) + f"  {rc_s}")
+                print(f"  (* p < 0.05)")
+
         hsweep = metrics.get("horizon_sweep", {})
         horizons = hsweep.get("horizons", [])
         if horizons:
@@ -947,6 +984,10 @@ class GRMTCMTrainer:
                 _ind_combined, _ind_emb_dict,
                 _ind_tr_idx, _ind_te_idx,
             ),
+            "treatment_response": self._evaluate_treatment_response(
+                _ind_combined, self.events, _ind_emb_dict,
+                _ind_tr_idx, _ind_te_idx,
+            ),
             # modes/ρ sweep uses train-only eigenvectors — skip in inductive for now.
             "modes_rho_sweep": {},
             "parsimony": self._parsimony_summary(),
@@ -1072,6 +1113,7 @@ class GRMTCMTrainer:
         # Subjects.csv is optional — only the constitution-recovery evaluation needs it.
         subjects_path = self.input_dir / "subjects.csv"
         self.subjects: Optional[pd.DataFrame] = pd.read_csv(subjects_path) if subjects_path.exists() else None
+        self.events: Optional[pd.DataFrame] = events
         return visits, latent, events
 
     def _prepare_visits(self, visits: pd.DataFrame) -> pd.DataFrame:
@@ -1559,6 +1601,9 @@ class GRMTCMTrainer:
             ),
             "regime_prediction": self._evaluate_regime_prediction(
                 visits, _emb_dict, train_idx, test_idx,
+            ),
+            "treatment_response": self._evaluate_treatment_response(
+                visits, self.events, _emb_dict, train_idx, test_idx,
             ),
             "modes_rho_sweep": self._sweep_modes_rho(
                 visits, self.eigenvectors_full, self.eigenvalues_full, train_idx, test_idx,
@@ -2564,6 +2609,151 @@ class GRMTCMTrainer:
                     "nmi": float(normalized_mutual_info_score(tl, pl)),
                 }
             results[f"k{n_cl}"] = cluster_block
+
+        return results
+
+    def _evaluate_treatment_response(
+        self,
+        visits: pd.DataFrame,
+        events: Optional[pd.DataFrame],
+        embeddings_dict: Dict[str, np.ndarray],
+        train_idx: np.ndarray,
+        test_idx: np.ndarray,
+        n_clusters: int = 5,
+    ) -> Dict[str, Any]:
+        """Test whether GRM state stratifies treatment response.
+
+        For each embedding type, cluster treatment-visit embeddings (KMeans fit
+        on train), then measure whether post-treatment outcome (score delta,
+        regime change) differs across clusters.  Reports Kruskal-Wallis H-stat
+        and eta² effect size.  Higher eta² = embedding better predicts
+        differential treatment response — the core TCM claim.
+        """
+
+        if events is None or events.empty or "event_type" not in events.columns:
+            return {}
+        score_col = "global_dysregulation_score"
+        if score_col not in visits.columns:
+            return {}
+
+        horizons = [1, 3, 7]
+
+        treat_df = events.loc[events["event_type"] == "treatment_event", ["subject_id", "day"]].copy()
+        treat_df["subject_id"] = treat_df["subject_id"].astype(int)
+        treat_df["day"] = treat_df["day"].astype(int)
+        treat_df = treat_df.sort_values(["subject_id", "day"]).reset_index(drop=True)
+        # Filter to "clean" index treatments: no other treatment within ±max_h days
+        # for the same subject. Avoids confounding overlapping treatment windows.
+        max_h = max(horizons)
+        clean_mask = np.ones(len(treat_df), dtype=bool)
+        for sid, grp in treat_df.groupby("subject_id"):
+            d = grp["day"].to_numpy(int)
+            idxs = grp.index.to_numpy()
+            for i in range(len(d)):
+                for j in range(len(d)):
+                    if i != j and abs(int(d[j]) - int(d[i])) <= max_h:
+                        clean_mask[idxs[i]] = False
+                        break
+        treat_df = treat_df[clean_mask]
+        treat_keys = set(zip(treat_df["subject_id"], treat_df["day"]))
+        if len(treat_keys) < 20:
+            return {}
+
+        subject_ids = visits["subject_id"].to_numpy(int)
+        days = visits["day"].to_numpy(int)
+        scores = visits[score_col].to_numpy(float)
+        visit_key = {(int(s), int(d)): i for i, (s, d) in enumerate(zip(subject_ids, days))}
+
+        # Build per-subject day→index map for horizon lookups.
+        subj_day_idx: Dict[int, Dict[int, int]] = {}
+        for i, (s, d) in enumerate(zip(subject_ids, days)):
+            subj_day_idx.setdefault(int(s), {})[int(d)] = i
+
+        # Compute post-treatment score deltas at multiple horizons.
+        treat_rows: List[int] = []
+        deltas: Dict[int, List[float]] = {h: [] for h in horizons}
+        regime_changed: List[float] = []
+
+        for s, d in treat_keys:
+            if (s, d) not in visit_key:
+                continue
+            idx = visit_key[(s, d)]
+            s_days = subj_day_idx.get(int(s), {})
+            # At least h=1 must exist.
+            if d + 1 not in s_days:
+                continue
+            treat_rows.append(idx)
+            score_now = scores[idx]
+            for h in horizons:
+                if d + h in s_days and np.isfinite(score_now):
+                    deltas[h].append(float(scores[s_days[d + h]] - score_now))
+                else:
+                    deltas[h].append(float("nan"))
+            # Regime change within 1 day.
+            if "true_regime_id" in visits.columns:
+                r_now = visits.iloc[idx]["true_regime_id"]
+                r_next = visits.iloc[s_days[d + 1]]["true_regime_id"]
+                regime_changed.append(float(r_now != r_next))
+            else:
+                regime_changed.append(float("nan"))
+
+        if len(treat_rows) < 20:
+            return {}
+
+        treat_arr = np.array(treat_rows, dtype=int)
+        delta_arrs = {h: np.array(deltas[h], dtype=float) for h in horizons}
+        regime_arr = np.array(regime_changed, dtype=float)
+
+        # Which treatment rows are in test set?
+        test_set = set(test_idx.tolist())
+        te_mask = np.array([r in test_set for r in treat_rows], dtype=bool)
+        tr_mask = ~te_mask
+        if te_mask.sum() < 10 or tr_mask.sum() < 10:
+            return {}
+
+        from scipy.stats import kruskal
+
+        results: Dict[str, Any] = {
+            "n_treatment_visits": len(treat_rows),
+            "n_train": int(tr_mask.sum()),
+            "n_test": int(te_mask.sum()),
+            "horizons": horizons,
+        }
+
+        for name, X in embeddings_dict.items():
+            X_treat = X[treat_arr]
+            km = KMeans(n_clusters=min(n_clusters, int(tr_mask.sum())), random_state=42, n_init=10)
+            km.fit(X_treat[tr_mask])
+            labels = km.predict(X_treat[te_mask])
+
+            entry: Dict[str, Any] = {}
+            # Score delta stratification per horizon.
+            for h in horizons:
+                d = delta_arrs[h][te_mask]
+                valid = np.isfinite(d)
+                if valid.sum() < 10 or len(np.unique(labels[valid])) < 2:
+                    continue
+                groups = [d[valid & (labels == c)] for c in np.unique(labels[valid]) if (valid & (labels == c)).sum() > 0]
+                if len(groups) < 2:
+                    continue
+                H, p = kruskal(*groups)
+                # Eta-squared: H / (n-1) approximation for Kruskal-Wallis.
+                n_valid = int(valid.sum())
+                eta2 = float((H - len(groups) + 1) / (n_valid - 1)) if n_valid > 1 else 0.0
+                entry[f"delta_h{h}"] = {"H": float(H), "p": float(p), "eta2": max(eta2, 0.0)}
+
+            # Regime-change rate stratification.
+            rc = regime_arr[te_mask]
+            valid_rc = np.isfinite(rc)
+            if valid_rc.sum() >= 10 and len(np.unique(labels[valid_rc])) >= 2:
+                groups = [rc[valid_rc & (labels == c)] for c in np.unique(labels[valid_rc]) if (valid_rc & (labels == c)).sum() > 0]
+                if len(groups) >= 2:
+                    H, p = kruskal(*groups)
+                    n_v = int(valid_rc.sum())
+                    eta2 = float((H - len(groups) + 1) / (n_v - 1)) if n_v > 1 else 0.0
+                    entry["regime_change"] = {"H": float(H), "p": float(p), "eta2": max(eta2, 0.0)}
+
+            results[name] = entry
 
         return results
 
