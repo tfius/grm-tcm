@@ -36,7 +36,12 @@ from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
 from sklearn.impute import SimpleImputer
 from sklearn.kernel_ridge import KernelRidge
 from sklearn.linear_model import LogisticRegression, Ridge
-from sklearn.metrics import accuracy_score, mean_absolute_error, mean_squared_error, r2_score, roc_auc_score
+from sklearn.metrics import (
+    accuracy_score, adjusted_mutual_info_score, adjusted_rand_score,
+    mean_absolute_error, mean_squared_error, normalized_mutual_info_score,
+    r2_score, roc_auc_score,
+)
+from sklearn.cluster import KMeans
 from sklearn.model_selection import GroupShuffleSplit, KFold
 from sklearn.neighbors import NearestNeighbors
 from sklearn.pipeline import Pipeline
@@ -433,6 +438,23 @@ class GRMTCMTrainer:
             if grm_mean is not None and raw_mean is not None:
                 delta = grm_mean - raw_mean
                 print(f"  {'Δ GRM vs raw aggregate (mean R²)':<32} " + "  ".join(" " * 10 for _ in axes) + f"  {delta:+6.4f}")
+
+        tcm = metrics.get("tcm_alignment", {})
+        if tcm and tcm.get("label_columns"):
+            print(f"\n  TCM ALIGNMENT (GRM clusters vs semantic labels, test set)")
+            label_cols = tcm["label_columns"]
+            for k_key in sorted(k for k in tcm if k.startswith("k")):
+                n_cl = k_key
+                block = tcm[k_key]
+                if not block:
+                    continue
+                print(f"  KMeans {k_key}:")
+                print(f"  {'label':<28} {'AMI':>7}  {'ARI':>7}  {'NMI':>7}")
+                print(f"  {'-' * 28} {'-' * 7}  {'-' * 7}  {'-' * 7}")
+                for col in label_cols:
+                    if col in block:
+                        d = block[col]
+                        print(f"  {col:<28} {d['ami']:7.4f}  {d['ari']:7.4f}  {d['nmi']:7.4f}")
 
         hsweep = metrics.get("horizon_sweep", {})
         horizons = hsweep.get("horizons", [])
@@ -859,6 +881,12 @@ class GRMTCMTrainer:
                 train_visits, train_embeddings, test_visits, test_embeddings,
             ),
             "spectral_signal_concentration": self._spectral_signal_concentration(test_visits, test_embeddings),
+            "tcm_alignment": self._evaluate_tcm_alignment(
+                pd.concat([train_visits, test_visits], ignore_index=True),
+                np.vstack([train_embeddings, test_embeddings]),
+                np.arange(len(train_visits)),
+                np.arange(len(train_visits), len(train_visits) + len(test_visits)),
+            ),
             "horizon_sweep": self._evaluate_horizon_sweep(
                 pd.concat([train_visits, test_visits], ignore_index=True),
                 {
@@ -1472,6 +1500,7 @@ class GRMTCMTrainer:
                 visits.iloc[test_idx], embeddings[test_idx],
             ),
             "spectral_signal_concentration": self._spectral_signal_concentration(visits.iloc[test_idx], embeddings[test_idx]),
+            "tcm_alignment": self._evaluate_tcm_alignment(visits, embeddings, train_idx, test_idx),
             "horizon_sweep": self._evaluate_horizon_sweep(
                 visits, {
                     "grm": X_grm, "pca": X_pca, "takens": X_takens, "takens_pca": X_takens_pca,
@@ -2358,6 +2387,57 @@ class GRMTCMTrainer:
                 pred = rf.predict(emb[te])
                 rf_entry[f"h{h}"] = float(r2_score(target[te], pred))
             results[f"m{n_modes}_rho{best_rho}_rf"] = rf_entry
+
+        return results
+
+    def _evaluate_tcm_alignment(
+        self,
+        visits: pd.DataFrame,
+        embeddings: np.ndarray,
+        train_idx: np.ndarray,
+        test_idx: np.ndarray,
+    ) -> Dict[str, Any]:
+        """Measure alignment between GRM embedding clusters and TCM-like labels.
+
+        Clusters GRM embeddings via KMeans, then computes AMI, ARI, and NMI
+        against each available semantic label column. High alignment means
+        the graph topology recovers structure that maps onto TCM categories.
+        Evaluated on test set only for honest scores.
+        """
+
+        label_cols = [
+            "qi_like_label", "tcm_like_label", "true_regime",
+            "contrarian_signature",
+        ]
+        available = [c for c in label_cols if c in visits.columns]
+        if not available or len(test_idx) < 20:
+            return {}
+
+        # Cluster on train, predict on test.
+        emb_test = embeddings[test_idx]
+        n_clusters_options = [5, 7, 10]
+        results: Dict[str, Any] = {"n_test": len(test_idx), "label_columns": available}
+
+        for n_cl in n_clusters_options:
+            if n_cl > len(test_idx):
+                continue
+            km = KMeans(n_clusters=n_cl, random_state=42, n_init=10).fit(embeddings[train_idx])
+            pred_labels = km.predict(emb_test)
+
+            cluster_block: Dict[str, Any] = {}
+            for col in available:
+                true_labels = visits.iloc[test_idx][col].to_numpy()
+                valid = pd.notna(true_labels)
+                if valid.sum() < 20:
+                    continue
+                tl = true_labels[valid]
+                pl = pred_labels[valid]
+                cluster_block[col] = {
+                    "ami": float(adjusted_mutual_info_score(tl, pl)),
+                    "ari": float(adjusted_rand_score(tl, pl)),
+                    "nmi": float(normalized_mutual_info_score(tl, pl)),
+                }
+            results[f"k{n_cl}"] = cluster_block
 
         return results
 
