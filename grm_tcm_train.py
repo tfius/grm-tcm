@@ -148,6 +148,14 @@ class GRMTrainConfig:
     # concatenated into a single feature vector). Set to 1 to disable (snapshot only).
     # Respects subject boundaries; early visits padded with NaN then median-imputed.
     delay_embedding_k: int = 3
+    # Feature source for the visit graph's KNN edges. 'obs' uses raw standardized
+    # observations (snapshot); 'takens' uses delay-embedded trajectory vectors so
+    # the graph encodes phase-space similarity (same symptoms AND same velocity).
+    graph_feature_source: str = "obs"
+    # Apply Coifman-Lafon density correction (α=1) to KNN edges before adding
+    # temporal/treatment edges. Reduces sampling-density bias so eigenmodes
+    # better approximate the Laplace-Beltrami operator geometry.
+    density_correction: bool = False
     # Horizon sweep: evaluate smoothed-delta regression at multiple prediction
     # horizons. Persistence predicts Δ=0, so any positive R² is genuine signal.
     # Computed inline from global_dysregulation_score; additive diagnostic that
@@ -431,7 +439,11 @@ class GRMTCMTrainer:
         if horizons:
             sw = hsweep.get("smooth_window", "?")
             print(f"\n  HORIZON SWEEP (smoothed-delta R², MA window={sw}; persistence=Δ0)")
-            model_keys = ["persistence_zero", "grm_ridge", "pca_ridge", "takens_ridge", "takens_pca_ridge"]
+            model_keys = [
+                "persistence_zero", "grm_ridge", "grm_rf",
+                "pca_ridge", "takens_ridge", "takens_rf",
+                "takens_pca_ridge", "takens+grm_ridge", "takens+grm_rf",
+            ]
             header = f"  {'model':<24}" + "".join(f"  {'h=' + str(h):>8}" for h in horizons)
             print(header)
             print(f"  {'-' * 24}" + "".join(f"  {'-' * 8}" for _ in horizons))
@@ -444,6 +456,29 @@ class GRMTCMTrainer:
                     cells.append(f"{r2:8.4f}" if r2 is not None else "       -")
                 print(f"  {mk:<24}" + "  ".join(cells))
 
+        sweep = metrics.get("modes_rho_sweep", {})
+        if sweep and sweep.get("modes_tested"):
+            modes_tested = sweep["modes_tested"]
+            rho_tested = sweep["rho_tested"]
+            horizons_s = sweep.get("horizons", [])
+            # Print one compact table per horizon.
+            for h in horizons_s:
+                hk = f"h{h}"
+                print(f"\n  MODES/ρ SWEEP (smoothed-delta R² at h={h})")
+                header = f"  {'modes \\\\ ρ':<12}" + "".join(f"  {r:>6}" for r in rho_tested) + f"  {'RF':>6}"
+                print(header)
+                print(f"  {'-' * 12}" + "".join(f"  {'-' * 6}" for _ in rho_tested) + f"  {'-' * 6}")
+                for m in modes_tested:
+                    cells = []
+                    for r in rho_tested:
+                        entry = sweep.get(f"m{m}_rho{r}", {})
+                        val = entry.get(hk)
+                        cells.append(f"{val:6.3f}" if val is not None else "     -")
+                    rf_entry = sweep.get(f"m{m}_rho{rho_tested[0]}_rf", {})
+                    rf_val = rf_entry.get(hk)
+                    cells.append(f"{rf_val:6.3f}" if rf_val is not None else "     -")
+                    print(f"  {m:<12}" + "  ".join(cells))
+
         note = metrics.get("tier_note") or metrics.get("interpretation_guardrail")
         if note:
             print()
@@ -455,7 +490,13 @@ class GRMTCMTrainer:
         self._visit_index = visits[["visit_id", "subject_id", "day"]].copy()
         X_obs, feature_names = self._make_observation_matrix(visits)
         self._X_obs = X_obs
-        W = self._build_visit_graph(visits, X_obs, events)
+        # Choose feature source for graph KNN edges.
+        if self.cfg.graph_feature_source == "takens":
+            X_graph = self._build_delay_embedding(X_obs, visits, self.cfg.delay_embedding_k)
+            print(f"[graph] KNN edges built from delay-embedded features (k={self.cfg.delay_embedding_k}, dim={X_graph.shape[1]})")
+        else:
+            X_graph = X_obs
+        W = self._build_visit_graph(visits, X_graph, events)
         eigenvalues, eigenvectors = self._spectral_decomposition(W)
         eigenvectors = canonicalize_eigvec_signs(eigenvectors)
         self.eigenvalues = eigenvalues
@@ -513,7 +554,12 @@ class GRMTCMTrainer:
         self._X_obs = X_train
 
         # 2b. Build train-only graph + eigenbasis.
-        W_train = self._build_visit_graph(train_visits, X_train, events)
+        if self.cfg.graph_feature_source == "takens":
+            X_train_graph = self._build_delay_embedding(X_train, train_visits, self.cfg.delay_embedding_k)
+            print(f"[graph] KNN edges built from delay-embedded features (k={self.cfg.delay_embedding_k}, dim={X_train_graph.shape[1]})")
+        else:
+            X_train_graph = X_train
+        W_train = self._build_visit_graph(train_visits, X_train_graph, events)
         eigenvalues, eigenvectors = self._spectral_decomposition(W_train)
         eigenvectors = canonicalize_eigvec_signs(eigenvectors)
         self.eigenvalues = eigenvalues
@@ -536,22 +582,33 @@ class GRMTCMTrainer:
             self.logistic_clf = None
 
         # 2d. Surrogate + temperature (both train-only).
-        self._fit_embedding_surrogate(X_train, train_embeddings)
+        # When graph was built from delay-embedded features, the surrogate should
+        # map from X_takens (trajectory) → embeddings, not X_obs (snapshot).
+        X_train_surr = X_train_graph if self.cfg.graph_feature_source == "takens" else X_train
+        self._fit_embedding_surrogate(X_train_surr, train_embeddings)
         self.flare_temperature = self._fit_flare_temperature(train_embeddings, y_cls_train, self.train_idx)
 
         # 3. Project test observations.
         X_test_raw = test_visits[self.feature_names].to_numpy(float)
         X_test = self.obs_preprocessor.transform(X_test_raw)
 
+        # Match projection input to graph feature source: if graph used X_takens,
+        # the projection must also use delay-embedded test features so distances
+        # are in the same space.
+        if self.cfg.graph_feature_source == "takens":
+            X_test_proj = self._build_delay_embedding(X_test, test_visits, self.cfg.delay_embedding_k)
+        else:
+            X_test_proj = X_test
+
         if self.cfg.projection == "surrogate":
-            test_embeddings = surrogate_project(self.embedding_surrogate, X_test)
+            test_embeddings = surrogate_project(self.embedding_surrogate, X_test_proj)
         else:  # nystrom
             if self.nn_index is None:
                 raise RuntimeError(
                     f"Nyström projection requires a KNN-based graph_mode; got {self.cfg.graph_mode!r}."
                 )
             test_embeddings = nystrom_extend_arrays(
-                X_test,
+                X_test_proj,
                 nn_index=self.nn_index,
                 knn_sigma=float(self.knn_sigma),
                 eigenvalues=self.eigenvalues,
@@ -639,7 +696,7 @@ class GRMTCMTrainer:
 
         # PCA baseline: linear projection into same dimensionality as GRM modes.
         # Fit on train_raw only; transform both train and test.
-        pca = PCA(n_components=self.cfg.n_modes, random_state=self.cfg.random_seed)
+        pca = PCA(n_components=min(self.cfg.n_modes, train_raw.shape[1]), random_state=self.cfg.random_seed)
         pca_train = pca.fit_transform(train_raw)
         pca_test = pca.transform(test_raw)
         pca_ridge = Ridge(alpha=1.0).fit(pca_train, y_reg_train)
@@ -688,7 +745,7 @@ class GRMTCMTrainer:
             pred_takens_lag_cls = np.zeros(len(test_visits), dtype=int)
 
         # Takens-PCA (SSA) in inductive mode.
-        pca_takens_ind = PCA(n_components=self.cfg.n_modes, random_state=self.cfg.random_seed)
+        pca_takens_ind = PCA(n_components=min(self.cfg.n_modes, takens_train.shape[1]), random_state=self.cfg.random_seed)
         tpca_train = pca_takens_ind.fit_transform(takens_train)
         tpca_test = pca_takens_ind.transform(takens_test)
         tpca_ridge_m = Ridge(alpha=1.0).fit(tpca_train, y_reg_train)
@@ -809,10 +866,16 @@ class GRMTCMTrainer:
                     "pca": np.vstack([pca_train, pca_test]),
                     "takens": np.vstack([takens_train, takens_test]),
                     "takens_pca": np.vstack([tpca_train, tpca_test]),
+                    "takens+grm": np.column_stack([
+                        np.vstack([takens_train, takens_test]),
+                        np.vstack([train_embeddings, test_embeddings]),
+                    ]),
                 },
                 np.arange(len(train_visits)),
                 np.arange(len(train_visits), len(train_visits) + len(test_visits)),
             ),
+            # modes/ρ sweep uses train-only eigenvectors — skip in inductive for now.
+            "modes_rho_sweep": {},
             "parsimony": self._parsimony_summary(),
             "flare_temperature": float(self.flare_temperature) if self.flare_temperature is not None else None,
             "latent_recovery": latent_recovery,
@@ -1035,6 +1098,24 @@ class GRMTCMTrainer:
                     cols += [int(j), i]
                     vals += [weight, weight]
 
+        # Optional density correction on KNN edges (before temporal/treatment).
+        if self.cfg.density_correction and rows:
+            W_knn = sparse.coo_matrix((vals, (rows, cols)), shape=(n, n)).tocsr()
+            W_knn.setdiag(0.0)
+            W_knn.eliminate_zeros()
+            W_knn = W_knn.maximum(W_knn.T)
+            q = np.maximum(np.asarray(W_knn.sum(axis=1)).ravel(), 1e-12)
+            Q = sparse.diags(q ** (-1.0))
+            W_knn = Q @ W_knn @ Q
+            W_knn.setdiag(0.0)
+            W_knn.eliminate_zeros()
+            W_knn = W_knn.maximum(W_knn.T)
+            # Replace KNN edges with density-corrected version.
+            W_knn_coo = W_knn.tocoo()
+            rows = list(W_knn_coo.row)
+            cols = list(W_knn_coo.col)
+            vals = list(W_knn_coo.data)
+
         # Temporal same-subject edges.
         visit_index = {(int(r.subject_id), int(r.day)): int(r.visit_id) for r in visits.itertuples(index=False)}
         temporal_graph_modes = {
@@ -1208,12 +1289,13 @@ class GRMTCMTrainer:
         # Compute extra eigenvalues beyond n_modes so the diagnostic spectrum
         # plot can show tail behavior past the retained cutoff. The extra
         # eigenvalues are persisted but not used to construct embeddings.
-        extra_modes = 24
+        extra_modes = 120
         k = min(self.cfg.n_modes + extra_modes + 1, n - 2)
         eigenvalues, eigenvectors = eigsh(L, k=k, which="SM")
         order = np.argsort(eigenvalues)
         eigenvalues, eigenvectors = eigenvalues[order], eigenvectors[:, order]
         self.eigenvalues_full = eigenvalues[1:].copy()
+        self.eigenvectors_full = eigenvectors[:, 1:].copy()
         return eigenvalues[1:self.cfg.n_modes + 1], eigenvectors[:, 1:self.cfg.n_modes + 1]
 
     def _make_grm_embeddings(self, eigenvalues: np.ndarray, eigenvectors: np.ndarray) -> np.ndarray:
@@ -1265,7 +1347,8 @@ class GRMTCMTrainer:
         # dimensionality as GRM modes. Fit on train only to respect the split.
         # This is the Pang-EDR analogue: if PCA matches GRM, the load-bearing
         # signal is linear variance, not graph topology.
-        pca = PCA(n_components=self.cfg.n_modes, random_state=self.cfg.random_seed)
+        pca_n = min(self.cfg.n_modes, X_raw.shape[1])
+        pca = PCA(n_components=pca_n, random_state=self.cfg.random_seed)
         pca.fit(X_raw[train_idx])
         X_pca = pca.transform(X_raw)
         pred_pca_reg, _ = self._fit_reg(X_pca, y_reg, train_idx, test_idx, "ridge")
@@ -1297,7 +1380,7 @@ class GRMTCMTrainer:
 
         # Takens-PCA (SSA): PCA on delay-embedded matrix. Compresses the fat
         # trajectory vector into dominant phase-space variance axes.
-        pca_takens = PCA(n_components=self.cfg.n_modes, random_state=self.cfg.random_seed)
+        pca_takens = PCA(n_components=min(self.cfg.n_modes, X_takens.shape[1]), random_state=self.cfg.random_seed)
         pca_takens.fit(X_takens[train_idx])
         X_takens_pca = pca_takens.transform(X_takens)
         pred_tpca_reg, _ = self._fit_reg(X_takens_pca, y_reg, train_idx, test_idx, "ridge")
@@ -1390,7 +1473,13 @@ class GRMTCMTrainer:
             ),
             "spectral_signal_concentration": self._spectral_signal_concentration(visits.iloc[test_idx], embeddings[test_idx]),
             "horizon_sweep": self._evaluate_horizon_sweep(
-                visits, {"grm": X_grm, "pca": X_pca, "takens": X_takens, "takens_pca": X_takens_pca}, train_idx, test_idx,
+                visits, {
+                    "grm": X_grm, "pca": X_pca, "takens": X_takens, "takens_pca": X_takens_pca,
+                    "takens+grm": np.column_stack([X_takens, X_grm]),
+                }, train_idx, test_idx,
+            ),
+            "modes_rho_sweep": self._sweep_modes_rho(
+                visits, self.eigenvectors_full, self.eigenvalues_full, train_idx, test_idx,
             ),
             "parsimony": self._parsimony_summary(),
             "flare_temperature": float(self.flare_temperature) if self.flare_temperature is not None else None,
@@ -2159,7 +2248,116 @@ class GRMTCMTrainer:
                 horizon_metrics[f"{name}_ridge"] = {"r2": float(r2_score(y_te, pred)),
                                                      "rmse": float(np.sqrt(mean_squared_error(y_te, pred)))}
 
+            # Non-linear head (RF) on selected embeddings to test decoder capacity.
+            for name in ("grm", "takens", "takens+grm"):
+                if name not in embeddings_dict:
+                    continue
+                X = embeddings_dict[name]
+                rf = RandomForestRegressor(
+                    n_estimators=100, min_samples_leaf=4, random_state=42, n_jobs=-1,
+                ).fit(X[tr], y_tr)
+                pred = rf.predict(X[te])
+                horizon_metrics[f"{name}_rf"] = {"r2": float(r2_score(y_te, pred)),
+                                                  "rmse": float(np.sqrt(mean_squared_error(y_te, pred)))}
+
             results[f"h{h}"] = horizon_metrics
+
+        return results
+
+    def _sweep_modes_rho(
+        self,
+        visits: pd.DataFrame,
+        eigenvectors_full: np.ndarray,
+        eigenvalues_full: np.ndarray,
+        train_idx: np.ndarray,
+        test_idx: np.ndarray,
+        modes_list: Tuple[int, ...] = (4, 8, 16, 32, 64, 96, 128),
+        rho_list: Tuple[float, ...] = (0.1, 0.5, 1.0, 2.0, 5.0),
+    ) -> Dict[str, Any]:
+        """Sweep n_modes and ρ on the horizon-sweep smoothed-delta targets.
+
+        Reuses the already-computed full eigendecomposition (eigenvalues_full has
+        n_modes+24 values). For each (n_modes, ρ) pair, builds GRM embeddings
+        and evaluates on smoothed-delta at each horizon. Cheap — no graph rebuild.
+        """
+
+        score_col = "global_dysregulation_score"
+        if score_col not in visits.columns or eigenvalues_full is None:
+            return {}
+
+        max_available = len(eigenvalues_full)
+        modes_list = tuple(m for m in modes_list if m <= max_available)
+        if not modes_list:
+            return {}
+
+        # Pre-compute smoothed-delta targets (same logic as _evaluate_horizon_sweep).
+        w = self.cfg.horizon_smooth_window
+        subject_ids = visits["subject_id"].to_numpy(int)
+        raw_score = visits[score_col].to_numpy(float)
+        smoothed = np.full_like(raw_score, np.nan)
+        for sid in np.unique(subject_ids):
+            mask = subject_ids == sid
+            s = raw_score[mask]
+            cs = np.nancumsum(s)
+            n_vals = np.arange(1, len(s) + 1, dtype=float)
+            n_vals = np.minimum(n_vals, float(w))
+            padded = np.concatenate([[0.0], cs])
+            start = np.maximum(np.arange(len(s)) - w + 1, 0).astype(int)
+            sums = padded[np.arange(1, len(s) + 1)] - padded[start]
+            smoothed[mask] = sums / n_vals
+
+        targets: Dict[int, Tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
+        for h in self.cfg.horizon_sweep:
+            target = np.full(len(visits), np.nan, dtype=float)
+            for sid in np.unique(subject_ids):
+                smask = subject_ids == sid
+                idxs = np.where(smask)[0]
+                sm = smoothed[smask]
+                for local_i, global_i in enumerate(idxs):
+                    if local_i + h < len(sm) and np.isfinite(sm[local_i]) and np.isfinite(sm[local_i + h]):
+                        target[global_i] = sm[local_i + h] - sm[local_i]
+            valid = np.isfinite(target)
+            tr = np.intersect1d(train_idx, np.where(valid)[0])
+            te = np.intersect1d(test_idx, np.where(valid)[0])
+            if len(tr) >= 10 and len(te) >= 10:
+                targets[h] = (target, tr, te)
+
+        if not targets:
+            return {}
+
+        results: Dict[str, Any] = {
+            "modes_tested": list(modes_list),
+            "rho_tested": list(rho_list),
+            "horizons": list(self.cfg.horizon_sweep),
+        }
+
+        for n_modes in modes_list:
+            evecs = eigenvectors_full[:, :n_modes]
+            evals = eigenvalues_full[:n_modes]
+            for rho in rho_list:
+                weights = 1.0 / np.sqrt(1.0 + (rho ** 2) * evals)
+                emb = evecs * weights.reshape(1, -1)
+                key = f"m{n_modes}_rho{rho}"
+                entry: Dict[str, Any] = {}
+                for h, (target, tr, te) in targets.items():
+                    ridge = Ridge(alpha=1.0).fit(emb[tr], target[tr])
+                    pred = ridge.predict(emb[te])
+                    entry[f"h{h}"] = float(r2_score(target[te], pred))
+                results[key] = entry
+
+            # RF at best ρ only (ρ=min) to test nonlinear decoder without
+            # blowing up runtime across the full ρ grid.
+            best_rho = min(rho_list)
+            weights = 1.0 / np.sqrt(1.0 + (best_rho ** 2) * evals)
+            emb = evecs * weights.reshape(1, -1)
+            rf_entry: Dict[str, Any] = {}
+            for h, (target, tr, te) in targets.items():
+                rf = RandomForestRegressor(
+                    n_estimators=100, min_samples_leaf=4, random_state=42, n_jobs=-1,
+                ).fit(emb[tr], target[tr])
+                pred = rf.predict(emb[te])
+                rf_entry[f"h{h}"] = float(r2_score(target[te], pred))
+            results[f"m{n_modes}_rho{best_rho}_rf"] = rf_entry
 
         return results
 
@@ -2566,6 +2764,12 @@ def _parse_cli() -> GRMTrainConfig:
     parser.add_argument("--projection", choices=["surrogate", "nystrom"], default=defaults.projection,
                         help="Inductive-only: how to project test-subject visits.")
     parser.add_argument("--n-neighbors-inductive", type=int, default=defaults.n_neighbors_inductive)
+    parser.add_argument("--graph-feature-source", choices=["obs", "takens"], default=defaults.graph_feature_source,
+                        help="Feature source for graph KNN edges: 'obs' (snapshot) or 'takens' (delay-embedded trajectory).")
+    parser.add_argument("--delay-embedding-k", type=int, default=defaults.delay_embedding_k,
+                        help="Delay embedding window size (number of visits concatenated).")
+    parser.add_argument("--density-correction", action="store_true",
+                        help="Apply Coifman-Lafon density correction to KNN edges.")
     args = parser.parse_args()
     return GRMTrainConfig(
         input_dir=args.input_dir,
@@ -2579,6 +2783,9 @@ def _parse_cli() -> GRMTrainConfig:
         inductive=args.inductive,
         projection=args.projection,
         n_neighbors_inductive=args.n_neighbors_inductive,
+        graph_feature_source=args.graph_feature_source,
+        delay_embedding_k=args.delay_embedding_k,
+        density_correction=args.density_correction,
     )
 
 
