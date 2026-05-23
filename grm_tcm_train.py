@@ -456,6 +456,35 @@ class GRMTCMTrainer:
                         d = block[col]
                         print(f"  {col:<28} {d['ami']:7.4f}  {d['ari']:7.4f}  {d['nmi']:7.4f}")
 
+        regime = metrics.get("regime_prediction", {})
+        if regime and regime.get("n_test"):
+            n_cls = regime.get("n_classes", "?")
+            print(f"\n  REGIME PREDICTION (next-day regime, {n_cls} classes)")
+            model_order = [
+                "persistence_same_regime",
+                "grm_logistic", "grm_rf",
+                "pca_logistic", "takens_logistic", "takens_rf",
+                "multiscale_logistic", "multiscale+grm_logistic", "multiscale+grm_rf",
+            ]
+            print(f"  {'model':<32} {'top-1 acc':>9}")
+            print(f"  {'-' * 32} {'-' * 9}")
+            for mk in model_order:
+                entry = regime.get(mk, {})
+                acc = entry.get("top1_acc")
+                if acc is not None:
+                    print(f"  {mk:<32} {acc:9.4f}")
+            change = regime.get("regime_change_subset", {})
+            if change and change.get("n_transitions"):
+                n_tr = change["n_transitions"]
+                print(f"\n  REGIME-CHANGE SUBSET (today != tomorrow; {n_tr} transitions)")
+                print(f"  {'model':<32} {'top-1 acc':>9}")
+                print(f"  {'-' * 32} {'-' * 9}")
+                for mk in model_order:
+                    entry = change.get(mk, {})
+                    acc = entry.get("top1_acc")
+                    if acc is not None:
+                        print(f"  {mk:<32} {acc:9.4f}")
+
         hsweep = metrics.get("horizon_sweep", {})
         horizons = hsweep.get("horizons", [])
         if horizons:
@@ -823,6 +852,24 @@ class GRMTCMTrainer:
             train_visits, train_embeddings, test_visits, test_embeddings, latent
         )
 
+        _ind_combined = pd.concat([train_visits, test_visits], ignore_index=True)
+        _ind_tr_idx = np.arange(len(train_visits))
+        _ind_te_idx = np.arange(len(train_visits), len(train_visits) + len(test_visits))
+        _ind_emb_dict = {
+            "grm": np.vstack([train_embeddings, test_embeddings]),
+            "pca": np.vstack([pca_train, pca_test]),
+            "takens": np.vstack([takens_train, takens_test]),
+            "takens_pca": np.vstack([tpca_train, tpca_test]),
+            "takens+grm": np.column_stack([
+                np.vstack([takens_train, takens_test]),
+                np.vstack([train_embeddings, test_embeddings]),
+            ]),
+            "multiscale": np.vstack([multi_train, multi_test]),
+            "multiscale+grm": np.column_stack([
+                np.vstack([multi_train, multi_test]),
+                np.vstack([train_embeddings, test_embeddings]),
+            ]),
+        }
         metrics: Dict[str, Any] = {
             "manifest": "model/manifest.json",
             "evaluation_mode": "inductive",
@@ -893,24 +940,12 @@ class GRMTCMTrainer:
                 np.arange(len(train_visits), len(train_visits) + len(test_visits)),
             ),
             "horizon_sweep": self._evaluate_horizon_sweep(
-                pd.concat([train_visits, test_visits], ignore_index=True),
-                {
-                    "grm": np.vstack([train_embeddings, test_embeddings]),
-                    "pca": np.vstack([pca_train, pca_test]),
-                    "takens": np.vstack([takens_train, takens_test]),
-                    "takens_pca": np.vstack([tpca_train, tpca_test]),
-                    "takens+grm": np.column_stack([
-                        np.vstack([takens_train, takens_test]),
-                        np.vstack([train_embeddings, test_embeddings]),
-                    ]),
-                    "multiscale": np.vstack([multi_train, multi_test]),
-                    "multiscale+grm": np.column_stack([
-                        np.vstack([multi_train, multi_test]),
-                        np.vstack([train_embeddings, test_embeddings]),
-                    ]),
-                },
-                np.arange(len(train_visits)),
-                np.arange(len(train_visits), len(train_visits) + len(test_visits)),
+                _ind_combined, _ind_emb_dict,
+                _ind_tr_idx, _ind_te_idx,
+            ),
+            "regime_prediction": self._evaluate_regime_prediction(
+                _ind_combined, _ind_emb_dict,
+                _ind_tr_idx, _ind_te_idx,
             ),
             # modes/ρ sweep uses train-only eigenvectors — skip in inductive for now.
             "modes_rho_sweep": {},
@@ -1455,6 +1490,11 @@ class GRMTCMTrainer:
         prob_grm_cls_calibrated = self._apply_flare_temperature(self.logistic_clf, X_grm, test_idx, self.flare_temperature)
         pred_grm_cls_calibrated = (prob_grm_cls_calibrated >= 0.5).astype(int) if prob_grm_cls_calibrated is not None else None
 
+        _emb_dict = {
+            "grm": X_grm, "pca": X_pca, "takens": X_takens, "takens_pca": X_takens_pca,
+            "takens+grm": np.column_stack([X_takens, X_grm]),
+            "multiscale": X_multi, "multiscale+grm": np.column_stack([X_multi, X_grm]),
+        }
         metrics: Dict = {
             "manifest": "model/manifest.json",
             "evaluation_tier": "transductive_diagnostic",
@@ -1515,11 +1555,10 @@ class GRMTCMTrainer:
             "spectral_signal_concentration": self._spectral_signal_concentration(visits.iloc[test_idx], embeddings[test_idx]),
             "tcm_alignment": self._evaluate_tcm_alignment(visits, embeddings, train_idx, test_idx),
             "horizon_sweep": self._evaluate_horizon_sweep(
-                visits, {
-                    "grm": X_grm, "pca": X_pca, "takens": X_takens, "takens_pca": X_takens_pca,
-                    "takens+grm": np.column_stack([X_takens, X_grm]),
-                    "multiscale": X_multi, "multiscale+grm": np.column_stack([X_multi, X_grm]),
-                }, train_idx, test_idx,
+                visits, _emb_dict, train_idx, test_idx,
+            ),
+            "regime_prediction": self._evaluate_regime_prediction(
+                visits, _emb_dict, train_idx, test_idx,
             ),
             "modes_rho_sweep": self._sweep_modes_rho(
                 visits, self.eigenvectors_full, self.eigenvalues_full, train_idx, test_idx,
@@ -2525,6 +2564,86 @@ class GRMTCMTrainer:
                     "nmi": float(normalized_mutual_info_score(tl, pl)),
                 }
             results[f"k{n_cl}"] = cluster_block
+
+        return results
+
+    def _evaluate_regime_prediction(
+        self,
+        visits: pd.DataFrame,
+        embeddings_dict: Dict[str, np.ndarray],
+        train_idx: np.ndarray,
+        test_idx: np.ndarray,
+    ) -> Dict[str, Any]:
+        """Predict next-day regime transitions using each embedding type.
+
+        Target: next_true_regime_id (7-class classification).
+        Persistence baseline: predict same regime as today.
+        This is where GRM topology should shine — the graph encodes which
+        states transition to which, not just how scores change.
+        """
+
+        if "next_true_regime_id" not in visits.columns or "true_regime_id" not in visits.columns:
+            return {}
+
+        y_all = visits["next_true_regime_id"].to_numpy(float)
+        valid = np.isfinite(y_all)
+        y_int = np.where(valid, y_all, 0).astype(int)
+
+        tr = np.intersect1d(train_idx, np.where(valid)[0])
+        te = np.intersect1d(test_idx, np.where(valid)[0])
+        if len(tr) < 20 or len(te) < 20 or len(np.unique(y_int[tr])) < 2:
+            return {}
+
+        y_tr, y_te = y_int[tr], y_int[te]
+        n_classes = len(np.unique(y_tr))
+        results: Dict[str, Any] = {"n_train": len(tr), "n_test": len(te), "n_classes": n_classes}
+
+        # Persistence baseline: predict same regime.
+        regime_today = visits["true_regime_id"].to_numpy(float)
+        regime_today_int = np.where(np.isfinite(regime_today), regime_today, -1).astype(int)
+        persist_pred = regime_today_int[te]
+        persist_acc = float(np.mean(persist_pred == y_te))
+        results["persistence_same_regime"] = {"top1_acc": persist_acc}
+
+        # Score each embedding with LogisticRegression (multinomial).
+        for name, X in embeddings_dict.items():
+            clf = LogisticRegression(max_iter=2000, random_state=42).fit(X[tr], y_tr)
+            pred = clf.predict(X[te])
+            acc = float(np.mean(pred == y_te))
+            results[f"{name}_logistic"] = {"top1_acc": acc}
+
+        # RF on selected embeddings.
+        for name in ("grm", "takens", "multiscale", "multiscale+grm"):
+            if name not in embeddings_dict:
+                continue
+            X = embeddings_dict[name]
+            rf = RandomForestClassifier(
+                n_estimators=100, min_samples_leaf=4, random_state=42, n_jobs=-1,
+            ).fit(X[tr], y_tr)
+            pred = rf.predict(X[te])
+            acc = float(np.mean(pred == y_te))
+            results[f"{name}_rf"] = {"top1_acc": acc}
+
+        # Regime-CHANGE subset: only rows where today != tomorrow.
+        change_mask = regime_today_int[te] != y_te
+        if change_mask.sum() >= 20:
+            change_block: Dict[str, Any] = {"n_transitions": int(change_mask.sum())}
+            change_block["persistence_same_regime"] = {"top1_acc": 0.0}  # always wrong by definition
+            for name, X in embeddings_dict.items():
+                clf = LogisticRegression(max_iter=2000, random_state=42).fit(X[tr], y_tr)
+                pred = clf.predict(X[te])
+                acc = float(np.mean(pred[change_mask] == y_te[change_mask]))
+                change_block[f"{name}_logistic"] = {"top1_acc": acc}
+            for name in ("grm", "takens", "multiscale", "multiscale+grm"):
+                if name not in embeddings_dict:
+                    continue
+                rf = RandomForestClassifier(
+                    n_estimators=100, min_samples_leaf=4, random_state=42, n_jobs=-1,
+                ).fit(X[tr], y_tr)
+                pred = rf.predict(X[te])
+                acc = float(np.mean(pred[change_mask] == y_te[change_mask]))
+                change_block[f"{name}_rf"] = {"top1_acc": acc}
+            results["regime_change_subset"] = change_block
 
         return results
 
