@@ -465,6 +465,7 @@ class GRMTCMTrainer:
                 "persistence_zero", "grm_ridge", "grm_rf",
                 "pca_ridge", "takens_ridge", "takens_rf",
                 "takens_pca_ridge", "takens+grm_ridge", "takens+grm_rf",
+                "multiscale_ridge", "multiscale+grm_ridge",
             ]
             header = f"  {'model':<24}" + "".join(f"  {'h=' + str(h):>8}" for h in horizons)
             print(header)
@@ -791,6 +792,10 @@ class GRMTCMTrainer:
             prob_tpca_lag_cls = np.full(len(test_visits), 0.5)
             pred_tpca_lag_cls = np.zeros(len(test_visits), dtype=int)
 
+        # Multi-scale features: k=3 trajectory + 14-day rolling stats.
+        multi_train = self._build_multiscale_features(train_raw, train_visits)
+        multi_test = self._build_multiscale_features(test_raw, test_visits)
+
         # Flare-onset secondary target. Eligible rows = where flare_today is known.
         y_onset_train_raw = train_visits[self.cfg.target_classification_onset].astype(float).to_numpy()
         y_onset_test_raw = test_visits[self.cfg.target_classification_onset].astype(float).to_numpy()
@@ -896,6 +901,11 @@ class GRMTCMTrainer:
                     "takens_pca": np.vstack([tpca_train, tpca_test]),
                     "takens+grm": np.column_stack([
                         np.vstack([takens_train, takens_test]),
+                        np.vstack([train_embeddings, test_embeddings]),
+                    ]),
+                    "multiscale": np.vstack([multi_train, multi_test]),
+                    "multiscale+grm": np.column_stack([
+                        np.vstack([multi_train, multi_test]),
                         np.vstack([train_embeddings, test_embeddings]),
                     ]),
                 },
@@ -1417,6 +1427,9 @@ class GRMTCMTrainer:
         pred_tpca_lag_reg, _ = self._fit_reg(X_tpca_lag, y_reg, train_idx, test_idx, "ridge")
         pred_tpca_lag_cls, prob_tpca_lag_cls, _ = self._fit_cls(X_tpca_lag, y_cls, train_idx, test_idx, "logistic")
 
+        # Multi-scale features: k=3 trajectory + 14-day rolling stats.
+        X_multi = self._build_multiscale_features(X_raw, visits)
+
         # Flare-onset secondary target (today=0 -> tomorrow=1). Eligible rows only.
         y_onset_raw = visits[self.cfg.target_classification_onset].astype(float).to_numpy()
         onset_valid = ~np.isnan(y_onset_raw)
@@ -1505,6 +1518,7 @@ class GRMTCMTrainer:
                 visits, {
                     "grm": X_grm, "pca": X_pca, "takens": X_takens, "takens_pca": X_takens_pca,
                     "takens+grm": np.column_stack([X_takens, X_grm]),
+                    "multiscale": X_multi, "multiscale+grm": np.column_stack([X_multi, X_grm]),
                 }, train_idx, test_idx,
             ),
             "modes_rho_sweep": self._sweep_modes_rho(
@@ -1741,6 +1755,79 @@ class GRMTCMTrainer:
         nan_mask = np.isnan(X_takens)
         X_takens[nan_mask] = np.take(col_medians, np.where(nan_mask)[1])
         return X_takens
+
+    @staticmethod
+    def _build_multiscale_features(
+        X: np.ndarray, visits: pd.DataFrame, k_fast: int = 3, window_slow: int = 14,
+    ) -> np.ndarray:
+        """Build multi-scale feature matrix: fast trajectory + slow chronic summaries.
+
+        Combines delay-embedded trajectory (k_fast visits) with per-subject rolling
+        statistics over window_slow days (mean, std, linear slope per feature).
+        Captures both fast dynamics (velocity) and slow TCM-relevant chronic patterns
+        without exploding dimensionality like large k delay embeddings do.
+
+        Returns X_multi of shape (N, p*k_fast + 3*p) where p = X.shape[1].
+        """
+
+        p = X.shape[1]
+        n = X.shape[0]
+        subject_ids = visits["subject_id"].to_numpy(int)
+        days = visits["day"].to_numpy(int)
+
+        # Inline delay embedding for fast trajectory component.
+        if k_fast <= 1:
+            X_fast = X.copy()
+        else:
+            fp = p
+            X_fast = np.full((n, fp * k_fast), np.nan, dtype=float)
+            X_fast[:, :fp] = X
+            for lag in range(1, k_fast):
+                shifted = np.full((n, fp), np.nan, dtype=float)
+                if lag <= n - 1:
+                    valid = np.zeros(n, dtype=bool)
+                    valid[lag:] = subject_ids[lag:] == subject_ids[:-lag]
+                    shifted[valid] = X[np.where(valid)[0] - lag]
+                X_fast[:, lag * fp:(lag + 1) * fp] = shifted
+            col_med = np.nanmedian(X_fast, axis=0)
+            col_med = np.where(np.isnan(col_med), 0.0, col_med)
+            nm = np.isnan(X_fast)
+            X_fast[nm] = np.take(col_med, np.where(nm)[1])
+
+        roll_mean = np.full((n, p), np.nan, dtype=float)
+        roll_std = np.full((n, p), np.nan, dtype=float)
+        roll_slope = np.full((n, p), np.nan, dtype=float)
+
+        for sid in np.unique(subject_ids):
+            mask = subject_ids == sid
+            idxs = np.where(mask)[0]
+            x_sub = X[mask]  # (T_i, p)
+            d_sub = days[mask]
+
+            for local_i, global_i in enumerate(idxs):
+                # Look back window_slow days.
+                start = local_i
+                while start > 0 and (d_sub[local_i] - d_sub[start - 1]) < window_slow:
+                    start -= 1
+                window = x_sub[start:local_i + 1]  # at least 1 row
+                roll_mean[global_i] = np.nanmean(window, axis=0)
+                if len(window) >= 2:
+                    roll_std[global_i] = np.nanstd(window, axis=0, ddof=1)
+                    # Linear slope: simple (last - first) / dt.
+                    dt = max(d_sub[local_i] - d_sub[start], 1)
+                    roll_slope[global_i] = (window[-1] - window[0]) / dt
+                else:
+                    roll_std[global_i] = 0.0
+                    roll_slope[global_i] = 0.0
+
+        # Impute remaining NaNs with column medians.
+        for arr in (roll_mean, roll_std, roll_slope):
+            col_med = np.nanmedian(arr, axis=0)
+            col_med = np.where(np.isnan(col_med), 0.0, col_med)
+            nan_mask = np.isnan(arr)
+            arr[nan_mask] = np.take(col_med, np.where(nan_mask)[1])
+
+        return np.column_stack([X_fast, roll_mean, roll_std, roll_slope])
 
     @staticmethod
     def _persistence_baseline(
