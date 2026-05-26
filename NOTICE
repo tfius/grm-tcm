@@ -1,0 +1,88 @@
+GRM-TCM Synthetic Benchmark
+Copyright 2026 Tadej Fius, Tims Pecerskis
+
+# Licensing
+
+This repository uses a dual license:
+
+- Code (Python source, build configuration) — Apache License 2.0.
+  See ./LICENSE for full text.
+
+- Data and documentation (synthetic*grm_tcm/, generated diagnostic
+  outputs under grm_tcm*_/ directories, _.md files) — CC BY 4.0.
+  See ./LICENSE-DATA for full text and attribution form.
+
+When in doubt about a file, code uses Apache 2.0 and everything else
+uses CC BY 4.0.
+
+# Attribution
+
+Primary author:
+Tadej Fius <tadej.fius@gmail.com>
+https://github.com/tfius
+
+Secondary author:
+Tims Pecerskis
+https://github.com/peersky
+
+AI-assisted contributions:
+Portions of this codebase were drafted, reviewed, or refactored in
+collaboration with Anthropic Claude (Opus 4.7). Per the project's
+commit conventions, AI contributions carry a "Co-Authored-By:
+Claude Opus 4.7 (1M context) <noreply@anthropic.com>" trailer in
+the git log; this attribution is informational and does not
+constitute a copyright claim by Anthropic.
+
+Conceptual baseline:
+The Geometric Resonance Model (GRM) mathematical framework adapted
+in this repository is documented at:
+
+    https://github.com/tfius/grm-modeling-markets/blob/main/docs/MATHEMATICAL_FORMULATION.md
+
+The TCM port reuses the resolvent / Green's-function regularization
+and rolling-window construction; the synthetic generator and
+longitudinal-physiology framing are original to this repository.
+
+# Related work
+
+Pang, J. C., Aquino, K. M., Oldehinkel, M., Robinson, P. A.,
+Fulcher, B. D., Breakspear, M., and Fornito, A. (2023).
+"Geometric constraints on human brain function."
+Nature 618(7965): 566–574.
+DOI: https://doi.org/10.1038/s41586-023-06098-1
+Article URL: https://www.nature.com/articles/s41586-023-06098-1
+Local copy: ./article/s41586-023-06098-1.pdf (CC BY 4.0, see paper)
+
+This paper demonstrates that resting and task-evoked cortical activity
+in human fMRI is well described by Laplace–Beltrami eigenmodes of the
+brain's geometry — i.e., resonant modes of a Laplacian on a biological
+substrate — rather than by modes of connectivity graphs. It is the
+closest published analogue of GRM applied to physiology and is the
+intellectual context for this repository's spectral / resonance choice.
+The GRM-TCM benchmark does NOT claim equivalence with the brain-imaging
+result; it uses the same family of methods on a different (synthetic,
+longitudinal, integrative-physiology) substrate.
+
+# Built on
+
+This software uses the following open-source dependencies (all under
+permissive licenses):
+
+- numpy (BSD-3-Clause)
+- scipy (BSD-3-Clause)
+- pandas (BSD-3-Clause)
+- scikit-learn (BSD-3-Clause)
+- matplotlib (matplotlib license, BSD-style)
+- joblib (BSD-3-Clause)
+- pyarrow (Apache-2.0)
+
+Their license texts ship with the installed packages; consult
+`uv tree` or `pip show` for current versions and license metadata.
+
+# Scientific framing
+
+This is a synthetic benchmark for latent-state recovery, attractor
+fingerprinting, and ontology mismatch detection on a controlled
+generator. It is NOT a biological simulator and does NOT constitute
+evidence for Traditional Chinese Medicine, Qi, or any clinical claim.
+Any reuse — code, data, or both — should preserve that framing.
