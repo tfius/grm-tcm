@@ -1,0 +1,75 @@
+cff-version: 1.2.0
+title: "GRM-TCM Synthetic Benchmark"
+message: "If you use this software or its synthetic dataset in research, please cite it as below."
+type: software
+authors:
+  - given-names: Tadej
+    family-names: Fius
+    email: tadej.fius@gmail.com
+  - given-names: Tims
+    family-names: Pecerskis
+repository-code: "https://github.com/tfius/grm-tcm"
+license: Apache-2.0
+license-url: "https://www.apache.org/licenses/LICENSE-2.0"
+keywords:
+  - synthetic benchmark
+  - spectral graph methods
+  - latent state recovery
+  - calibration
+  - ontology mismatch detection
+  - regime-switching state space
+  - longitudinal physiology
+abstract: >-
+  A research prototype that adapts the Geometric Resonance Model (GRM) — a
+  resolvent-style spectral graph method originally formulated for price action —
+  to longitudinal physiological data. The repository ships a regime-switching
+  synthetic generator with controlled ontology mismatch, plus diagnostic and
+  evaluation harnesses that test latent-state recovery, attractor fingerprinting,
+  and observation-aliased regime separation under subject-grouped cross-validation
+  with cluster-bootstrap confidence intervals. Outputs are framed as synthetic
+  benchmark diagnostics, not clinical or biological claims.
+references:
+  - type: software
+    title: "Geometric Resonance Model (GRM) for Price Action"
+    authors:
+      - given-names: Tadej
+        family-names: Fius
+      - given-names: Tims
+        family-names: Pecerskis
+    repository-code: "https://github.com/tfius/grm-modeling-markets"
+    notes: "Mathematical baseline this repository adapts."
+  - type: article
+    title: "Geometric constraints on human brain function"
+    authors:
+      - given-names: James
+        name-particle: "C."
+        family-names: Pang
+      - given-names: Kevin
+        name-particle: "M."
+        family-names: Aquino
+      - given-names: Marianne
+        family-names: Oldehinkel
+      - given-names: Peter
+        name-particle: "A."
+        family-names: Robinson
+      - given-names: Ben
+        name-particle: "D."
+        family-names: Fulcher
+      - given-names: Michael
+        family-names: Breakspear
+      - given-names: Alex
+        family-names: Fornito
+    journal: "Nature"
+    volume: 618
+    issue: 7965
+    start: 566
+    end: 574
+    year: 2023
+    month: 5
+    doi: "10.1038/s41586-023-06098-1"
+    url: "https://www.nature.com/articles/s41586-023-06098-1"
+    notes: >-
+      Closest published analogue: Laplace–Beltrami eigenmodes of brain geometry
+      explain cortical dynamics better than connectivity graphs. Intellectual
+      context for the spectral / resonance-mode choice in this repository's
+      GRM-TCM port (synthetic substrate, not a biological claim).

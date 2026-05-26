@@ -126,6 +126,32 @@ uv run python grm_tcm_train.py --graph-mode feature_temporal_treatment
 uv run python grm_tcm_train.py --graph-mode feature_temporal_treatment_subject
 ```
 
+### Trajectory-aware graph (Takens-Laplacian)
+
+By default, KNN edges use snapshot observations `x_t`. To build the graph from
+delay-embedded trajectory vectors `[x_t, x_{t-1}, ..., x_{t-k+1}]` so the
+Laplacian eigenmodes decompose the phase-space attractor instead of the static
+symptom manifold:
+
+```bash
+uv run python grm_tcm_train.py \
+    --graph-feature-source takens \
+    --delay-embedding-k 3 \
+    --n-modes 16 \
+    --rho 0.1
+```
+
+Other knobs:
+
+- `--graph-feature-source {obs,takens}` — KNN feature source (default `obs`).
+- `--delay-embedding-k INT` — delay window for trajectory construction (default 3; k=5 hurts due to KNN curse of dimensionality).
+- `--density-correction` — Coifman-Lafon `Q W Q` normalization on edges; off by default (over-corrects in current configuration).
+
+Projection automatically matches the graph feature source — when
+`--graph-feature-source takens`, both the surrogate and Nyström extensions
+take `X_takens` instead of `X_obs`. The persisted model carries the choice in
+its manifest; `predict.py` honors it.
+
 Static `grm_mode_*` coordinates use the kernel-feature convention:
 
 ```text
@@ -153,12 +179,33 @@ Useful static plots:
 - `grm_tcm_diagnostics/plots/grm_modes_scatter_true_regime.png`
 - `grm_tcm_diagnostics/plots/grm_modes_scatter_tcm_like_label.png`
 - `grm_tcm_diagnostics/plots/true_regime_distribution_by_tcm_label.png`
+- `grm_tcm_diagnostics/plots/manifold_scatter_3d.png` — 3D scatter of GRM modes 1–3 by `true_regime` and `hidden_subtype`.
+- `grm_tcm_diagnostics/plots/graph_eigen_spectrum.png` — Laplacian λ spectrum with `n_modes` cutoff annotated; uses the extended `eigenvalues_full` array persisted by the trainer.
 
 Read first:
 
 ```bash
 cat grm_tcm_diagnostics/diagnostics_summary.json
 ```
+
+### Evaluation outputs in `grm_metrics.json`
+
+Beyond the headline regression / classification numbers, the trainer also
+writes the following structured sections — each compared across `grm`, `pca`,
+`takens`, and `multiscale` embeddings so the contribution of graph topology is
+explicit:
+
+- `horizon_sweep` — smoothed-delta target `MA(score,3)_{t+h} - MA(score,3)_t`
+  scored at h ∈ {1, 3, 7}, with `persistence_zero` (Δ=0) as the falsifiable
+  baseline. Designed to remove the next-day persistence free lunch.
+- `tcm_alignment` — KMeans (k ∈ {5, 7, 10}) on test embeddings, AMI/ARI/NMI
+  against `true_regime`, `tcm_like_label`, `qi_like_label`,
+  `contrarian_signature`.
+- `regime_prediction` — Logistic / RF on `next_true_regime_id` (7 classes),
+  with persistence + regime-change subset (today ≠ tomorrow).
+- `treatment_response` — Kruskal-Wallis H and η² (eta-squared) per embedding,
+  on score deltas at h ∈ {1, 3, 7} and on regime-change rate, restricted to
+  clean treatment windows (no overlapping treatments within ±7 days).
 
 ## Dynamic GRM
 
@@ -375,3 +422,15 @@ Geometry claim:
 These do not always move together. Temporal/treatment edges can help prediction
 while making the operator less like a pure manifold Laplacian. The manifold
 benchmark and experiment matrix are designed to expose that tradeoff directly.
+
+## Journal
+
+Per-experiment write-ups (motivation, method, raw numbers, interpretation) live
+under `journal/`. Read these for the why-and-how-it-evolved that the README
+deliberately omits:
+
+- `2026-05-22_pca_baseline_findings.md` — snapshot-GRM ≈ PCA; the graph as a linear variance filter.
+- `2026-05-22_delay_embedding_findings.md` — Takens-only feature surrogate; marginal lift on standard targets.
+- `2026-05-22_horizon_sweep_findings.md` — smoothed-delta target; raw Takens R² = 0.52 vs snapshot ~ 0.02.
+- `2026-05-22_takens_laplacian_findings.md` / `..._full_findings.md` — graph from delay-embedded vectors, projection-matching fix, k/ρ/density ablations.
+- `2026-05-22_treatment_response_findings.md` — treatment response is state-dependent across embeddings; GRM uniquely captures regime-change stratification.

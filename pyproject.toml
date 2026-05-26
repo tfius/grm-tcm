@@ -3,6 +3,27 @@ name = "grm-tcm"
 version = "0.1.0"
 description = "Synthetic GRM-TCM benchmark generator and trainer."
 readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE", "LICENSE-DATA", "NOTICE"]
+authors = [
+    {name = "Tadej Fius", email = "tadej.fius@gmail.com"},
+    {name = "Tims Pecerskis"},
+]
+keywords = [
+    "synthetic-benchmark",
+    "spectral-graph",
+    "latent-state-recovery",
+    "calibration",
+    "ontology-mismatch",
+]
+classifiers = [
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Operating System :: OS Independent",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering",
+    "Development Status :: 3 - Alpha",
+]
 requires-python = ">=3.10"
 dependencies = [
     "joblib>=1.4",
