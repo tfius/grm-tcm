@@ -88,9 +88,15 @@ so any positive R² is genuine predictive signal.
 
 For patients not seen during training: find their nearest neighbors in the
 training graph using the same trajectory features, then approximate their
-graph coordinates (Nyström extension). The input features must match what the
-graph was built from — using snapshot features for a trajectory-built graph
-silently produces garbage (Section 5.3).
+graph coordinates (Nyström extension). This avoids recomputing the full
+eigendecomposition (O(N³) for N training visits) — the projection costs
+O(M·K) per new visit, where M is the number of KNN neighbors queried and
+K is the number of retained modes. For a training graph of 10,000 visits
+with M=12 neighbors and K=16 modes, projecting a new patient-day takes
+~192 dot products regardless of training set size.
+
+The input features must match what the graph was built from — using snapshot
+features for a trajectory-built graph silently produces garbage (Section 5.3).
 
 ---
 
