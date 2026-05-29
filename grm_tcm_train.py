@@ -165,7 +165,7 @@ class GRMTrainConfig:
     # horizons. Persistence predicts Δ=0, so any positive R² is genuine signal.
     # Computed inline from global_dysregulation_score; additive diagnostic that
     # does not affect the standard h=1 evaluation.
-    horizon_sweep: Tuple[int, ...] = (1, 3, 7)
+    horizon_sweep: Tuple[int, ...] = (1, 3, 7, 14, 21)
     horizon_smooth_window: int = 3
     # If True, run constitution-recovery evaluation in inductive AND transductive
     # modes. Reports visit-GRM aggregates, raw subject aggregates, and a dedicated
@@ -465,6 +465,7 @@ class GRMTCMTrainer:
                 "grm_logistic", "grm_rf",
                 "pca_logistic", "takens_logistic", "takens_rf",
                 "multiscale_logistic", "multiscale+grm_logistic", "multiscale+grm_rf",
+                "takens+prior_logistic", "takens+prior+grm_logistic", "takens+prior+grm_rf",
             ]
             print(f"  {'model':<32} {'top-1 acc':>9}")
             print(f"  {'-' * 32} {'-' * 9}")
@@ -532,6 +533,7 @@ class GRMTCMTrainer:
                 "pca_ridge", "takens_ridge", "takens_rf",
                 "takens_pca_ridge", "takens+grm_ridge", "takens+grm_rf",
                 "multiscale_ridge", "multiscale+grm_ridge",
+                "takens+prior_ridge", "takens+prior+grm_ridge",
             ]
             header = f"  {'model':<24}" + "".join(f"  {'h=' + str(h):>8}" for h in horizons)
             print(header)
@@ -861,6 +863,8 @@ class GRMTCMTrainer:
         # Multi-scale features: k=3 trajectory + 14-day rolling stats.
         multi_train = self._build_multiscale_features(train_raw, train_visits)
         multi_test = self._build_multiscale_features(test_raw, test_visits)
+        prior_train = self._build_subject_prior_mean(train_raw, train_visits)
+        prior_test = self._build_subject_prior_mean(test_raw, test_visits)
 
         # Flare-onset secondary target. Eligible rows = where flare_today is known.
         y_onset_train_raw = train_visits[self.cfg.target_classification_onset].astype(float).to_numpy()
@@ -904,6 +908,15 @@ class GRMTCMTrainer:
             "multiscale": np.vstack([multi_train, multi_test]),
             "multiscale+grm": np.column_stack([
                 np.vstack([multi_train, multi_test]),
+                np.vstack([train_embeddings, test_embeddings]),
+            ]),
+            "takens+prior": np.column_stack([
+                np.vstack([takens_train, takens_test]),
+                np.vstack([prior_train, prior_test]),
+            ]),
+            "takens+prior+grm": np.column_stack([
+                np.vstack([takens_train, takens_test]),
+                np.vstack([prior_train, prior_test]),
                 np.vstack([train_embeddings, test_embeddings]),
             ]),
         }
@@ -1506,6 +1519,7 @@ class GRMTCMTrainer:
 
         # Multi-scale features: k=3 trajectory + 14-day rolling stats.
         X_multi = self._build_multiscale_features(X_raw, visits)
+        X_prior = self._build_subject_prior_mean(X_raw, visits)
 
         # Flare-onset secondary target (today=0 -> tomorrow=1). Eligible rows only.
         y_onset_raw = visits[self.cfg.target_classification_onset].astype(float).to_numpy()
@@ -1536,6 +1550,8 @@ class GRMTCMTrainer:
             "grm": X_grm, "pca": X_pca, "takens": X_takens, "takens_pca": X_takens_pca,
             "takens+grm": np.column_stack([X_takens, X_grm]),
             "multiscale": X_multi, "multiscale+grm": np.column_stack([X_multi, X_grm]),
+            "takens+prior": np.column_stack([X_takens, X_prior]),
+            "takens+prior+grm": np.column_stack([X_takens, X_prior, X_grm]),
         }
         metrics: Dict = {
             "manifest": "model/manifest.json",
@@ -1912,6 +1928,34 @@ class GRMTCMTrainer:
             arr[nan_mask] = np.take(col_med, np.where(nan_mask)[1])
 
         return np.column_stack([X_fast, roll_mean, roll_std, roll_slope])
+
+    @staticmethod
+    def _build_subject_prior_mean(
+        X: np.ndarray, visits: pd.DataFrame,
+    ) -> np.ndarray:
+        """Per-subject cumulative mean of all prior visits (expanding window).
+
+        At visit t, computes mean(x_{1..t}) for the same subject. This is a
+        causal constitution proxy — no future leakage. The first visit gets
+        its own value (no history yet). Approximates the stable per-subject
+        baseline that drives regime transitions via constitution K.
+        """
+
+        p = X.shape[1]
+        n = X.shape[0]
+        subject_ids = visits["subject_id"].to_numpy(int)
+        result = np.zeros((n, p), dtype=float)
+        for sid in np.unique(subject_ids):
+            mask = subject_ids == sid
+            x_sub = X[mask]
+            cumsum = np.nancumsum(x_sub, axis=0)
+            counts = np.arange(1, len(x_sub) + 1, dtype=float).reshape(-1, 1)
+            result[mask] = cumsum / counts
+        col_med = np.nanmedian(result, axis=0)
+        col_med = np.where(np.isnan(col_med), 0.0, col_med)
+        nan_mask = np.isnan(result)
+        result[nan_mask] = np.take(col_med, np.where(nan_mask)[1])
+        return result
 
     @staticmethod
     def _persistence_baseline(
@@ -2449,7 +2493,7 @@ class GRMTCMTrainer:
                                                      "rmse": float(np.sqrt(mean_squared_error(y_te, pred)))}
 
             # Non-linear head (RF) on selected embeddings to test decoder capacity.
-            for name in ("grm", "takens", "takens+grm"):
+            for name in ("grm", "takens", "takens+grm", "takens+prior+grm"):
                 if name not in embeddings_dict:
                     continue
                 X = embeddings_dict[name]
@@ -2803,7 +2847,7 @@ class GRMTCMTrainer:
             results[f"{name}_logistic"] = {"top1_acc": acc}
 
         # RF on selected embeddings.
-        for name in ("grm", "takens", "multiscale", "multiscale+grm"):
+        for name in ("grm", "takens", "multiscale", "multiscale+grm", "takens+prior", "takens+prior+grm"):
             if name not in embeddings_dict:
                 continue
             X = embeddings_dict[name]
@@ -2824,7 +2868,7 @@ class GRMTCMTrainer:
                 pred = clf.predict(X[te])
                 acc = float(np.mean(pred[change_mask] == y_te[change_mask]))
                 change_block[f"{name}_logistic"] = {"top1_acc": acc}
-            for name in ("grm", "takens", "multiscale", "multiscale+grm"):
+            for name in ("grm", "takens", "multiscale", "multiscale+grm", "takens+prior", "takens+prior+grm"):
                 if name not in embeddings_dict:
                     continue
                 rf = RandomForestClassifier(
