@@ -9,7 +9,8 @@ Combined with a per-subject constitution proxy and nonlinear decoding, the
 resulting Graph Resonance Model (GRM) predicts future health state changes
 on a persistence-free evaluation target with R²=0.49 on real wearable data
 (54 subjects, Fitbit Sense) and R²=0.52 on a synthetic benchmark.
-Flare classification reaches AUC=0.83, and treatment response shows
+Predicting next-day "bad health days" (composite score above median)
+reaches AUC=0.83, and treatment response shows
 significant state-dependence (η²=0.37, p<0.05). The trajectory signal
 replicates across three datasets. We report both positive results and
 systematic negative findings from 12 ablation experiments.
@@ -42,31 +43,54 @@ aware spectral methods reveal signal invisible to snapshot approaches.
 
 ### 2.1 Delay Embedding
 
-Trajectory vector of window k: `x^(k)_{i,t} = [x_{i,t}, ..., x_{i,t-k+1}]`.
-Default k=3. By Takens' theorem, reconstructs attractor topology.
+Instead of using only today's measurements, concatenate today + yesterday +
+day before into one "fat" vector: `x^(k)_{i,t} = [x_today, x_yesterday, x_2days_ago]`.
+This captures not just where the patient is, but which direction they are
+moving (getting better? getting worse? stable?). Default window k=3.
 
 ### 2.2 Constitution Proxy
 
-Per-subject cumulative mean: `μ_{i,t} = (1/t) Σ x_{i,s}`. Causal (no future
-leakage). Recovers R²=0.93 of true constitution on synthetic data.
+Average of everything we've seen for this patient so far:
+`μ_{i,t} = (1/t) Σ x_{i,s}`. A simple running average that estimates the
+patient's stable "normal" — their personal baseline heart rate, typical sleep
+pattern, usual activity level. Uses only past data (no future leakage).
+Recovers R²=0.93 of true constitution on synthetic data.
 
 ### 2.3 Takens-Laplacian Graph
 
-Visit graph with KNN edges on delay-embedded vectors:
-`W^obs_{ab} = exp(-||x^(k)_a - x^(k)_b||² / 2σ²)` plus temporal and
-treatment edges. Normalized Laplacian decomposed into K eigenmodes. GRM
-embedding: `e_a = [√g_m · ψ_m(a)]` with `g_m = 1/(1+ρ²λ_m)`, ρ=0.1.
+Build a network where each patient-day is a dot, and dots are connected when
+they represent similar health trajectories (not just similar symptoms today).
+Two visits get linked only if the patients had similar symptoms AND were
+changing in similar ways over the prior days.
+
+Mathematically: KNN graph on delay-embedded vectors with Gaussian weights,
+plus edges for consecutive days (same patient) and shared treatment context.
+The graph Laplacian is decomposed into smooth "modes" (eigenvectors) that
+describe the broadest patterns of health variation across the population.
+GRM weighting: `g_m = 1/(1+ρ²λ_m)` with ρ=0.1 (less smoothing preserves
+sharp transitions between health states).
 
 ### 2.4 Prediction
 
-Combined features `[x^(k), μ, e]` → Ridge (inductive) or RF (transductive).
+The model sees three things about each patient-day:
+- **Where they are heading** (trajectory: today + recent history)
+- **What their normal looks like** (constitution: personal running average)
+- **Where they sit on the health landscape** (GRM: graph coordinates)
 
-Target: `y^Δ_{h} = MA(score,3)_{t+h} - MA(score,3)_t`. Persistence = Δ0.
+These are concatenated and fed to either Ridge regression (fast, linear) or
+Random Forest (nonlinear, better on real data).
 
-### 2.5 Inductive Projection
+Main target: how much will the patient's 3-day-averaged health score change
+over the next h days? A "nothing changes" prediction always scores R²≈0,
+so any positive R² is genuine predictive signal.
 
-Nyström extension on delay-embedded test features. Feature space must match
-graph construction space (Section 5.3).
+### 2.5 New Patients (Inductive Projection)
+
+For patients not seen during training: find their nearest neighbors in the
+training graph using the same trajectory features, then approximate their
+graph coordinates (Nyström extension). The input features must match what the
+graph was built from — using snapshot features for a trajectory-built graph
+silently produces garbage (Section 5.3).
 
 ---
 
@@ -117,7 +141,15 @@ dysregulation score, subjects with ≥40 days and ≥50% core feature fill.
 Trajectory signal replicates across all three datasets. Constitution proxy
 adds +6% at h≥7. GRM adds +0.05 on LifeSnaps, +0.12 on PMData.
 
-### 4.2 Flare Classification
+### 4.2 Next-Day "Bad Day" Prediction
+
+We define a "bad day" as a day when the composite health score (built from
+resting heart rate, sleep efficiency, daily steps, and sleep duration) falls
+above the population median — meaning the person is doing worse than their
+typical day. This is not a clinical diagnosis; it is a data-derived threshold.
+
+AUC measures how well the model separates "bad days" from "normal days"
+(0.5 = coin flip, 1.0 = perfect separation).
 
 | Dataset | Model | AUC |
 |---------|-------|-----|
@@ -188,7 +220,7 @@ numbers, and they are wrong.
 | Acute trajectory (h=1) | Takens | Velocity dominates |
 | Long horizon (h≥7) | Constitution proxy | Baseline determines drift |
 | Regime transitions | GRM modes | Graph position encodes state |
-| Flare classification | GRM+lag | Topology + persistence |
+| "Bad day" prediction | GRM+lag | Topology + persistence |
 
 No single component dominates. The combined architecture leverages each
 where it contributes.
@@ -214,8 +246,8 @@ longitudinal health data that snapshot methods miss entirely. The key is
 building the graph from delay-embedded trajectories and evaluating on
 persistence-free targets. The method replicates across synthetic and real
 wearable data, with the combined [trajectory + constitution + topology]
-architecture achieving R²=0.49 on LifeSnaps and AUC=0.83 for flare
-classification.
+architecture achieving R²=0.49 on LifeSnaps and AUC=0.83 for predicting
+next-day "bad days" on real Fitbit data.
 
 ---
 
