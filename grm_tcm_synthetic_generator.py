@@ -1196,6 +1196,10 @@ def parse_args() -> GeneratorConfig:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--n-subjects", type=int, default=GeneratorConfig.n_subjects)
     parser.add_argument("--n-days", type=int, default=GeneratorConfig.n_days)
+    parser.add_argument("--obs-noise-std", type=float, default=None,
+                        help="Override observation noise (default from difficulty preset).")
+    parser.add_argument("--latent-noise-std", type=float, default=None,
+                        help="Override latent noise (default from difficulty preset).")
     args = parser.parse_args()
     return GeneratorConfig(
         n_subjects=args.n_subjects,
@@ -1203,6 +1207,8 @@ def parse_args() -> GeneratorConfig:
         random_seed=args.seed,
         output_dir=args.output_dir,
         difficulty=args.difficulty,
+        obs_noise_std=args.obs_noise_std,
+        latent_noise_std=args.latent_noise_std,
     )
 
 
