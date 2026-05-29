@@ -18,3 +18,4 @@ __pycache__/
 /grm_tcm_dynamic_eval/*.csv
 /grm_tcm_dynamic_eval/*.json
 pmdata_grm_tcm/
+lifesnaps_grm_tcm/
