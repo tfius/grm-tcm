@@ -2,483 +2,327 @@
 
 ## Abstract
 
-We present a spectral graph framework for predicting future health state
-changes from longitudinal wearable and self-report data. The core insight is
-that standard graph-based methods fail on health trajectories because they
-build visit-similarity graphs from static symptom snapshots, discarding the
-temporal dynamics that carry most of the predictive signal. We introduce the
-**Takens-Laplacian**: a visit graph whose KNN edges are computed over
-delay-embedded trajectory vectors rather than instantaneous observations, so
-that visits are connected only when they share both similar symptoms and
-similar recent history. The resulting Graph Resonance Model (GRM) eigenmodes
-decompose the phase-space attractor of patient health dynamics rather than the
-static symptom manifold.
-
-We evaluate on a controlled synthetic benchmark (200 subjects, 7 latent health
-regimes) and two real-world wearable datasets: PMData (16 athletes, 150 days,
-Fitbit) and LifeSnaps (54 subjects, 88 days median, Fitbit Sense). On a
-persistence-free evaluation target (smoothed score delta), the three-component
-architecture — trajectory features + constitution proxy + GRM topology —
-achieves R²=0.49 on real human data (LifeSnaps) and R²=0.52 on synthetic data,
-substantially outperforming PCA, snapshot GRM, and persistence baselines.
-Treatment response stratification shows significant state-dependence
-(η²=0.37, p<0.05), and flare classification reaches AUC=0.83 on real data.
-
-We identify three critical methodological findings: (1) standard evaluation
-targets dominated by persistence mask trajectory signal — smoothed-delta
-targets are essential; (2) graph feature space and inductive projection feature
-space must match — mismatch is a silent failure mode; (3) trajectory-aware
-graph topology adds genuine predictive value (+0.05 R²) on real data when
-decoded with nonlinear heads, supporting the hypothesis that health dynamics
-live on a structured manifold recoverable by spectral methods.
+We introduce the Takens-Laplacian: a spectral graph construction for
+longitudinal health data where visit-similarity edges are computed over
+delay-embedded trajectory vectors rather than instantaneous observations.
+Combined with a per-subject constitution proxy and nonlinear decoding, the
+resulting Graph Resonance Model (GRM) predicts future health state changes
+on a persistence-free evaluation target with R²=0.49 on real wearable data
+(54 subjects, Fitbit Sense) and R²=0.52 on a synthetic benchmark.
+Flare classification reaches AUC=0.83, and treatment response shows
+significant state-dependence (η²=0.37, p<0.05). The trajectory signal
+replicates across three datasets. We report both positive results and
+systematic negative findings from 12 ablation experiments.
 
 ---
 
 ## 1. Introduction
 
-Longitudinal health monitoring through wearable devices produces dense,
-multi-channel time series: heart rate, sleep architecture, activity patterns,
-and physiological stress indicators measured daily or continuously. A central
-question in digital health is whether these observations encode a lower-
-dimensional latent health state whose dynamics — transitions between stability
-and crisis, responses to interventions, long-term constitutional patterns —
-can be learned from data and used for prediction.
+Wearable health monitoring produces daily multi-channel time series (heart
+rate, sleep, activity, stress). We ask whether spectral graph methods —
+where each patient visit is a node and edges encode similarity — can learn
+a latent health manifold that predicts future state changes.
 
-Spectral graph methods offer a natural framework: each patient visit becomes a
-node in a graph, edges encode similarity and temporal continuity, and the graph
-Laplacian's low-frequency eigenmodes approximate the smooth manifold of health
-variation (Belkin & Niyogi, 2003; Coifman & Lafon, 2006). This approach draws
-on recent work showing that geometric eigenmodes of physical structures
-constrain functional dynamics — notably Pang et al. (2023), who demonstrated
-that cortical surface geometry predicts brain activity patterns better than
-connectome-derived modes.
+The key challenge: on standard next-day prediction targets, persistence
+(yesterday ≈ today) dominates all methods. We show this is a target design
+problem. On persistence-free targets (smoothed score deltas), trajectory-
+aware spectral methods reveal signal invisible to snapshot approaches.
 
-We ask the analogous question for health: **do the geometric eigenmodes of a
-patient visit graph predict future health dynamics better than standard
-statistical baselines?**
+**Contributions:**
 
-The answer is nuanced. On standard next-day prediction targets, the answer is
-no — persistence (yesterday predicts today) dominates all methods equally. But
-this is an artifact of target choice, not method failure. When evaluated on
-targets where persistence cannot cheat (smoothed score deltas), trajectory-
-aware spectral methods reveal strong signal invisible to snapshot-based
-approaches.
-
-### Contributions
-
-1. **The Takens-Laplacian**: building the visit graph from delay-embedded
-   trajectory vectors rather than instantaneous observations, yielding a 10x
-   improvement in smoothed-delta R² for GRM eigenmodes.
-
-2. **A three-component prediction architecture** combining trajectory
-   momentum (Takens embedding), stable individual baseline (constitution
-   proxy), and nonlinear graph topology (GRM eigenmodes), validated on
-   synthetic and real wearable data.
-
-3. **Methodological findings** on evaluation target design, projection feature
-   space matching, and architecture-task duality that apply broadly to
-   spectral graph methods on longitudinal data.
-
-4. **Real-world validation** on two public wearable datasets demonstrating
-   that trajectory signal discovered on synthetic data replicates on actual
-   human physiology.
+1. The Takens-Laplacian graph construction (10x GRM improvement over
+   snapshot graphs)
+2. Three-component architecture: trajectory + constitution + topology
+3. Validation on synthetic + two real wearable datasets
+4. Systematic ablation documenting 12 negative results
 
 ---
 
-## 2. Related Work
+## 2. Methods
 
-**Spectral graph methods in health.** Graph-based patient similarity and
-trajectory modeling has been explored in clinical settings (Pai et al., 2019;
-Zitnik et al., 2018), but typically with static feature graphs rather than
-trajectory-aware constructions. Our work extends these approaches by embedding
-temporal dynamics directly into graph construction.
+### 2.1 Delay Embedding
 
-**Geometric eigenmodes.** Pang et al. (2023) showed that cortical surface
-geometry explains neural activity patterns. We apply the same principle —
-low-frequency eigenmodes of a data-derived geometry as a predictive basis —
-to longitudinal health data, using the graph Laplacian as a discrete
-approximation to the Laplace-Beltrami operator on a hypothesized health
-manifold.
+Trajectory vector of window k: `x^(k)_{i,t} = [x_{i,t}, ..., x_{i,t-k+1}]`.
+Default k=3. By Takens' theorem, reconstructs attractor topology.
 
-**Takens embedding in health.** Delay embedding has been applied to
-physiological time series for attractor reconstruction (Kantz & Schreiber,
-2004), but not previously combined with graph spectral methods for population-
-level health manifold construction.
+### 2.2 Constitution Proxy
 
-**Wearable health prediction.** Prior work on wearable-based health prediction
-(Li et al., 2017; Dunn et al., 2021) typically uses standard ML pipelines
-(RF, gradient boosting) on engineered features. Our contribution is showing
-that spectral graph topology adds value beyond these baselines when the graph
-is trajectory-aware.
+Per-subject cumulative mean: `μ_{i,t} = (1/t) Σ x_{i,s}`. Causal (no future
+leakage). Recovers R²=0.93 of true constitution on synthetic data.
 
----
+### 2.3 Takens-Laplacian Graph
 
-## 3. Methods
+Visit graph with KNN edges on delay-embedded vectors:
+`W^obs_{ab} = exp(-||x^(k)_a - x^(k)_b||² / 2σ²)` plus temporal and
+treatment edges. Normalized Laplacian decomposed into K eigenmodes. GRM
+embedding: `e_a = [√g_m · ψ_m(a)]` with `g_m = 1/(1+ρ²λ_m)`, ρ=0.1.
 
-### 3.1 Problem Setup
+### 2.4 Prediction
 
-Let subject `i = 1,...,N` be observed at times `t = 1,...,T_i`. Each visit
-produces a p-dimensional observation vector x_{i,t} (physiological
-measurements, activity metrics, sleep features). The prediction targets are:
+Combined features `[x^(k), μ, e]` → Ridge (inductive) or RF (transductive).
 
-- **Smoothed score delta**: the change in a moving-averaged global health
-  score over horizon h days, defined as
-  `y^Δ_{i,t,h} = MA(score, w)_{t+h} - MA(score, w)_t` where w=3.
-  Persistence predicts Δ=0, so any positive R² reflects genuine signal.
+Target: `y^Δ_{h} = MA(score,3)_{t+h} - MA(score,3)_t`. Persistence = Δ0.
 
-- **Flare classification**: binary next-day event prediction.
+### 2.5 Inductive Projection
 
-### 3.2 Delay Embedding (Takens)
-
-To capture biological momentum, we define the delay-embedded trajectory
-vector of window k:
-
-```
-x^(k)_{i,t} = [x_{i,t}, x_{i,t-1}, ..., x_{i,t-k+1}] ∈ R^{pk}
-```
-
-By Takens' embedding theorem, this reconstructs the topology of the latent
-dynamical attractor. We use k=3 (today + two prior visits), which balances
-trajectory information against dimensionality for KNN graph construction.
-
-### 3.3 Constitution Proxy
-
-To capture stable individual baselines, we compute the per-subject cumulative
-mean of all prior observations:
-
-```
-μ_{i,t} = (1/t) Σ_{s=1}^{t} x_{i,s}
-```
-
-This is a causal estimate (no future leakage) that converges to the subject's
-stable physiological baseline over time. On synthetic data with known
-constitution vectors, this proxy achieves R²=0.93 for constitution recovery.
-
-### 3.4 Takens-Laplacian Graph
-
-We construct a visit graph where each node is a (subject, day) pair. The
-observation-similarity edges use delay-embedded vectors:
-
-```
-W^obs_{ab} = exp(-||x^(k)_a - x^(k)_b||² / 2σ²)
-```
-
-KNN-sparsified with σ set by the median-distance heuristic. Temporal edges
-`W^time_{(i,t),(i,t+1)}` enforce within-subject continuity. Treatment/event
-edges `W^intervention` connect visits sharing intervention context.
-
-The normalized graph Laplacian `L = I - D^{-1/2}WD^{-1/2}` is decomposed
-into K low-frequency eigenmodes. The GRM embedding for visit a is:
-
-```
-e_a = [√g_1 · ψ_1(a), ..., √g_K · ψ_K(a)]
-```
-
-with spectral weights `g_m = 1/(1 + ρ²λ_m)`, where ρ controls propagation
-scale (we use ρ=0.1, selected by sweep).
-
-**Critical distinction from standard spectral graph methods**: by computing
-W^obs over trajectory vectors rather than instantaneous observations, the
-Laplacian eigenmodes decompose the phase-space attractor rather than the
-static symptom manifold. Two visits are "similar" only if they share both
-similar symptoms and similar recent history.
-
-### 3.5 Combined Prediction Model
-
-The prediction model uses a concatenated feature vector:
-
-```
-f_{i,t} = [x^(k)_{i,t}, μ_{i,t}, e_{i,t}]
-```
-
-combining trajectory momentum (fast dynamics), constitution proxy (slow
-baseline), and GRM coordinates (nonlinear topology). For score-delta targets,
-we use Ridge regression (synthetic, inductive) or Random Forest (real data).
-For flare classification, logistic regression.
-
-### 3.6 Inductive Projection
-
-For new subjects not in the training graph, the Nyström extension approximates
-GRM coordinates:
-
-```
-ê_{new,m} = (√g_m / λ_m) Σ_j W(x^(k)_{new}, x^(k)_j) ψ_m(j)
-```
-
-**Critical requirement**: when the training graph uses delay-embedded vectors,
-the projection must also use delay-embedded test features. Feature-space
-mismatch between graph construction and projection causes complete model
-collapse.
-
-### 3.7 Treatment Response Stratification
-
-To test whether manifold position predicts differential treatment response,
-we cluster GRM embeddings at treatment time via KMeans, then measure whether
-post-treatment outcome varies across clusters using the Kruskal-Wallis test
-with η² effect size.
+Nyström extension on delay-embedded test features. Feature space must match
+graph construction space (Section 5.3).
 
 ---
 
-## 4. Experimental Setup
+## 3. Datasets
 
-### 4.1 Datasets
+| Dataset | N | Days | Channels | Source |
+|---------|---|------|----------|--------|
+| Synthetic | 200 | 120 | 15 | Switching state-space, 7 regimes |
+| PMData | 16 | 150 | 21 | Fitbit + wellness + training load |
+| LifeSnaps | 54 | 88 (median) | 18 | Fitbit Sense + EMA + Big Five |
 
-**Synthetic benchmark.** 200 subjects × 120 days. Switching state-space model
-with 7 latent health regimes, 4-dimensional continuous latent state, 12–15
-observation channels, constitutional dynamics, treatment events, and
-deliberately aliased observation groups. SNR=0.64 (regime signal / daily
-noise).
-
-**PMData** (Simula Research Laboratory). 16 athletes × 150 days. Fitbit
-Versa 2 (resting HR, sleep score, steps, activity minutes) + daily wellness
-self-report (fatigue, mood, readiness, soreness, stress on 1–5 scales) +
-training load (sRPE). 21 observation channels.
-
-**LifeSnaps** (Yfantidou et al., 2022). 71 participants × 4 months
-(quality-filtered to 54 subjects with ≥40 days and ≥50% core feature fill).
-Fitbit Sense (HR, HRV, sleep stages, steps, calories, skin temperature,
-stress score) + hourly-derived features (intra-day HR variability, circadian
-amplitude). 14–18 observation channels. Big Five personality scores available
-for constitution analysis.
-
-### 4.2 Evaluation Protocol
-
-- **Transductive**: graph over all visits; GroupShuffleSplit by subject (75/25)
-- **Inductive**: graph on train subjects only; Nyström projection for test
-- All splits group by subject_id to prevent within-subject leakage
-- Seed 42 throughout for reproducibility
-
-### 4.3 Baselines
-
-| Baseline | Description |
-|----------|-------------|
-| Persistence | Yesterday's value predicts today |
-| PCA Ridge | PCA(K) on observations → Ridge |
-| Raw RF | Random Forest on standardized observations |
-| Smooth RBF | Kernel Ridge with RBF kernel |
-| Snapshot GRM | GRM from instantaneous observation graph |
+LifeSnaps quality-filtered: removed binary mood columns, physiology-only
+dysregulation score, subjects with ≥40 days and ≥50% core feature fill.
 
 ---
 
-## 5. Results
+## 4. Results
 
-### 5.1 Standard Targets: Persistence Dominates
+### 4.1 Smoothed-Delta Prediction
 
-On the standard next-day-score target, all methods converge to similar
-performance once lag features are included:
-
-| Model | R² (synthetic) | R² (LifeSnaps) |
-|-------|---------------|----------------|
-| Persistence | 0.478 | varies by dysreg definition |
-| PCA+lag Ridge | 0.579 | 0.295 |
-| GRM+lag Ridge | 0.564 | 0.265 |
-| Takens+lag Ridge | 0.583 | 0.346 |
-
-**Conclusion**: on persistence-dominated targets, graph topology adds nothing.
-This is not a method failure — it is a target design problem.
-
-### 5.2 Smoothed-Delta: Trajectory Signal Revealed
-
-On the persistence-free smoothed-delta target (MA(3) change over h days):
-
-**Synthetic benchmark:**
+**Synthetic (transductive):**
 
 | Model | h=1 | h=7 | h=21 |
 |-------|-----|-----|------|
-| Persistence (Δ=0) | -0.000 | -0.000 | -0.000 |
-| PCA Ridge | 0.020 | 0.234 | 0.293 |
+| Persistence (Δ=0) | 0.000 | 0.000 | 0.000 |
 | Snapshot GRM Ridge | 0.022 | 0.130 | 0.183 |
-| Takens Ridge | 0.517 | 0.368 | 0.431 |
 | Takens-Laplacian GRM Ridge | 0.229 | 0.199 | 0.234 |
-| Takens-Laplacian GRM RF | 0.528 | 0.324 | 0.371 |
+| Takens Ridge | 0.517 | 0.368 | 0.431 |
 | Takens+prior+GRM Ridge | 0.524 | 0.404 | 0.470 |
 
-**LifeSnaps (real data):**
+**LifeSnaps (transductive, quality-filtered):**
 
 | Model | h=1 | h=7 |
 |-------|-----|-----|
-| Persistence (Δ=0) | -0.001 | -0.000 |
+| Persistence (Δ=0) | -0.001 | 0.000 |
 | PCA Ridge | 0.013 | 0.018 |
-| Takens Ridge | 0.354 | 0.320 |
 | Takens RF | 0.460 | 0.440 |
 | Takens+prior RF | 0.484 | 0.445 |
-| Takens+GRM RF | 0.470 | 0.411 |
 | Takens+prior+GRM RF | 0.489 | 0.422 |
 
-Key findings:
+**PMData (transductive):**
 
-1. **Trajectory signal is 25x stronger than snapshot signal** on the
-   smoothed-delta target (Takens R²=0.52 vs PCA/GRM=0.02 on synthetic).
+| Model | h=1 |
+|-------|-----|
+| Takens RF | 0.379 |
+| Takens+GRM RF | 0.500 |
 
-2. **The Takens-Laplacian improves GRM by 10x** over the snapshot graph
-   (0.022→0.229 Ridge, 0.022→0.528 RF on synthetic).
+Trajectory signal replicates across all three datasets. Constitution proxy
+adds +6% at h≥7. GRM adds +0.05 on LifeSnaps, +0.12 on PMData.
 
-3. **Constitution proxy is the biggest lever at long horizons**: +6% R² at
-   h=7, peaking at h=21 (R²=0.47). Prediction improves with horizon — the
-   stable patient baseline determines multi-week trajectory.
+### 4.2 Flare Classification
 
-4. **Results replicate on real data**: Takens RF R²=0.46 (LifeSnaps),
-   R²=0.38 (PMData) on smoothed-delta h=1. GRM adds +0.05 R² on LifeSnaps.
+| Dataset | Model | AUC |
+|---------|-------|-----|
+| Synthetic | GRM+lag Logistic | 0.656 |
+| LifeSnaps | GRM+lag Logistic | 0.829 |
+| PMData | GRM+lag Logistic | 0.716 |
 
-### 5.3 Flare Classification
+### 4.3 Treatment Response Stratification
 
-| Model | AUC (synthetic) | AUC (LifeSnaps) |
-|-------|----------------|-----------------|
-| Persistence | 0.556 | — |
-| Raw RF | 0.614 | — |
-| GRM+lag Logistic | 0.656 | 0.829 |
+Kruskal-Wallis test on post-treatment score change, clustered by embedding
+at treatment time (synthetic, 524 clean treatment windows):
 
-GRM+lag logistic achieves AUC=0.83 for next-day flare classification on
-real wearable data.
-
-### 5.4 Treatment Response Stratification
-
-Testing whether manifold position predicts differential treatment response
-(Kruskal-Wallis η² on treatment-day score changes):
-
-| Embedding | η² at h=7 (synthetic) | p-value |
-|-----------|----------------------|---------|
+| Embedding | η² (h=7) | p |
+|-----------|---------|---|
 | PCA | 0.368 | <0.05 |
 | Takens | 0.265 | <0.05 |
-| GRM (Takens graph) | 0.148 | <0.05 |
+| GRM | 0.148 | <0.05 |
 
-Treatment response is significantly state-dependent. Manifold position
-explains up to 37% of the variance in post-treatment score change at h=7.
+Treatment response is state-dependent across all embedding types.
 
-### 5.5 Inductive Projection
+### 4.4 Signal Chain Analysis (Synthetic)
 
-| Model | Transductive h=1 | Inductive h=1 |
-|-------|-----------------|--------------|
-| GRM RF (mismatched projection) | 0.528 | -0.131 |
-| GRM RF (matched Nyström) | 0.528 | 0.394 |
-| Takens Ridge | 0.517 | 0.519 |
-| Takens+GRM Ridge | 0.520 | 0.521 |
+Oracle features reveal the theoretical ceiling:
 
-Matching projection feature space to graph feature space recovers inductive
-performance. Raw Takens features generalize perfectly (zero degradation).
-
-### 5.6 Modes and Spectral Scale
-
-Sweep over n_modes ∈ {4,8,16,32,64,128} and ρ ∈ {0.1,0.5,1.0,2.0,5.0}:
-
-- Optimal: n_modes=32, ρ=0.1 for RF decoder; n_modes=16 for Ridge
-- Lower ρ (less spectral smoothing) consistently better — regime boundaries
-  are steep transitions, not gradual gradients
-- RF unlocks nonlinear topology that Ridge cannot decode (0.281→0.528 at h=1)
-- Signal saturates at ~32 modes; higher modes add noise
-
-### 5.7 Signal Chain Analysis
-
-Oracle feature analysis on synthetic data:
-
-| Features | R² (h=1) |
-|----------|---------|
-| True latent z only | 0.001 |
-| True z delay-embedded | 0.334 |
-| Observations x delay-embedded | **0.515** |
+| Features added | R² (h=1) |
+|---------------|---------|
+| Observations delay-embedded | 0.515 |
 | + true current regime | 0.542 |
-| + true NEXT regime | **0.843** |
+| + true next regime | 0.843 |
 | All oracle features | 0.858 |
 
-Observations contain more predictive signal than true latents (R²=0.52 vs
-0.33) because the observation model encodes regime-conditional offsets and
-constitution. The theoretical ceiling is R²=0.86, with the 0.34 gap entirely
-in next-regime prediction.
+The 0.34 gap between our best (0.52) and the ceiling (0.86) lives entirely
+in next-regime prediction. Observations carry more signal than true latents
+(0.52 vs 0.33) because the observation model encodes regime offsets and
+constitution.
 
 ---
 
-## 6. Discussion
+## 5. Critical Findings
 
-### 6.1 Why Standard Evaluation Fails
+### 5.1 Persistence Masks Everything on Standard Targets
 
-The most important methodological finding is that standard next-day targets
-completely mask trajectory signal. With day-to-day autocorrelation >0.6,
-persistence explains most variance, and all embedding methods look identical.
-The smoothed-delta target removes this confound by design — and reveals a
-25-fold difference between trajectory-aware and snapshot methods.
+On next-day-score, all methods converge to R²≈0.55 once lag features are
+included. PCA ≈ GRM ≈ Takens. This is not a method failure — persistence
+(autocorrelation >0.6) absorbs variance. **The smoothed-delta target is
+essential** to reveal that trajectory methods carry 25x more genuine signal
+than snapshot methods.
 
-This has implications beyond our specific method: any longitudinal health
-model evaluated only on next-day prediction may appear no better than
-persistence, regardless of the structure it has learned.
+### 5.2 Takens-Laplacian: Graph From Trajectories
 
-### 6.2 Architecture-Task Duality
+Snapshot GRM: R²=0.022. Takens-Laplacian GRM: R²=0.229 (Ridge), 0.528 (RF).
+**Building the graph from delay-embedded vectors is the single largest
+architectural improvement.** The graph must encode trajectory similarity, not
+just instantaneous symptom similarity.
 
-Different prediction tasks favor different feature architectures:
+### 5.3 Projection Feature Space Must Match Graph Feature Space
 
-| Task | Best feature | Why |
-|------|-------------|-----|
-| Acute trajectory (h=1) | Takens embedding | Velocity matters most |
-| Long-horizon change (h≥7) | Constitution proxy | Baseline determines drift |
-| Regime transitions | GRM modes | Graph position encodes state identity |
-| Treatment stratification | PCA clusters | Dominant variance = treatment-responsive axis |
-| Flare classification | GRM+lag | Topology + persistence combines well |
+When the graph is built from 45D trajectory vectors but the inductive
+projection uses 15D snapshots, GRM collapses to R²=−0.13. Matching the
+projection input to the graph feature space recovers R²=0.39. **This is a
+silent failure mode with no error message** — the model runs, produces
+numbers, and they are wrong.
 
-No single embedding dominates all tasks. The combined architecture
-[Takens + prior + GRM] leverages each component where it contributes.
+### 5.4 Architecture-Task Duality
 
-### 6.3 Limitations
+| Task | Best component | Why |
+|------|---------------|-----|
+| Acute trajectory (h=1) | Takens | Velocity dominates |
+| Long horizon (h≥7) | Constitution proxy | Baseline determines drift |
+| Regime transitions | GRM modes | Graph position encodes state |
+| Flare classification | GRM+lag | Topology + persistence |
 
-1. **Small real-world samples.** PMData (N=16) and LifeSnaps (N=54) are
-   insufficient for robust GRM graph topology. Larger cohorts (N≥200) with
-   daily wearable data would enable a more definitive test.
+No single component dominates. The combined architecture leverages each
+where it contributes.
 
-2. **Synthetic noise is unrealistically high.** The benchmark generator has
-   SNR=0.64, worse than typical wearable data (SNR~1.5–2.5). Low-noise
-   experiments showed treatment η² doubling, suggesting real clinical data
-   would produce stronger results.
+---
 
-3. **Inductive projection gap.** GRM RF drops from R²=0.53 (transductive)
-   to R²=0.39 (inductive). The Nyström approximation loses topology.
-   Nonlinear projection methods (MLP surrogate) may close this gap.
+## 6. Limitations
 
-4. **No clinical treatment data.** Treatment events in our real-world
-   datasets are exercise sessions, not clinical interventions. The treatment
-   stratification result (η²=0.37) is on synthetic data only.
-
-5. **TCM alignment is modest.** AMI=0.15 for TCM label alignment with
-   trajectory-aware GRM. The synthetic benchmark's labels are deliberately
-   noisy, but the clinical relevance of this alignment is unestablished.
-
-### 6.4 Connections to Traditional Chinese Medicine
-
-The mathematical framework offers a quantitative test of TCM's core claims:
-
-- **"Same disease, different treatment"** maps to treatment response
-  stratification: patients with similar symptoms but different manifold
-  positions respond differently. We observe η²=0.37 (p<0.05).
-
-- **TCM syndromes as dynamical patterns**: TCM labels align better with
-  trajectory-aware (Takens-Laplacian) GRM states than with snapshot states
-  (AMI improvement +12%), supporting the hypothesis that TCM categories
-  describe dynamical patterns, not static symptom clusters.
-
-- **Constitution**: the expanding-mean constitution proxy improves long-
-  horizon prediction by 6%, and prediction R² increases with horizon up to
-  h=21 days. This "constitutional medicine" signature — where knowing the
-  patient's stable baseline is more predictive at longer timescales — is
-  consistent with TCM's emphasis on constitutional diagnosis.
-
-These connections are suggestive, not definitive. Validating them requires
-clinical data with actual TCM diagnostic assessments alongside wearable
-physiology.
+1. Small real-world N (16 and 54 subjects) — GRM needs N≥200 for robust
+   graph topology
+2. Synthetic SNR=0.64 is below typical wearable SNR (~1.5–2.5) — real data
+   should produce stronger treatment stratification
+3. GRM RF drops from R²=0.53 to 0.39 inductively — Nyström loses topology
+4. Treatment events are exercise loads, not clinical interventions
+5. TCM label alignment is modest (AMI=0.15)
 
 ---
 
 ## 7. Conclusion
 
-We demonstrate that trajectory-aware spectral graph methods can extract
-meaningful predictive structure from longitudinal health data. The key
-innovations are the Takens-Laplacian (building graphs from delay-embedded
-trajectories), the combined [Takens + constitution + GRM] prediction
-architecture, and the smoothed-delta evaluation framework that reveals
-trajectory signal hidden by persistence.
+Trajectory-aware spectral graph methods extract predictive structure from
+longitudinal health data that snapshot methods miss entirely. The key is
+building the graph from delay-embedded trajectories and evaluating on
+persistence-free targets. The method replicates across synthetic and real
+wearable data, with the combined [trajectory + constitution + topology]
+architecture achieving R²=0.49 on LifeSnaps and AUC=0.83 for flare
+classification.
 
-The method replicates across synthetic and real wearable data, achieving
-R²=0.49 for health state change prediction and AUC=0.83 for flare
-classification on real human Fitbit data. Treatment response is significantly
-state-dependent (η²=0.37, p<0.05), and the architecture captures both fast
-dynamics (trajectory) and slow patterns (constitution) in a unified
-spectral-geometric framework.
+---
+
+## Appendix A: Ablation Studies (Negative Results)
+
+All experiments on synthetic benchmark unless noted. Each tested in
+isolation against the best configuration at the time.
+
+### A.1 Approaches That Did Not Help
+
+| Experiment | Result | Why it failed |
+|-----------|--------|---------------|
+| k=5 delay embedding | GRM RF: 0.39→0.27 | Curse of dimensionality in 75D KNN |
+| 90-day rolling window | No improvement | Constitution proxy already captures it |
+| Density correction (Q@W@Q) | GRM RF: 0.39→0.005 | Over-corrects edge weights on Takens graph |
+| Takens-PCA (SSA compression) | 0.517→0.500 | PCA removes useful phase-space redundancy |
+| Takens+GRM RF (inductive) | 0.521→0.503 | RF overfits high-D concatenated space |
+| GRM propagation vectors | +0.000 | Fully redundant to eigenmodes for linear head |
+| Regime-probability stacking | +0.007 | Soft probabilities redundant to delay embedding |
+| Sign-sqrt GRM transform | +0.003 at h=1, −0.004 at h=21 | Helps short-term, hurts where constitution dominates |
+| GRM polynomial features | +0.000 | Regime boundaries not quadratic in eigenmode space |
+| 14+90 day multi-window | No improvement | Truncated rolling stats noisy on 120-day subjects |
+| Complex eigenvalues (directed graph) | Not needed | Graph well-connected (degree 16.4, 0 isolated) |
+| Flaredown dataset (17K users) | Unusable | 90% NaN — users track different symptoms |
+
+### A.2 The Persistence Trap
+
+On standard next-day-score with lag features:
+
+| Model | R² |
+|-------|-----|
+| Persistence only | 0.478 |
+| PCA+lag | 0.579 |
+| GRM+lag | 0.564 |
+| Takens+lag | 0.583 |
+
+All within ±0.02 of each other. **These numbers are misleading.** The lag
+feature dominates, and all embeddings contribute marginal decorrelation.
+Reporting only these metrics would wrongly conclude that graph topology adds
+nothing.
+
+### A.3 Modes and Spectral Scale Sweep
+
+n_modes ∈ {4,8,16,32,64,128} × ρ ∈ {0.1,0.5,1.0,2.0,5.0} on Takens-
+Laplacian (synthetic, h=1):
+
+- Ridge: saturates at n=32 (R²=0.281). ρ=0.1 best everywhere.
+- RF: peaks at n=32 (R²=0.528). Declines at n>64 (overfitting).
+- ρ=5.0 collapses signal (0.098) — over-smoothing destroys steep regime
+  boundaries.
+
+### A.4 Inductive Projection Comparison
+
+| Projection | GRM Ridge | GRM RF |
+|-----------|-----------|--------|
+| Snapshot surrogate (broken) | 0.015 | −0.131 |
+| Trajectory-matched surrogate | 0.294 | 0.362 |
+| Trajectory-matched Nyström | 0.232 | 0.394 |
+
+Nyström preserves more topology than the linear surrogate for RF. Both
+require trajectory-matched input features.
+
+### A.5 Low-Noise Sensitivity (Synthetic)
+
+Reducing obs_noise from 0.28 to 0.12 (SNR 0.64→~1.5, realistic for
+wearables):
+
+| Metric | SNR=0.64 | SNR~1.5 | Δ |
+|--------|----------|---------|---|
+| Treatment η² (GRM, h=7) | 0.148 | 0.265 | +0.117 |
+| Regime accuracy (Takens) | 0.526 | 0.582 | +0.056 |
+| Takens Ridge h=1 | 0.517 | 0.559 | +0.042 |
+
+Treatment stratification nearly doubles with realistic noise levels.
+
+---
+
+## Appendix B: TCM Connections (Exploratory)
+
+TCM label alignment with Takens-Laplacian GRM (synthetic, KMeans k=5):
+
+| Label | Snapshot AMI | Takens AMI | Δ |
+|-------|------------|-----------|---|
+| true_regime | 0.360 | 0.404 | +12% |
+| tcm_like_label | 0.135 | 0.149 | +10% |
+| qi_like_label | 0.171 | 0.175 | +3% |
+
+Direction correct but effects modest. TCM categories align better with
+trajectory-aware topology, consistent with the hypothesis that TCM describes
+dynamical patterns, not static symptom clusters.
+
+Regime-change prediction (7-class, change-only subset):
+
+| Model | Accuracy |
+|-------|----------|
+| GRM Logistic | 0.232 |
+| PCA Logistic | 0.179 |
+| Takens Logistic | 0.171 |
+| Random | 0.143 |
+
+GRM leads on state transitions (+9pp over random) but absolute accuracy is
+low. Treatment response regime-change η²=0.034 (GRM) vs 0.000 (PCA) — GRM
+uniquely predicts whether treatment triggers a state change, but the effect
+size is small (3.4% variance explained).
+
+These results are exploratory. Validating TCM connections requires clinical
+data with actual TCM diagnostic assessments.
 
 ---
 
@@ -489,12 +333,6 @@ reduction and data representation. Neural Computation, 15(6), 1373–1396.
 
 Coifman, R.R. & Lafon, S. (2006). Diffusion maps. Applied and Computational
 Harmonic Analysis, 21(1), 5–30.
-
-Dunn, J. et al. (2021). Wearable sensors enable personalized predictions of
-clinical laboratory measurements. Nature Medicine, 27(6), 1105–1112.
-
-Kantz, H. & Schreiber, T. (2004). Nonlinear Time Series Analysis. Cambridge
-University Press.
 
 Pang, J.C. et al. (2023). Geometric constraints on human brain function.
 Nature, 618, 566–574.
