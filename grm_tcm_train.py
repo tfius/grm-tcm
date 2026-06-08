@@ -534,6 +534,7 @@ class GRMTCMTrainer:
                 "takens_pca_ridge", "takens+grm_ridge", "takens+grm_rf",
                 "multiscale_ridge", "multiscale+grm_ridge",
                 "takens+prior_ridge", "takens+prior+grm_ridge",
+                "takens+prior+grm_ssqrt_ridge",
             ]
             header = f"  {'model':<24}" + "".join(f"  {'h=' + str(h):>8}" for h in horizons)
             print(header)
@@ -918,6 +919,12 @@ class GRMTCMTrainer:
                 np.vstack([takens_train, takens_test]),
                 np.vstack([prior_train, prior_test]),
                 np.vstack([train_embeddings, test_embeddings]),
+            ]),
+            "takens+prior+grm_ssqrt": np.column_stack([
+                np.vstack([takens_train, takens_test]),
+                np.vstack([prior_train, prior_test]),
+                np.vstack([train_embeddings, test_embeddings]),
+                np.sign(np.vstack([train_embeddings, test_embeddings])) * np.sqrt(np.abs(np.vstack([train_embeddings, test_embeddings]))),
             ]),
         }
         metrics: Dict[str, Any] = {
@@ -1546,12 +1553,16 @@ class GRMTCMTrainer:
         prob_grm_cls_calibrated = self._apply_flare_temperature(self.logistic_clf, X_grm, test_idx, self.flare_temperature)
         pred_grm_cls_calibrated = (prob_grm_cls_calibrated >= 0.5).astype(int) if prob_grm_cls_calibrated is not None else None
 
+        # Sign-sqrt transform: compresses heavy-tailed GRM modes, makes nonlinear
+        # topology more linearly separable. sign(x)*sqrt(|x|) preserves direction.
+        X_grm_ssqrt = np.sign(X_grm) * np.sqrt(np.abs(X_grm))
         _emb_dict = {
             "grm": X_grm, "pca": X_pca, "takens": X_takens, "takens_pca": X_takens_pca,
             "takens+grm": np.column_stack([X_takens, X_grm]),
             "multiscale": X_multi, "multiscale+grm": np.column_stack([X_multi, X_grm]),
             "takens+prior": np.column_stack([X_takens, X_prior]),
             "takens+prior+grm": np.column_stack([X_takens, X_prior, X_grm]),
+            "takens+prior+grm_ssqrt": np.column_stack([X_takens, X_prior, X_grm, X_grm_ssqrt]),
         }
         metrics: Dict = {
             "manifest": "model/manifest.json",
