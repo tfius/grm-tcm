@@ -31,13 +31,39 @@ sleep, HRV, resting HR, temperature, fatigue, pain, appetite,
 bowel quality, mood, energy, heaviness, cold-hot descriptor
 ```
 
+To capture biological momentum (velocity and acceleration of state change),
+define the delay-embedded trajectory vector of window `k`:
+
+```math
+\mathbf{x}_{i,t}^{(k)} = [x_{i,t},\; x_{i,t-1},\; \dots,\; x_{i,t-k+1}] \in \mathbb{R}^{pk}
+```
+
+By Takens' embedding theorem, the delay-embedded vector reconstructs the
+topology of the latent attractor from scalar observations alone.
+
+For chronic-pattern detection at longer timescales, augment the trajectory
+with per-subject rolling statistics over a slow window `w`:
+
+```math
+\tilde{x}_{i,t} = [\mathbf{x}_{i,t}^{(k)},\; \bar{x}^{(w)}_{i,t},\; \sigma^{(w)}_{i,t},\; \beta^{(w)}_{i,t}]
+```
+
+where the trailing mean, standard deviation, and slope summarize the slow
+chronic baseline without exploding dimensionality.
+
 Examples of prediction targets:
 
 ```text
-y^{score}_{i,t+1}     next-day global state score
-y^{flare}_{i,t+1}     flare / crash probability
-y^{response}_{i,t+h}  response after intervention within h days
+y^{score}_{i,t+1}          next-day global state score
+y^{flare}_{i,t+1}          flare / crash probability
+y^{response}_{i,t+h}       response after intervention within h days
+y^{delta,smooth}_{i,t+h}   smoothed change: MA(score,w)_{t+h} - MA(score,w)_t
+y^{regime}_{i,t+1}         next-day regime class
 ```
+
+The smoothed-delta target removes persistence bias (the persistence baseline
+predicts `Delta = 0`), so any positive R-squared reflects genuine structural
+signal rather than autocorrelation.
 
 The model should be judged first on `y`, not on whether labels sound meaningful.
 
@@ -255,20 +281,25 @@ The graph encodes multiple notions of similarity or coupling:
 W = W^{obs} + alpha_t W^{time} + alpha_u W^{intervention}
 ```
 
-where:
+The observation-similarity edges may be constructed over either instantaneous
+snapshots or delay-embedded trajectory vectors:
 
 ```math
-W^{obs}_{ab} = exp(-||x_a - x_b||^2 / (2 sigma^2))
+W^{obs}_{ab} = \exp\!\left(-\frac{\|\mathbf{x}_a^{(k)} - \mathbf{x}_b^{(k)}\|^2}{2 \sigma^2}\right)
 ```
 
-for feature-near visits,
+for feature-near visits (KNN-sparsified). When `k = 1`, this reduces to the
+standard snapshot kernel. When `k > 1`, visits are connected only if they
+share both similar symptoms and similar recent history. `sigma` is set via
+the median heuristic on KNN distances and auto-scales with dimensionality.
+
+Temporal edges provide within-subject continuity:
 
 ```math
 W^{time}_{(i,t),(i,t+1)} > 0
 ```
 
-for within-subject temporal continuity, and `W^{intervention}` links visits with
-similar intervention or event context.
+and `W^{intervention}` links visits with similar intervention or event context.
 
 Define the degree matrix:
 
@@ -444,23 +475,36 @@ signals.
 
 ## 9. Prediction Model
 
-Static prediction:
+Prediction may use the GRM embedding alone, the delay-embedded trajectory
+alone, or a concatenated vector that combines raw trajectory momentum with
+topological graph coordinates:
 
 ```math
-E[y_{i,t+1} | x_{i,t}] = f(e_{i,t})
+E[y_{i,t+h} \mid \mathbf{x}_{i,t}] = f(\mathbf{x}_{i,t}^{(k)},\; e_{i,t})
 ```
 
-For continuous outcomes:
+For continuous trajectory forecasting (e.g., smoothed-delta target):
 
 ```math
-hat y^{score}_{i,t+1} = theta_0 + theta^T e_{i,t}
+\hat{y}^{\Delta}_{i,t+h}
+  = \theta_0
+    + \theta_{takens}^T \mathbf{x}_{i,t}^{(k)}
+    + \theta_{grm}^T e_{i,t}
 ```
+
+The Takens component captures linear momentum (velocity/acceleration). The
+GRM component captures nonlinear graph position (basin membership, proximity
+to regime boundaries). A regularized linear model (Ridge) over this combined
+space leverages both signals; nonlinear heads (Random Forest) may further
+decode complex spectral topology.
 
 For flare risk:
 
 ```math
-P(y^{flare}_{i,t+1}=1 | e_{i,t})
-  = sigmoid(theta_0 + theta^T e_{i,t})
+P(y^{flare}_{i,t+1}=1 \mid \mathbf{x}_{i,t}^{(k)}, e_{i,t})
+  = \text{sigmoid}(\theta_0
+    + \theta_{takens}^T \mathbf{x}_{i,t}^{(k)}
+    + \theta_{grm}^T e_{i,t})
 ```
 
 Dynamic prediction can include resonance scores:
@@ -664,6 +708,26 @@ Inductive GRM:
 The graph and modes are fit on training subjects only. New visits are projected
 into the learned representation. This is required for honest deployment claims.
 ```
+
+To project a novel out-of-sample visit into the learned latent space without
+recomputing the eigendecomposition, use the Nystrom extension. The approximate
+embedding coordinate for mode `m` is:
+
+```math
+\hat{e}_{new,m}
+  = \frac{\sqrt{g_m(\rho)}}{\lambda_m}
+    \sum_{j \in \text{Train}}
+      W(\mathbf{x}_{new}^{(k)},\, \mathbf{x}_j^{(k)})\,\psi_m(j)
+```
+
+where `W` is the affinity kernel connecting the new visit to the training
+graph. When the training graph uses delay-embedded vectors, the projection
+must also use the delay-embedded input — feature-space mismatch between graph
+construction and projection is a known failure mode.
+
+An alternative surrogate projection fits a regression from the input feature
+space to the embedding space and applies it to new visits. This is faster
+but less faithful to the graph topology.
 
 Semantic mapping:
 
