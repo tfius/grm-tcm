@@ -1163,16 +1163,41 @@ class GRMTCMTrainer:
     def _active_feature_names(self, visits: pd.DataFrame) -> List[str]:
         """Return the feature columns the trainer will actually use.
 
-        Always the 12 continuous OBSERVATION_NAMES. Additionally includes the v2
-        qualitative ordinal channels when `include_qualitative_features` is on
-        AND those columns are present in visits.csv (so v1 data still works).
+        For the synthetic benchmark: the 12 continuous OBSERVATION_NAMES plus
+        optional qualitative ordinal channels.
+
+        For external datasets (PMData, GLOBEM, etc.): if the synthetic columns
+        are not found, auto-detect all numeric columns that are not metadata.
         """
 
-        feats = list(OBSERVATION_NAMES)
-        if self.cfg.include_qualitative_features:
-            for q in QUALITATIVE_FEATURE_NAMES:
-                if q in visits.columns:
-                    feats.append(q)
+        present = [c for c in OBSERVATION_NAMES if c in visits.columns]
+        if len(present) >= len(OBSERVATION_NAMES) // 2:
+            feats = list(OBSERVATION_NAMES)
+            if self.cfg.include_qualitative_features:
+                for q in QUALITATIVE_FEATURE_NAMES:
+                    if q in visits.columns:
+                        feats.append(q)
+            return feats
+
+        # External dataset — auto-detect numeric feature columns.
+        meta = {
+            "visit_id", "subject_id", "day", "global_dysregulation_score",
+            "next_day_score", "flare_next_day", "flare_onset",
+            "flare_persistence_today", "score_persistence_today",
+            "true_regime_id", "true_regime", "next_true_regime_id",
+            "is_aliased_pair_row", "hidden_subtype", "dwell_time",
+            "qi_like_label", "tcm_like_label", "contrarian_signature",
+            "pulse_quality_like_label", "tongue_state_like_label",
+            "complexion_like_label",
+        }
+        feats = sorted(
+            c for c in visits.columns
+            if c not in meta
+            and visits[c].dtype in [np.float64, np.int64, float, int]
+            and visits[c].notna().mean() > 0.1
+        )
+        if feats:
+            print(f"[auto-detect] {len(feats)} feature columns: {feats[:8]}{'...' if len(feats)>8 else ''}")
         return feats
 
     def _make_observation_matrix(self, visits: pd.DataFrame) -> Tuple[np.ndarray, List[str]]:

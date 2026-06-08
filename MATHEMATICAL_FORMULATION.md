@@ -39,7 +39,7 @@ define the delay-embedded trajectory vector of window `k`:
 ```
 
 By Takens' embedding theorem, the delay-embedded vector reconstructs the
-topology of the latent attractor from scalar observations alone.
+topology of the latent attractor from scalar observations alone. Default k=3.
 
 For chronic-pattern detection at longer timescales, augment the trajectory
 with per-subject rolling statistics over a slow window `w`:
@@ -50,6 +50,16 @@ with per-subject rolling statistics over a slow window `w`:
 
 where the trailing mean, standard deviation, and slope summarize the slow
 chronic baseline without exploding dimensionality.
+
+To capture stable individual baselines (constitution proxy), define the
+per-subject cumulative mean:
+
+```math
+\mu_{i,t} = \frac{1}{t} \sum_{s=1}^{t} x_{i,s}
+```
+
+This is a causal estimate (no future leakage) that converges to the subject's
+stable physiological baseline.
 
 Examples of prediction targets:
 
@@ -284,13 +294,17 @@ W = W^{obs} + alpha_t W^{time} + alpha_u W^{intervention}
 The observation-similarity edges may be constructed over either instantaneous
 snapshots or delay-embedded trajectory vectors:
 
+The observation-similarity edges use delay-embedded trajectory vectors
+(Takens-Laplacian) rather than instantaneous snapshots:
+
 ```math
 W^{obs}_{ab} = \exp\!\left(-\frac{\|\mathbf{x}_a^{(k)} - \mathbf{x}_b^{(k)}\|^2}{2 \sigma^2}\right)
 ```
 
 for feature-near visits (KNN-sparsified). When `k = 1`, this reduces to the
 standard snapshot kernel. When `k > 1`, visits are connected only if they
-share both similar symptoms and similar recent history. `sigma` is set via
+share both similar symptoms and similar recent history (biological momentum).
+`sigma` is set via
 the median heuristic on KNN distances and auto-scales with dimensionality.
 
 Temporal edges provide within-subject continuity:
@@ -476,11 +490,12 @@ signals.
 ## 9. Prediction Model
 
 Prediction may use the GRM embedding alone, the delay-embedded trajectory
-alone, or a concatenated vector that combines raw trajectory momentum with
-topological graph coordinates:
+alone, or a concatenated vector that combines raw trajectory momentum, the
+stable individual baseline (constitution proxy), and topological graph
+coordinates:
 
 ```math
-E[y_{i,t+h} \mid \mathbf{x}_{i,t}] = f(\mathbf{x}_{i,t}^{(k)},\; e_{i,t})
+f_{i,t} = [\mathbf{x}_{i,t}^{(k)},\; \mu_{i,t},\; e_{i,t}]
 ```
 
 For continuous trajectory forecasting (e.g., smoothed-delta target):
@@ -488,23 +503,23 @@ For continuous trajectory forecasting (e.g., smoothed-delta target):
 ```math
 \hat{y}^{\Delta}_{i,t+h}
   = \theta_0
-    + \theta_{takens}^T \mathbf{x}_{i,t}^{(k)}
+    + \theta_{prior}^T \mu_{i,t}
     + \theta_{grm}^T e_{i,t}
 ```
 
-The Takens component captures linear momentum (velocity/acceleration). The
-GRM component captures nonlinear graph position (basin membership, proximity
-to regime boundaries). A regularized linear model (Ridge) over this combined
-space leverages both signals; nonlinear heads (Random Forest) may further
-decode complex spectral topology.
+The Takens component captures velocity/acceleration (fast dynamics). The
+constitution proxy captures the stable individual baseline (slow dynamics).
+The GRM component captures nonlinear graph position (basin membership,
+proximity to regime boundaries). Each dominates at different horizons:
+trajectory at h=1, constitution at h≥7. A regularized linear model (Ridge)
+over this combined space leverages all signals; nonlinear heads (Random
+Forest) may further decode complex spectral topology.
 
 For flare risk:
 
 ```math
-P(y^{flare}_{i,t+1}=1 \mid \mathbf{x}_{i,t}^{(k)}, e_{i,t})
-  = \text{sigmoid}(\theta_0
-    + \theta_{takens}^T \mathbf{x}_{i,t}^{(k)}
-    + \theta_{grm}^T e_{i,t})
+P(y^{flare}_{i,t+1}=1 \mid f_{i,t})
+  = \text{sigmoid}(\theta_0 + \theta^T f_{i,t})
 ```
 
 Dynamic prediction can include resonance scores:
@@ -665,6 +680,10 @@ H5: Coarse TCM-like descriptors align with GRM states above chance.
 H6: Descriptor-aligned states show different intervention response probabilities.
 H7: Low-frequency manifold/graph modes explain future risk better than
     distance-smooth baselines of similar complexity.
+H8: Trajectory-aware graph construction (Takens-Laplacian) outperforms snapshot
+    graph construction for all predictive tasks.
+H9: A combined [trajectory + constitution + topology] architecture outperforms
+    any single component.
 ```
 
 Failures are informative. For example, if H2 fails, the model may still be useful
@@ -721,9 +740,10 @@ embedding coordinate for mode `m` is:
 ```
 
 where `W` is the affinity kernel connecting the new visit to the training
-graph. When the training graph uses delay-embedded vectors, the projection
-must also use the delay-embedded input — feature-space mismatch between graph
-construction and projection is a known failure mode.
+graph. **Critical requirement**: when the training graph uses delay-embedded
+vectors, the projection must also use the delay-embedded input — feature-space
+mismatch between graph construction and projection causes complete model
+collapse.
 
 An alternative surrogate projection fits a regression from the input feature
 space to the embedding space and applies it to new visits. This is faster
@@ -753,10 +773,14 @@ biological mechanism or TCM ontology is true.
 
 ## 16. One-Sentence Formulation
 
-We model longitudinal visits as samples from a latent body-state process, treat
-GRM graph modes as a discrete approximation to low-frequency manifold modes,
-use `G_ij = sum_m psi_m(i) psi_m*(j) / (1 + r_s^2 lambda_m)` to define
-propagation and self-resonance, test whether these quantities improve prediction
-of future state and intervention response over smooth-distance and raw
-baselines, and only then map coarse TCM-like descriptors onto the learned states
-as an empirical semantic overlay.
+We model longitudinal health visits as samples from a latent body-state
+process, embed each visit as a delay-embedded trajectory vector to capture
+biological momentum, construct a visit graph whose KNN edges encode trajectory
+similarity (Takens-Laplacian), extract GRM spectral modes as a discrete
+approximation to the manifold's low-frequency geometry, combine trajectory
+features with a per-subject constitution proxy and GRM coordinates into a
+three-component prediction vector, evaluate on persistence-free smoothed-delta
+targets across multiple horizons, and map coarse TCM-like descriptors onto the
+learned states as an empirical semantic overlay — testing each component's
+contribution against PCA, persistence, and raw-feature baselines on both
+synthetic and real wearable data.
